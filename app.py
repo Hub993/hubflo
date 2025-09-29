@@ -11,8 +11,13 @@ app = Flask(__name__)
 init_db()
 
 def check_auth():
- auth = request.headers.get("Authorization","")
- if not ADMIN_TOKEN or auth != f"Bearer {ADMIN_TOKEN}":
+ # Accept either header OR ?token=
+ token = request.headers.get("Authorization", "")
+ if token.lower().startswith("bearer "):
+   token = token[7:]
+ else:
+   token = request.args.get("token", "")
+ if not ADMIN_TOKEN or token != ADMIN_TOKEN:
    abort(401)
 
 @app.route("/health")
