@@ -1,0 +1,5 @@
+flask
+requests
+sqlalchemy
+psycopg[binary]
+python-dotenv
