@@ -46,6 +46,10 @@ def webhook():
  ok = apply_action(action)
  return jsonify(ok=ok, action=action)
 
+@app.route("/whatsapp/webhook", methods=["POST"])
+def whatsapp_webhook():
+   return webhook()
+
 # Stubs: will flesh out after templates
 @app.route("/daily", methods=["POST"])
 def daily():
