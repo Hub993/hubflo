@@ -4,11 +4,15 @@ from dotenv import load_dotenv
 load_dotenv()
 from storage import init_db, get_tasks
 from parse import parse_text, apply_action
+import logging
 
 ADMIN_TOKEN = os.environ.get("HUBFLO_ADMIN_TOKEN","")
 
 app = Flask(__name__)
 init_db()
+
+logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
 
 def check_auth():
  # Accept either header OR ?token=
@@ -33,6 +37,7 @@ def debug_tasks():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+ app.logger.info("Inbound webhook hit")
  print("Inbound webhook hit")
  data = request.get_json(silent=True) or {}
  try:
