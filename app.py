@@ -33,6 +33,7 @@ def debug_tasks():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+ print("Inbound webhook hit")
  data = request.get_json(silent=True) or {}
  try:
    msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
