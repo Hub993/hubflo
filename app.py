@@ -38,6 +38,7 @@ def debug_tasks():
 @app.route("/webhook", methods=["POST"])
 def webhook():
  app.logger.info("Inbound webhook hit")
+ app.logger.info(request.get_json())
  print(request.get_json())
  print("Inbound webhook hit")
  data = request.get_json(silent=True) or {}
