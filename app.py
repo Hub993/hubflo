@@ -37,21 +37,40 @@ def debug_tasks():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
- app.logger.info("Inbound webhook hit")
- app.logger.info(request.get_json())
- print(request.get_json())
- print("Inbound webhook hit")
- data = request.get_json(silent=True) or {}
- try:
-   msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
- except Exception:
-   return jsonify(ok=True, ignored=True)
- text = (msg.get("text",{}) or {}).get("body","").strip()
- action = parse_text(text) if text else None
- if not action:
-   return jsonify(ok=True, matched=False)
- ok = apply_action(action)
- return jsonify(ok=ok, action=action)
+   app.logger.info("Inbound webhook hit")
+   payload = request.get_json() or {}
+
+   msg_body = None
+   try:
+       # 360dialog/WhatsApp structure: messages[0].text.body
+       msgs = payload.get("messages", [])
+       if msgs:
+           m0 = msgs[0]
+           if m0.get("type") == "text":
+               msg_body = (m0.get("text") or {}).get("body")
+           elif "button" in m0:  # if you press a quick-reply button
+               msg_body = (m0.get("button") or {}).get("text")
+   except Exception as e:
+       app.logger.error(f"parse error: {e}")
+
+   app.logger.info(f"MSG_BODY={msg_body}")
+   app.logger.info(request.get_json())
+   print(request.get_json())
+   print("Inbound webhook hit")
+
+   data = request.get_json(silent=True) or {}
+   try:
+       msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
+   except Exception:
+       return jsonify(ok=True, ignored=True)
+
+   text = (msg.get("text", {}) or {}).get("body", "").strip()
+   action = parse_text(text) if text else None
+   if not action:
+       return jsonify(ok=True, matched=False)
+
+   ok = apply_action(action)
+   return jsonify(ok=ok, action=action)
 
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
@@ -74,4 +93,4 @@ def nudge():
  return jsonify(ok=True)
 
 if __name__ == "__main__":
- app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+ app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
