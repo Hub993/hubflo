@@ -1,96 +1,57 @@
 import os
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-load_dotenv()
-from storage import init_db, get_tasks
-from parse import parse_text, apply_action
 import logging
 
-ADMIN_TOKEN = os.environ.get("HUBFLO_ADMIN_TOKEN","")
+from storage import init_db, create_task, get_tasks
+from parse import parse_text
+
+load_dotenv()
 
 app = Flask(__name__)
-init_db()
-
-logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-def check_auth():
- # Accept either header OR ?token=
- token = request.headers.get("Authorization", "")
- if token.lower().startswith("bearer "):
-   token = token[7:]
- else:
-   token = request.args.get("token", "")
- if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-   abort(401)
+# Initialize the database
+init_db()
 
-@app.route("/health")
-def health():
- return jsonify(ok=True)
-
-@app.route("/debug/tasks")
-def debug_tasks():
- check_auth()
- ids = request.args.get("ids","")
- id_list = [int(x) for x in ids.split(",") if x.strip().isdigit()]
- return jsonify(get_tasks(id_list))
+@app.route("/", methods=["GET"])
+def home():
+    return "Hubflo service is running", 200
 
 @app.route("/webhook", methods=["POST"])
+@app.route("/whatsapp/webhook", methods=["POST"])  # alias for 360dialog
 def webhook():
-   app.logger.info("Inbound webhook hit")
-   payload = request.get_json() or {}
+    app.logger.info("Inbound webhook hit")
+    payload = request.get_json(force=True, silent=True)
 
-   msg_body = None
-   try:
-       # 360dialog/WhatsApp structure: messages[0].text.body
-       msgs = payload.get("messages", [])
-       if msgs:
-           m0 = msgs[0]
-           if m0.get("type") == "text":
-               msg_body = (m0.get("text") or {}).get("body")
-           elif "button" in m0:  # if you press a quick-reply button
-               msg_body = (m0.get("button") or {}).get("text")
-   except Exception as e:
-       app.logger.error(f"parse error: {e}")
+    if not payload:
+        app.logger.warning("No JSON payload received")
+        return jsonify({"status": "no payload"}), 400
 
-   app.logger.info(f"MSG_BODY={msg_body}")
-   app.logger.info(request.get_json())
-   print(request.get_json())
-   print("Inbound webhook hit")
+    # Extract message body safely
+    msg_body = None
+    try:
+        if "messages" in payload and len(payload["messages"]) > 0:
+            msg = payload["messages"][0]
+            if msg.get("type") == "text":
+                msg_body = msg["text"]["body"]
+            elif msg.get("type") == "button":
+                msg_body = msg["button"]["text"]
+            elif msg.get("type") == "interactive":
+                msg_body = msg["interactive"]["button_reply"]["title"]
+    except Exception as e:
+        app.logger.error(f"Error parsing payload: {e}")
 
-   data = request.get_json(silent=True) or {}
-   try:
-       msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
-   except Exception:
-       return jsonify(ok=True, ignored=True)
+    app.logger.info(f"MSG_BODY={msg_body}")
 
-   text = (msg.get("text", {}) or {}).get("body", "").strip()
-   action = parse_text(text) if text else None
-   if not action:
-       return jsonify(ok=True, matched=False)
+    # TODO: future steps → save to DB, confirmation reply, rules
+    return jsonify({"status": "received"}), 200
 
-   ok = apply_action(action)
-   return jsonify(ok=ok, action=action)
-
-@app.route("/whatsapp/webhook", methods=["POST"])
-def whatsapp_webhook():
-   return webhook()
-
-# Stubs: will flesh out after templates
-@app.route("/daily", methods=["POST"])
-def daily():
- check_auth()
- return jsonify(ok=True, sent=1)
-
-@app.route("/send", methods=["POST"])
-def send():
- check_auth()
- return jsonify(ok=True)
-
-@app.route("/nudge", methods=["POST"])
-def nudge():
- check_auth()
- return jsonify(ok=True)
+@app.route("/debug/tasks", methods=["GET"])
+def debug_tasks():
+    tasks = get_tasks()
+    return jsonify(tasks), 200
 
 if __name__ == "__main__":
- app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
