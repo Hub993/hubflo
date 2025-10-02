@@ -2,12 +2,11 @@ import os, json, logging, requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-D360_KEY = os.getenv("D360_KEY", "")
-D360_SEND_URL = os.getenv("D360_SEND_URL", "https://waba.360dialog.io/v1/messages")
+# Meta Cloud API token (Render → Environment must have META_TOKEN set)
+META_TOKEN = os.getenv("META_TOKEN", "")
 
 @app.route("/")
 def index():
@@ -20,76 +19,61 @@ def webhook():
     payload = request.get_json(force=True, silent=True) or {}
     app.logger.info("RAW_PAYLOAD=" + json.dumps(payload)[:3000])
 
-    msg_body, sender = extract_text_and_sender(payload)
-    app.logger.info(f"MSG_BODY={msg_body} SENDER={sender}")
+    text, sender, phone_id = extract_meta(payload)
+    app.logger.info(f"MSG_BODY={text} SENDER={sender} PHONE_ID={phone_id}")
 
-    if msg_body and sender:
-        ok = send_whatsapp_text(sender, f"✅ Received: {msg_body}")
+    if text and sender and phone_id and META_TOKEN:
+        ok = send_meta_reply(phone_id, sender, f"✅ Received: {text}")
         app.logger.info(f"WHATSAPP_SEND status={ok}")
-    return jsonify({"status":"ok"}), 200
+    else:
+        if not META_TOKEN:
+            app.logger.warning("Missing META_TOKEN; cannot send reply")
+    return jsonify({"status": "ok"}), 200
 
-def extract_text_and_sender(p):
-    msgs = p.get("messages")
-    if msgs:
-        m0 = msgs[0]
-        sender = m0.get("from")
-        t = m0.get("type")
-        if t == "text":
-            return ((m0.get("text") or {}).get("body"), sender)
-        if "button" in m0:
-            return ((m0.get("button") or {}).get("text"), sender)
-        if t == "interactive":
-            inter = m0.get("interactive") or {}
-            txt = ((inter.get("button_reply") or {}).get("title")
-                   or (inter.get("list_reply") or {}).get("title"))
-            return (txt, sender)
+def extract_meta(p):
+    """Return (text, sender_waid, phone_number_id) from Meta relay payload."""
     try:
         entry = (p.get("entry") or [])[0]
         changes = (entry.get("changes") or [])[0]
         value = changes.get("value") or {}
+        phone_id = (value.get("metadata") or {}).get("phone_number_id")
         msgs = value.get("messages") or []
         if msgs:
             m0 = msgs[0]
             sender = m0.get("from")
             t = m0.get("type")
             if t == "text":
-                return ((m0.get("text") or {}).get("body"), sender)
+                return ((m0.get("text") or {}).get("body"), sender, phone_id)
             if "button" in m0:
-                return ((m0.get("button") or {}).get("text"), sender)
+                return ((m0.get("button") or {}).get("text"), sender, phone_id)
             if t == "interactive":
                 inter = m0.get("interactive") or {}
                 txt = ((inter.get("button_reply") or {}).get("title")
                        or (inter.get("list_reply") or {}).get("title"))
-                return (txt, sender)
+                return (txt, sender, phone_id)
     except Exception:
         pass
-    return (None, None)
+    return (None, None, None)
 
-def send_whatsapp_text(to_waid, body):
-    if not (D360_KEY and to_waid and body):
-        app.logger.warning("send_whatsapp_text skipped (missing key/to/body)")
-        return False
-    payload = {"to": str(to_waid), "type": "text", "text": {"body": body}}
-    # Try both header schemes; some accounts require Authorization: Bearer
-    headers_primary = {
+def send_meta_reply(phone_id, to_waid, body):
+    """Send via Meta Graph: POST https://graph.facebook.com/v20.0/{phone_id}/messages"""
+    url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+    headers = {
         "Content-Type": "application/json",
-        "D360-API-KEY": D360_KEY
+        "Authorization": f"Bearer {META_TOKEN}",
     }
-    headers_bearer = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {D360_KEY}"
+    data = {
+        "messaging_product": "whatsapp",
+        "to": str(to_waid),
+        "type": "text",
+        "text": {"body": body},
     }
     try:
-        r = requests.post(D360_SEND_URL, headers=headers_primary, json=payload, timeout=12)
-        app.logger.info(f"WHATSAPP_SEND status_code={r.status_code} body={r.text[:400]}")
-        if 200 <= r.status_code < 300:
-            return True
-        # fallback try with Bearer
-        r2 = requests.post(D360_SEND_URL, headers=headers_bearer, json=payload, timeout=12)
-        app.logger.info(f"WHATSAPP_SEND (bearer) status_code={r2.status_code} body={r2.text[:400]}")
-        return 200 <= r2.status_code < 300
+        r = requests.post(url, headers=headers, json=data, timeout=12)
+        app.logger.info(f"META_SEND status_code={r.status_code} body={r.text[:400]}")
+        return 200 <= r.status_code < 300
     except Exception as e:
-        app.logger.error(f"WHATSAPP_SEND error: {e}")
+        app.logger.error(f"META_SEND error: {e}")
         return False
 
 if __name__ == "__main__":
