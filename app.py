@@ -7,18 +7,19 @@ app = Flask(__name__)
 
 # Env variables
 D360_KEY = os.getenv("D360_KEY", "")
-SEND_URL = os.getenv("D360_SEND_URL", "https://waba-v2.360dialog.io/messages")
+SEND_URL = os.getenv("D360_SEND_URL", "https://waba-v2.360dialog.io/v1/messages")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         payload = request.get_json(force=True)
         app.logger.info("Inbound webhook hit")
-        app.logger.info(f"RAW_PAYLOAD= {json.dumps(payload)[:2000]}")
+        app.logger.info(f"RAW_PAYLOAD= {json.dumps(payload)[:3000]}")
 
-        # Try extracting message body
         msg_body = None
         sender = None
+
+        # Try extracting message body (360dialog structure)
         if payload and "messages" in payload:
             messages = payload.get("messages", [])
             if messages and "text" in messages[0]:
@@ -26,20 +27,6 @@ def webhook():
                 sender = messages[0].get("from")
 
         app.logger.info(f"MSG_BODY= {msg_body} SENDER= {sender}")
-
-        # Send a reply back if we have both
-        if msg_body and sender:
-            headers = {
-                "Content-Type": "application/json",
-                "D360-API-KEY": D360_KEY
-            }
-            data = {
-                "to": sender,
-                "type": "text",
-                "text": {"body": f"✅ Received: {msg_body}"}
-            }
-            r = requests.post(SEND_URL, headers=headers, json=data)
-            app.logger.info(f"WHATSAPP_SEND status={r.status_code} body={r.text}")
 
         return jsonify({"status": "ok"}), 200
 
