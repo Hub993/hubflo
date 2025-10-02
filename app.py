@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import logging
 
-from storage import init_db, create_task, get_tasks
+from storage import init_db, get_tasks
 from parse import parse_text
 
 load_dotenv()
