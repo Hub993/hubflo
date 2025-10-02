@@ -1,57 +1,75 @@
 import os
+import json
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-import logging
-
 from storage import init_db, get_tasks
-from parse import parse_text
 
 load_dotenv()
 
 app = Flask(__name__)
-app.logger.setLevel(logging.INFO)
-
-# Initialize the database
 init_db()
 
-@app.route("/", methods=["GET"])
-def home():
-    return "Hubflo service is running", 200
+@app.route('/')
+def index():
+    return "HUBFLO service running", 200
 
-@app.route("/webhook", methods=["POST"])
-@app.route("/whatsapp/webhook", methods=["POST"])  # alias for 360dialog
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    app.logger.info("Inbound webhook hit")
-    payload = request.get_json(force=True, silent=True)
-
-    if not payload:
-        app.logger.warning("No JSON payload received")
-        return jsonify({"status": "no payload"}), 400
-
-    # Extract message body safely
-    msg_body = None
     try:
-        if "messages" in payload and len(payload["messages"]) > 0:
-            msg = payload["messages"][0]
-            if msg.get("type") == "text":
-                msg_body = msg["text"]["body"]
-            elif msg.get("type") == "button":
-                msg_body = msg["button"]["text"]
-            elif msg.get("type") == "interactive":
-                msg_body = msg["interactive"]["button_reply"]["title"]
+        payload = request.get_json(force=True, silent=True) or {}
+        app.logger.info("RAW_PAYLOAD=" + json.dumps(payload)[:3000])
+
+        def extract_text(p):
+            # 360dialog direct shape
+            msgs = p.get("messages")
+            if msgs:
+                m0 = msgs[0]
+                t = m0.get("type")
+                if t == "text":
+                    return (m0.get("text") or {}).get("body")
+                if t == "button":
+                    return (m0.get("button") or {}).get("text")
+                if t == "interactive":
+                    inter = m0.get("interactive") or {}
+                    return ((inter.get("button_reply") or {}).get("title")
+                            or (inter.get("list_reply") or {}).get("title"))
+
+            # Meta relay shape
+            try:
+                entry = (p.get("entry") or [])[0]
+                changes = (entry.get("changes") or [])[0]
+                value = changes.get("value") or {}
+                msgs = value.get("messages") or []
+                if msgs:
+                    m0 = msgs[0]
+                    t = m0.get("type")
+                    if t == "text":
+                        return (m0.get("text") or {}).get("body")
+                    if "button" in m0:
+                        return (m0.get("button") or {}).get("text")
+                    if t == "interactive":
+                        inter = m0.get("interactive") or {}
+                        return ((inter.get("button_reply") or {}).get("title")
+                                or (inter.get("list_reply") or {}).get("title"))
+            except Exception:
+                pass
+            return None
+
+        msg_body = extract_text(payload)
+        app.logger.info(f"MSG_BODY={msg_body}")
+
     except Exception as e:
-        app.logger.error(f"Error parsing payload: {e}")
+        app.logger.error("Webhook error: " + str(e))
 
-    app.logger.info(f"MSG_BODY={msg_body}")
+    return jsonify({"status": "ok"}), 200
 
-    # TODO: future steps → save to DB, confirmation reply, rules
-    return jsonify({"status": "received"}), 200
+@app.route('/admin/debug', methods=['GET'])
+def admin_debug():
+    token = request.args.get("token")
+    if token != os.getenv("HUBFLO_ADMIN_TOKEN"):
+        return "Unauthorized", 401
+    return jsonify(get_tasks()), 200
 
-@app.route("/debug/tasks", methods=["GET"])
-def debug_tasks():
-    tasks = get_tasks()
-    return jsonify(tasks), 200
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
