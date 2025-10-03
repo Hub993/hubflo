@@ -1,4 +1,4 @@
-import os, json, logging
+import os, json, logging, html
 from flask import Flask, request, jsonify, abort
 from storage import init_db, create_task, get_tasks
 import requests
@@ -18,13 +18,19 @@ ADMIN_TOKEN = os.getenv("HUBFLO_ADMIN_TOKEN", "")
 # DB ready
 init_db()
 
-# ---------- Helpers ----------
-
+# ---------- Admin helpers ----------
 def _check_admin():
     token = request.args.get("token")
     if token != ADMIN_TOKEN:
         abort(401)
 
+def _int(v, default=None):
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+# ---------- Classifier (strict-but-friendly) ----------
 def classify_text_strict(txt: str):
     """
     Strict-but-friendly tagging:
@@ -66,6 +72,7 @@ def classify_text_strict(txt: str):
 
     return None
 
+# ---------- Payload parsing ----------
 def extract_text_sender_phoneid(p):
     # 360dialog direct format
     msgs = p.get("messages")
@@ -113,8 +120,9 @@ def extract_text_sender_phoneid(p):
 
     return (None, None, None)
 
+# ---------- Outbound (optional) ----------
 def send_whatsapp_text(to, body, phone_id=None):
-    # Meta Cloud (will require META_TOKEN; optional)
+    # Meta Cloud (requires META_TOKEN; optional)
     if META_TOKEN and phone_id:
         try:
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
@@ -141,7 +149,6 @@ def send_whatsapp_text(to, body, phone_id=None):
     return False
 
 # ---------- Routes ----------
-
 @app.route("/")
 def index():
     return "HUBFLO service running", 200
@@ -175,8 +182,7 @@ def webhook():
 
     return jsonify(ok=True, task_id=task_id, tag=tag), 200
 
-# ----- Admin (read-only) -----
-
+# ----- Admin (read-only JSON) -----
 @app.route("/admin/debug", methods=["GET"])
 def admin_debug():
     _check_admin()
@@ -187,11 +193,14 @@ def admin_search():
     _check_admin()
     tag = (request.args.get("tag") or "").strip().lower()
     q = (request.args.get("q") or "").strip().lower()
+    sender = (request.args.get("sender") or "").strip()
     rows = get_tasks()
     if tag:
         rows = [r for r in rows if (r.get("tag") or "") == tag]
     if q:
         rows = [r for r in rows if q in (r.get("text") or "").lower()]
+    if sender:
+        rows = [r for r in rows if (r.get("sender") or "") == sender]
     return jsonify(rows), 200
 
 @app.route("/admin/summary", methods=["GET"])
@@ -202,8 +211,95 @@ def admin_summary():
     latest = rows[:10]
     return jsonify({"counts_by_tag": counts, "latest": latest}), 200
 
-# ---------- Main ----------
+# ----- Admin (small utilities) -----
+@app.route("/admin/tag", methods=["GET"])
+def admin_tag():
+    """
+    Quick manual retag:
+    /admin/tag?token=...&id=5&tag=order
+    """
+    _check_admin()
+    task_id = _int(request.args.get("id"))
+    new_tag = (request.args.get("tag") or "").strip().lower() or None
+    if not task_id:
+        return jsonify(ok=False, error="missing id"), 400
 
+    rows = get_tasks([task_id])  # storage.get_tasks supports list of ids
+    if not rows:
+        return jsonify(ok=False, error="id not found"), 404
+
+    # naive in-place update: re-create with same fields but new tag
+    row = rows[0]
+    row["tag"] = new_tag
+    try:
+        # storage.create_task returns new id; for simplicity we just add another record
+        # In a fuller impl we'd have update_task(). For now we append and return the new id.
+        nid = create_task({"text": row["text"], "sender": row["sender"], "tag": row["tag"]})
+        return jsonify(ok=True, new_id=nid, previous_id=task_id, tag=new_tag), 200
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+# ----- Simple HTML view -----
+@app.route("/admin/view", methods=["GET"])
+def admin_view():
+    """
+    HTML list with optional filters:
+    /admin/view?token=...&tag=order&q=conduit&sender=13522098414
+    """
+    _check_admin()
+    tag = (request.args.get("tag") or "").strip().lower()
+    q = (request.args.get("q") or "").strip().lower()
+    sender = (request.args.get("sender") or "").strip()
+
+    rows = get_tasks()
+    if tag:
+        rows = [r for r in rows if (r.get("tag") or "") == tag]
+    if q:
+        rows = [r for r in rows if q in (r.get("text") or "").lower()]
+    if sender:
+        rows = [r for r in rows if (r.get("sender") or "") == sender]
+
+    def esc(s): return html.escape(str(s if s is not None else ""))
+    items = "\n".join(
+        f"<tr><td>{esc(r.get('id'))}</td>"
+        f"<td>{esc(r.get('ts'))}</td>"
+        f"<td>{esc(r.get('sender'))}</td>"
+        f"<td>{esc(r.get('tag') or '—')}</td>"
+        f"<td>{esc(r.get('text'))}</td></tr>"
+        for r in rows
+    )
+    html_page = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>HUBFLO Admin View</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px}}
+table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #ddd;padding:8px;font-size:14px}}
+th{{background:#f6f6f6;text-align:left}}
+.controls input{{margin-right:8px;padding:6px 8px}}
+.badge{{display:inline-block;padding:2px 6px;border-radius:6px;background:#eee}}
+</style>
+</head>
+<body>
+<h2>HUBFLO Admin</h2>
+<div class="controls">
+<span class="badge">Filters: tag={esc(tag or '*')}, q={esc(q or '*')}, sender={esc(sender or '*')}</span>
+</div>
+<table>
+<thead><tr><th>ID</th><th>Time</th><th>Sender</th><th>Tag</th><th>Text</th></tr></thead>
+<tbody>
+{items or '<tr><td colspan="5">No rows</td></tr>'}
+</tbody>
+</table>
+</body>
+</html>
+"""
+    return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+# ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
