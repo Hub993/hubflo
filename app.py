@@ -1,20 +1,26 @@
 import os, json, logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
 from storage import init_db, create_task, get_tasks
 import requests
+from collections import Counter
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-# Env for optional outbound (we still skip sends in sandbox)
+# Env for optional outbound (still gated in sandbox)
 META_TOKEN = os.getenv("META_TOKEN", "")
 D360_KEY = os.getenv("D360_KEY", "")
 D360_SEND_URL = os.getenv("D360_SEND_URL", "https://waba.360dialog.io/v1/messages")
 ADMIN_TOKEN = os.getenv("HUBFLO_ADMIN_TOKEN", "")
 
 init_db()
+
+def _check_admin():
+    token = request.args.get("token")
+    if token != ADMIN_TOKEN:
+        abort(401)
 
 @app.route("/")
 def index():
@@ -42,23 +48,53 @@ def webhook():
         except Exception as e:
             app.logger.error(f"TASK_CREATE_ERROR: {e}")
 
-        # Optional auto-reply (will be blocked in 360 sandbox; keeps log clarity)
+        # Optional auto-reply (will 401 in sandbox; fine)
         reply_body = f"✅ Saved (tag={tag or 'none'}): {text}"
         sent_ok = send_whatsapp_text(sender, reply_body, phone_id=phone_id)
         app.logger.info(f"AUTO_REPLY status={sent_ok}")
 
     return jsonify(ok=True, task_id=task_id, tag=tag), 200
 
+# ----- Admin (read-only) -----
+
 @app.route("/admin/debug", methods=["GET"])
 def admin_debug():
-    token = request.args.get("token")
-    if token != ADMIN_TOKEN:
-        return "Unauthorized", 401
+    _check_admin()
     return jsonify(get_tasks()), 200
+
+@app.route("/admin/search", methods=["GET"])
+def admin_search():
+    """
+    /admin/search?token=...&tag=order
+    /admin/search?token=...&q=cable
+    Both params are optional; combine if you like.
+    """
+    _check_admin()
+    tag = (request.args.get("tag") or "").strip().lower()
+    q = (request.args.get("q") or "").strip().lower()
+    rows = get_tasks()
+    if tag:
+        rows = [r for r in rows if (r.get("tag") or "") == tag]
+    if q:
+        rows = [r for r in rows if q in (r.get("text") or "").lower()]
+    return jsonify(rows), 200
+
+@app.route("/admin/summary", methods=["GET"])
+def admin_summary():
+    """
+    /admin/summary?token=...
+    Returns counts by tag and last 10 tasks.
+    """
+    _check_admin()
+    rows = get_tasks()
+    counts = Counter((r.get("tag") or "none") for r in rows)
+    latest = rows[:10]
+    return jsonify({"counts_by_tag": counts, "latest": latest}), 200
+
+# ----- Helpers -----
 
 def classify_text(txt):
     t = (txt or "").lower()
-    # simple keyword rules (can evolve)
     if any(k in t for k in ["order:", "po ", "purchase", "vendor", "deliver", "quote", "invoice"]):
         return "order"
     if any(k in t for k in ["change:", "variation", "revise", "scope", "amend"]):
@@ -113,7 +149,6 @@ def extract_text_sender_phoneid(p):
             return (txt, sender, phone_id)
     except Exception:
         pass
-
     return (None, None, None)
 
 def send_whatsapp_text(to, body, phone_id=None):
@@ -121,10 +156,7 @@ def send_whatsapp_text(to, body, phone_id=None):
     if META_TOKEN and phone_id:
         try:
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
-            headers = {
-                "Authorization": f"Bearer {META_TOKEN}",
-                "Content-Type": "application/json"
-            }
+            headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
             data = {"messaging_product": "whatsapp", "to": to, "text": {"body": body}}
             r = requests.post(url, headers=headers, json=data, timeout=15)
             app.logger.info(f"META_SEND status_code={r.status_code} body={r.text}")
