@@ -1,62 +1,47 @@
-import os, datetime
-from sqlalchemy import create_engine, text
+# storage.py
+import os, sqlite3, threading
 
-DB_URL = os.environ["DATABASE_URL"]
-engine = create_engine(DB_URL, pool_pre_ping=True)
+_DB_LOCK = threading.Lock()
+# If DATABASE_URL is a simple filename, we use SQLite at that path.
+# If it's unset, default to a local file "hubflo.db".
+_DB_PATH = os.environ.get("DATABASE_URL", "hubflo.db")
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS users (
- id SERIAL PRIMARY KEY,
- alias TEXT UNIQUE NOT NULL,
- name TEXT,
- wa_id TEXT UNIQUE,
- role TEXT,
- active BOOLEAN DEFAULT TRUE
-);
-CREATE TABLE IF NOT EXISTS tasks (
- task_id INTEGER PRIMARY KEY,
- project TEXT, trade TEXT, assignee_alias TEXT,
- due_date DATE, status TEXT, eta TEXT,
- notes TEXT, evidence_urls TEXT, change_orders TEXT,
- last_update_ts TIMESTAMPTZ
-);
-CREATE TABLE IF NOT EXISTS events (
- id SERIAL PRIMARY KEY,
- ts TIMESTAMPTZ DEFAULT NOW(),
- task_id INTEGER,
- kind TEXT,
- payload JSONB
-);
-"""
+def _conn():
+    return sqlite3.connect(_DB_PATH, check_same_thread=False)
 
 def init_db():
- with engine.begin() as cx:
-   cx.exec_driver_sql(SCHEMA_SQL)
+    with _DB_LOCK, _conn() as cx:
+        cx.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT,
+            text   TEXT,
+            ts     DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        cx.commit()
 
-def now_iso():
- return datetime.datetime.utcnow().isoformat()
+def create_task(task):
+    """task: dict with keys 'sender', 'text'"""
+    with _DB_LOCK, _conn() as cx:
+        cur = cx.execute(
+            "INSERT INTO tasks (sender, text) VALUES (?, ?)",
+            (task.get("sender"), task.get("text"))
+        )
+        cx.commit()
+        return cur.lastrowid
 
-def upsert_task(task):
- sql = """
- INSERT INTO tasks (task_id,project,trade,assignee_alias,due_date,status,eta,notes,evidence_urls,change_orders,last_update_ts)
- VALUES (:task_id,:project,:trade,:assignee_alias,:due_date,:status,:eta,:notes,:evidence_urls,:change_orders,:last_update_ts)
- ON CONFLICT (task_id) DO UPDATE SET
-   project=EXCLUDED.project, trade=EXCLUDED.trade, assignee_alias=EXCLUDED.assignee_alias,
-   due_date=EXCLUDED.due_date, status=EXCLUDED.status, eta=EXCLUDED.eta,
-   notes=COALESCE(tasks.notes,'') || CASE WHEN EXCLUDED.notes IS NULL OR EXCLUDED.notes='' THEN '' ELSE ' | '||EXCLUDED.notes END,
-   evidence_urls=COALESCE(tasks.evidence_urls,'') || CASE WHEN EXCLUDED.evidence_urls IS NULL OR EXCLUDED.evidence_urls='' THEN '' ELSE ' | '||EXCLUDED.evidence_urls END,
-   change_orders=COALESCE(tasks.change_orders,'') || CASE WHEN EXCLUDED.change_orders IS NULL OR EXCLUDED.change_orders='' THEN '' ELSE ' | '||EXCLUDED.change_orders END,
-   last_update_ts=EXCLUDED.last_update_ts;
- """
- with engine.begin() as cx:
-   cx.execute(text(sql), task)
-
-def append_event(task_id, kind, payload):
- with engine.begin() as cx:
-   cx.execute(text("INSERT INTO events (task_id, kind, payload) VALUES (:t,:k,:p)"),
-              {"t": task_id, "k": kind, "p": payload})
-
-def get_tasks(ids):
- q = text("SELECT task_id, status, eta, notes, evidence_urls, change_orders FROM tasks WHERE task_id = ANY(:ids)")
- with engine.begin() as cx:
-   return [dict(r) for r in cx.execute(q, {"ids": ids}).mappings()]
+def get_tasks(ids=None):
+    q = "SELECT id, sender, text, ts FROM tasks"
+    params = ()
+    if ids:
+        placeholders = ",".join(["?"] * len(ids))
+        q += f" WHERE id IN ({placeholders})"
+        params = tuple(ids)
+    q += " ORDER BY id DESC LIMIT 100"
+    with _DB_LOCK, _conn() as cx:
+        rows = cx.execute(q, params).fetchall()
+    return [
+        {"id": r[0], "sender": r[1], "text": r[2], "ts": r[3]}
+        for r in rows
+    ]
