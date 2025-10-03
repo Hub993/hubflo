@@ -1,305 +1,273 @@
-import os, json, logging, html
-from flask import Flask, request, jsonify, abort
-from storage import init_db, create_task, get_tasks
+import os
+import json
+import logging
+import urllib.parse
 import requests
-from collections import Counter
+from flask import Flask, request, jsonify, abort, Response
+from dotenv import load_dotenv
+
+# --- env + logging -----------------------------------------------------------
+load_dotenv()
+
+ADMIN_TOKEN = os.environ.get("HUBFLO_ADMIN_TOKEN", "")
+BOUND_NUMBER = os.environ.get("BOUND_NUMBER", "")  # your WhatsApp sender (waba)
+D360_KEY     = os.environ.get("D360_KEY", "")      # 360dialog Sandbox/Prod key (x-headers)
+D360_BEARER  = os.environ.get("DIALOG360_API_KEY", "")  # if you later use Bearer flow
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-# --- Environment (outbound still gated in sandbox) ---
-META_TOKEN = os.getenv("META_TOKEN", "")
-D360_KEY = os.getenv("D360_KEY", "")
-D360_SEND_URL = os.getenv("D360_SEND_URL", "https://waba.360dialog.io/v1/messages")
-ADMIN_TOKEN = os.getenv("HUBFLO_ADMIN_TOKEN", "")
-
-# DB ready
+# --- storage ---------------------------------------------------------------
+# storage.py must provide: init_db(), create_task(dict), get_tasks([ids]|None)
+from storage import init_db, create_task, get_tasks
 init_db()
 
-# ---------- Admin helpers ----------
-def _check_admin():
-    token = request.args.get("token")
-    if token != ADMIN_TOKEN:
+# --- helpers ---------------------------------------------------------------
+def check_auth():
+    # Token via header OR querystring ?token=
+    token = request.headers.get("Authorization", "")
+    if token.lower().startswith("bearer "):
+        token = token[7:]
+    else:
+        token = request.args.get("token", "")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         abort(401)
 
-def _int(v, default=None):
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-# ---------- Classifier (strict-but-friendly) ----------
-def classify_text_strict(txt: str):
+def classify_tag(text: str) -> str:
     """
-    Strict-but-friendly tagging:
-    - Prefixes accepted with or without colon: 'Order:' or 'Order ', etc.
-    - Hashtag overrides anywhere: #order, #change, #urgent, #task
-    - NO quantity/material heuristics (e.g., '20m conduit' stays untagged) to avoid false positives.
+    Hybrid classifier:
+    - explicit hashtags: #order #task #change #urgent (takes priority)
+    - prefix cues: startswith('order', 'change', 'urgent', 'task')
+    - else: blank (ungrouped/general)
     """
-    t = (txt or "").lower().strip()
+    if not text:
+        return None
+    low = text.lower().strip()
 
-    # Hashtag overrides (take precedence)
-    if "#order" in t:
-        return "order"
-    if "#change" in t:
-        return "change"
-    if "#urgent" in t:
-        return "urgent"
-    if "#task" in t:
-        return "task"
+    # hashtag override
+    if "#order" in low:  return "order"
+    if "#task" in low:   return "task"
+    if "#change" in low: return "change"
+    if "#urgent" in low: return "urgent"
 
-    # Accept prefixes with or without ':' (e.g., "order 25m...", "order: 25m...")
-    def starts_with(word):
-        return t.startswith(f"{word}:") or t.startswith(f"{word} ")
+    # soft prefix cues
+    if low.startswith("order"):   return "order"
+    if low.startswith("change"):  return "change"
+    if low.startswith("urgent"):  return "urgent"
+    if low.startswith("task"):    return "task"
 
-    # Orders (explicit only)
-    if starts_with("order") or starts_with("po") or starts_with("purchase"):
-        return "order"
-
-    # Changes / variations (explicit)
-    if starts_with("change") or t.startswith("variation:") or " variation:" in t or t.startswith("revise scope:") or t.startswith("amend:"):
-        return "change"
-
-    # Urgency (explicit cue words at start)
-    if starts_with("urgent") or t.startswith("asap") or t.startswith("immediately") or t.startswith("now!"):
-        return "urgent"
-
-    # Tasks (explicit cues)
-    if starts_with("task") or starts_with("install") or starts_with("schedule"):
-        return "task"
-
+    # no tag
     return None
 
-# ---------- Payload parsing ----------
-def extract_text_sender_phoneid(p):
-    # 360dialog direct format
-    msgs = p.get("messages")
-    if msgs:
-        m0 = msgs[0]
-        sender = m0.get("from")
-        t = m0.get("type")
-        if t == "text":
-            txt = (m0.get("text") or {}).get("body")
-        elif "button" in m0:
-            txt = (m0.get("button") or {}).get("text")
-        elif t == "interactive":
-            inter = m0.get("interactive") or {}
-            txt = ((inter.get("button_reply") or {}).get("title")
-                   or (inter.get("list_reply") or {}).get("title"))
-        else:
-            txt = None
-        return (txt, sender, None)
+def send_whatsapp_text(to_wa_id: str, body: str) -> dict:
+    """
+    Attempt to send via 360dialog.
+    Note: In sandbox you will likely see 401 'Invalid api key'—that’s expected until we go production.
+    """
+    result = {"ok": False, "status_code": None, "body": None}
 
-    # Meta relay format (what your logs show)
+    # Endpoint used by 360dialog
+    url = "https://waba.360dialog.io/v1/messages"
+
+    payload = {
+        "to": to_wa_id,
+        "type": "text",
+        "text": {"body": body}
+    }
+
+    # Try x-API-KEY header style (common for D360)
+    if D360_KEY:
+        headers = {
+            "Content-Type": "application/json",
+            "D360-API-KEY": D360_KEY
+        }
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+            result["status_code"] = r.status_code
+            result["body"] = r.text
+            app.logger.info(f"D360_SEND status_code={r.status_code} body={r.text}")
+            if r.ok:
+                result["ok"] = True
+                return result
+        except Exception as e:
+            app.logger.error(f"D360_SEND error: {e}")
+
+    # Try Bearer fallback if provided
+    if D360_BEARER:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {D360_BEARER}",
+        }
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+            result["status_code"] = r.status_code
+            result["body"] = r.text
+            app.logger.info(f"D360_SEND (bearer) status_code={r.status_code} body={r.text}")
+            if r.ok:
+                result["ok"] = True
+                return result
+        except Exception as e:
+            app.logger.error(f"D360_SEND bearer error: {e}")
+
+    # If we got here, either keys missing or 401 etc.
+    if not D360_KEY and not D360_BEARER:
+        app.logger.warning("send_whatsapp_text skipped (missing D360 key)")
+    return result
+
+# --- routes ----------------------------------------------------------------
+@app.route("/")
+def index():
+    return Response("HUBFLO service running", mimetype="text/plain")
+
+@app.route("/health")
+def health():
+    return jsonify(ok=True)
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    app.logger.info("Inbound webhook hit")
     try:
-        entry = (p.get("entry") or [])[0]
-        changes = (entry.get("changes") or [])[0]
-        value = changes.get("value") or {}
-        msgs = value.get("messages") or []
-        metadata = value.get("metadata") or {}
-        phone_id = metadata.get("phone_number_id")
-        if msgs:
-            m0 = msgs[0]
-            sender = m0.get("from")
-            t = m0.get("type")
-            if t == "text":
-                txt = (m0.get("text") or {}).get("body")
-            elif "button" in m0:
-                txt = (m0.get("button") or {}).get("text")
-            elif t == "interactive":
-                inter = m0.get("interactive") or {}
-                txt = ((inter.get("button_reply") or {}).get("title")
-                       or (inter.get("list_reply") or {}).get("title"))
-            else:
-                txt = None
-            return (txt, sender, phone_id)
+        app.logger.info(f"RAW_PAYLOAD={json.dumps(data)}")
     except Exception:
         pass
 
-    return (None, None, None)
-
-# ---------- Outbound (optional) ----------
-def send_whatsapp_text(to, body, phone_id=None):
-    # Meta Cloud (requires META_TOKEN; optional)
-    if META_TOKEN and phone_id:
-        try:
-            url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
-            headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
-            data = {"messaging_product": "whatsapp", "to": to, "text": {"body": body}}
-            r = requests.post(url, headers=headers, json=data, timeout=15)
-            app.logger.info(f"META_SEND status_code={r.status_code} body={r.text}")
-            return 200 <= r.status_code < 300
-        except Exception as e:
-            app.logger.error(f"META_SEND error={e}")
-
-    # 360dialog (sandbox likely 401; fine for now)
-    if D360_KEY:
-        try:
-            headers = {"D360-API-KEY": D360_KEY, "Content-Type": "application/json"}
-            data = {"to": to, "type": "text", "text": {"body": body}}
-            r = requests.post(D360_SEND_URL, headers=headers, json=data, timeout=15)
-            app.logger.info(f"D360_SEND status_code={r.status_code} body={r.text}")
-            return 200 <= r.status_code < 300
-        except Exception as e:
-            app.logger.error(f"D360_SEND error={e}")
-
-    app.logger.warning("AUTO_REPLY skipped (no valid provider creds: META_TOKEN+phone_id or D360_KEY)")
-    return False
-
-# ---------- Routes ----------
-@app.route("/")
-def index():
-    return "HUBFLO service running", 200
-
-@app.route("/webhook", methods=["POST"])
-@app.route("/whatsapp/webhook", methods=["POST"])
-def webhook():
-    app.logger.info("Inbound webhook hit")
-    payload = request.get_json(force=True, silent=True) or {}
-    app.logger.info("RAW_PAYLOAD=" + json.dumps(payload)[:3000])
-
-    text, sender, phone_id = extract_text_sender_phoneid(payload)
-    app.logger.info(f"MSG_BODY={text} SENDER={sender} PHONE_ID={phone_id}")
-
-    tag = classify_text_strict(text) if text else None
-    if tag:
-        app.logger.info(f"TAG={tag}")
-
-    task_id = None
-    if text and sender:
-        try:
-            task_id = create_task({"text": text, "sender": sender, "tag": tag})
-            app.logger.info(f"TASK_CREATED id={task_id}")
-        except Exception as e:
-            app.logger.error(f"TASK_CREATE_ERROR: {e}")
-
-        # Optional auto-reply (sandbox 401 is expected)
-        reply_body = f"✅ Saved (tag={tag or 'none'}): {text}"
-        sent_ok = send_whatsapp_text(sender, reply_body, phone_id=phone_id)
-        app.logger.info(f"AUTO_REPLY status={sent_ok}")
-
-    return jsonify(ok=True, task_id=task_id, tag=tag), 200
-
-# ----- Admin (read-only JSON) -----
-@app.route("/admin/debug", methods=["GET"])
-def admin_debug():
-    _check_admin()
-    return jsonify(get_tasks()), 200
-
-@app.route("/admin/search", methods=["GET"])
-def admin_search():
-    _check_admin()
-    tag = (request.args.get("tag") or "").strip().lower()
-    q = (request.args.get("q") or "").strip().lower()
-    sender = (request.args.get("sender") or "").strip()
-    rows = get_tasks()
-    if tag:
-        rows = [r for r in rows if (r.get("tag") or "") == tag]
-    if q:
-        rows = [r for r in rows if q in (r.get("text") or "").lower()]
-    if sender:
-        rows = [r for r in rows if (r.get("sender") or "") == sender]
-    return jsonify(rows), 200
-
-@app.route("/admin/summary", methods=["GET"])
-def admin_summary():
-    _check_admin()
-    rows = get_tasks()
-    counts = Counter((r.get("tag") or "none") for r in rows)
-    latest = rows[:10]
-    return jsonify({"counts_by_tag": counts, "latest": latest}), 200
-
-# ----- Admin (small utilities) -----
-@app.route("/admin/tag", methods=["GET"])
-def admin_tag():
-    """
-    Quick manual retag:
-    /admin/tag?token=...&id=5&tag=order
-    """
-    _check_admin()
-    task_id = _int(request.args.get("id"))
-    new_tag = (request.args.get("tag") or "").strip().lower() or None
-    if not task_id:
-        return jsonify(ok=False, error="missing id"), 400
-
-    rows = get_tasks([task_id])  # storage.get_tasks supports list of ids
-    if not rows:
-        return jsonify(ok=False, error="id not found"), 404
-
-    # naive in-place update: re-create with same fields but new tag
-    row = rows[0]
-    row["tag"] = new_tag
+    # Extract message and sender (Meta/WhatsApp webhook structure)
+    msg_body = None
+    sender = None
     try:
-        # storage.create_task returns new id; for simplicity we just add another record
-        # In a fuller impl we'd have update_task(). For now we append and return the new id.
-        nid = create_task({"text": row["text"], "sender": row["sender"], "tag": row["tag"]})
-        return jsonify(ok=True, new_id=nid, previous_id=task_id, tag=new_tag), 200
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+        value = data["entry"][0]["changes"][0]["value"]
+        msg = value["messages"][0]
+        msg_body = (msg.get("text") or {}).get("body")
+        sender = msg.get("from")
+    except Exception:
+        # could be other callback types
+        return jsonify(ok=True, ignored=True), 200
 
-# ----- Simple HTML view -----
-@app.route("/admin/view", methods=["GET"])
-def admin_view():
-    """
-    HTML list with optional filters:
-    /admin/view?token=...&tag=order&q=conduit&sender=13522098414
-    """
-    _check_admin()
-    tag = (request.args.get("tag") or "").strip().lower()
-    q = (request.args.get("q") or "").strip().lower()
-    sender = (request.args.get("sender") or "").strip()
+    app.logger.info(f"MSG_BODY={msg_body} SENDER={sender}")
 
-    rows = get_tasks()
+    # Tag + store
+    tag = classify_tag(msg_body or "")
+    row_id = create_task({"sender": sender, "tag": tag, "text": msg_body})
+    app.logger.info(f"TASK_CREATED id={row_id}")
+
+    # --- Basic Reply Rule (always on for now) ------------------------------
+    # Even in sandbox (401), we want to see the attempt + logs for end-to-end
+    reply_text = "✅ HUBFLO received your message."
     if tag:
-        rows = [r for r in rows if (r.get("tag") or "") == tag]
-    if q:
-        rows = [r for r in rows if q in (r.get("text") or "").lower()]
-    if sender:
-        rows = [r for r in rows if (r.get("sender") or "") == sender]
+        reply_text += f" (tag='{tag}')"
+    send_res = send_whatsapp_text(sender, reply_text)
+    app.logger.info(f"AUTO_REPLY status={send_res.get('ok', False)}")
 
-    def esc(s): return html.escape(str(s if s is not None else ""))
-    items = "\n".join(
-        f"<tr><td>{esc(r.get('id'))}</td>"
-        f"<td>{esc(r.get('ts'))}</td>"
-        f"<td>{esc(r.get('sender'))}</td>"
-        f"<td>{esc(r.get('tag') or '—')}</td>"
-        f"<td>{esc(r.get('text'))}</td></tr>"
-        for r in rows
+    return jsonify(ok=True), 200
+
+@app.route("/whatsapp/webhook", methods=["POST"])
+def whatsapp_webhook():
+    return webhook()
+
+# --- Admin: JSON & HTML views ---------------------------------------------
+@app.route("/admin/debug")
+def admin_debug():
+    check_auth()
+    ids = request.args.get("ids", "")
+    id_list = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+    return jsonify(get_tasks(id_list if id_list else None))
+
+@app.route("/admin/summary")
+def admin_summary():
+    check_auth()
+    # counts by tag + latest 10 items
+    rows = get_tasks(None)
+    counts = {}
+    for r in rows:
+        t = r.get("tag") or "none"
+        counts[t] = counts.get(t, 0) + 1
+    latest = rows[:10]
+    return jsonify({"counts_by_tag": counts, "latest": latest})
+
+@app.route("/admin/search")
+def admin_search():
+    check_auth()
+    tag = request.args.get("tag")
+    q = request.args.get("q")
+    sender = request.args.get("sender")
+
+    rows = get_tasks(None)
+    def ok(r):
+        if tag and (r.get("tag") or "") != tag:
+            return False
+        if sender and (r.get("sender") or "") != sender:
+            return False
+        if q:
+            needle = q.lower()
+            hay = f"{r.get('text','')} {r.get('tag','')} {r.get('sender','')}".lower()
+            if needle not in hay:
+                return False
+        return True
+
+    out = [r for r in rows if ok(r)]
+    return jsonify(out)
+
+@app.route("/admin/view")
+def admin_view():
+    check_auth()
+    tag = request.args.get("tag", "*")
+    q = request.args.get("q", "*")
+    sender = request.args.get("sender", "*")
+    rows = get_tasks(None)
+
+    def match(r):
+        if tag != "*" and (r.get("tag") or "") != tag:
+            return False
+        if sender != "*" and (r.get("sender") or "") != sender:
+            return False
+        if q != "*":
+            needle = q.lower()
+            hay = f"{r.get('text','')} {r.get('tag','')} {r.get('sender','')}".lower()
+            if needle not in hay:
+                return False
+        return True
+
+    filtered = [r for r in rows if match(r)]
+    html_rows = "\n".join(
+        f"<tr><td>{r['id']}</td><td>{r['ts']}</td><td>{r.get('sender','')}</td>"
+        f"<td>{r.get('tag','')}</td><td>{r.get('text','')}</td></tr>"
+        for r in filtered
     )
-    html_page = f"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<title>HUBFLO Admin View</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px}}
-table{{border-collapse:collapse;width:100%}}
-th,td{{border:1px solid #ddd;padding:8px;font-size:14px}}
-th{{background:#f6f6f6;text-align:left}}
-.controls input{{margin-right:8px;padding:6px 8px}}
-.badge{{display:inline-block;padding:2px 6px;border-radius:6px;background:#eee}}
-</style>
-</head>
-<body>
-<h2>HUBFLO Admin</h2>
-<div class="controls">
-<span class="badge">Filters: tag={esc(tag or '*')}, q={esc(q or '*')}, sender={esc(sender or '*')}</span>
-</div>
-<table>
-<thead><tr><th>ID</th><th>Time</th><th>Sender</th><th>Tag</th><th>Text</th></tr></thead>
-<tbody>
-{items or '<tr><td colspan="5">No rows</td></tr>'}
-</tbody>
-</table>
-</body>
-</html>
-"""
-    return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
+    html = f"""
+    <html>
+    <head>
+      <title>HUBFLO Admin</title>
+      <style>
+        body {{ font-family: -apple-system, system-ui, Helvetica, Arial, sans-serif; padding: 14px; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 14px; }}
+        th {{ background: #f7f7f7; text-align: left; }}
+        .filters {{ margin-bottom: 10px; font-size: 14px; }}
+        code {{ background:#f3f3f3; padding:2px 6px; border-radius:4px; }}
+      </style>
+    </head>
+    <body>
+      <h2>HUBFLO Admin</h2>
+      <div class="filters">
+        Filters:
+        tag=<code>{tag}</code> &nbsp; q=<code>{q}</code> &nbsp; sender=<code>{sender}</code>
+      </div>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Time</th><th>Sender</th><th>Tag</th><th>Text</th></tr>
+        </thead>
+        <tbody>
+          {html_rows if html_rows else "<tr><td colspan='5'>(no rows)</td></tr>"}
+        </tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return Response(html, mimetype="text/html")
 
-# ---------- Main ----------
+# --- main ------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
