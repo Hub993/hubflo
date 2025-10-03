@@ -2,10 +2,18 @@ import os, json, logging
 from flask import Flask, request, jsonify
 from storage import init_db, create_task, get_tasks
 
+import requests
+
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
+
+# === Env ===
+META_TOKEN = os.getenv("META_TOKEN", "")
+D360_KEY = os.getenv("D360_KEY", "")
+D360_SEND_URL = os.getenv("D360_SEND_URL", "https://waba.360dialog.io/v1/messages")
+ADMIN_TOKEN = os.getenv("HUBFLO_ADMIN_TOKEN", "")
 
 # Ensure DB table exists on boot
 init_db()
@@ -21,8 +29,8 @@ def webhook():
     payload = request.get_json(force=True, silent=True) or {}
     app.logger.info("RAW_PAYLOAD=" + json.dumps(payload)[:3000])
 
-    text, sender = extract_text_and_sender(payload)
-    app.logger.info(f"MSG_BODY={text} SENDER={sender}")
+    text, sender, phone_id = extract_text_sender_phoneid(payload)
+    app.logger.info(f"MSG_BODY={text} SENDER={sender} PHONE_ID={phone_id}")
 
     task_id = None
     if text and sender:
@@ -32,16 +40,25 @@ def webhook():
         except Exception as e:
             app.logger.error(f"TASK_CREATE_ERROR: {e}")
 
+        # ---- Basic Auto-Reply (sanity loop) ----
+        reply_body = f"✅ Received: {text}"
+        sent_ok = send_whatsapp_text(sender, reply_body, phone_id=phone_id)
+        app.logger.info(f"AUTO_REPLY status={sent_ok}")
+
     return jsonify(ok=True, task_id=task_id), 200
 
 @app.route("/admin/debug", methods=["GET"])
 def admin_debug():
     token = request.args.get("token")
-    if token != os.getenv("HUBFLO_ADMIN_TOKEN"):
+    if token != ADMIN_TOKEN:
         return "Unauthorized", 401
     return jsonify(get_tasks()), 200
 
-def extract_text_and_sender(p):
+def extract_text_sender_phoneid(p):
+    """
+    Returns (text, sender, phone_number_id or None)
+    Supports both 360dialog and Meta Cloud formats.
+    """
     # 360dialog direct format
     msgs = p.get("messages")
     if msgs:
@@ -49,38 +66,90 @@ def extract_text_and_sender(p):
         sender = m0.get("from")
         t = m0.get("type")
         if t == "text":
-            return ((m0.get("text") or {}).get("body"), sender)
-        if "button" in m0:
-            return ((m0.get("button") or {}).get("text"), sender)
-        if t == "interactive":
+            txt = (m0.get("text") or {}).get("body")
+        elif "button" in m0:
+            txt = (m0.get("button") or {}).get("text")
+        elif t == "interactive":
             inter = m0.get("interactive") or {}
             txt = ((inter.get("button_reply") or {}).get("title")
                    or (inter.get("list_reply") or {}).get("title"))
-            return (txt, sender)
+        else:
+            txt = None
+        # 360 webhook doesn’t include phone_number_id; return None for that
+        return (txt, sender, None)
 
-    # Meta relay format (what we’ve been seeing)
+    # Meta relay (what we’ve been seeing)
     try:
         entry = (p.get("entry") or [])[0]
         changes = (entry.get("changes") or [])[0]
         value = changes.get("value") or {}
         msgs = value.get("messages") or []
+        metadata = value.get("metadata") or {}
+        phone_id = metadata.get("phone_number_id")
         if msgs:
             m0 = msgs[0]
             sender = m0.get("from")
             t = m0.get("type")
             if t == "text":
-                return ((m0.get("text") or {}).get("body"), sender)
-            if "button" in m0:
-                return ((m0.get("button") or {}).get("text"), sender)
-            if t == "interactive":
+                txt = (m0.get("text") or {}).get("body")
+            elif "button" in m0:
+                txt = (m0.get("button") or {}).get("text")
+            elif t == "interactive":
                 inter = m0.get("interactive") or {}
                 txt = ((inter.get("button_reply") or {}).get("title")
                        or (inter.get("list_reply") or {}).get("title"))
-                return (txt, sender)
+            else:
+                txt = None
+            return (txt, sender, phone_id)
     except Exception:
         pass
 
-    return (None, None)
+    return (None, None, None)
+
+def send_whatsapp_text(to, body, phone_id=None):
+    """
+    Try Meta Cloud first (if token + phone_id are present), else 360dialog.
+    Logs clear reasons if skipped. Returns True/False for 'send attempted and accepted'.
+    """
+    # Meta Cloud path
+    if META_TOKEN and phone_id:
+        try:
+            url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+            headers = {
+                "Authorization": f"Bearer {META_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "text": {"body": body}
+            }
+            r = requests.post(url, headers=headers, json=data, timeout=15)
+            app.logger.info(f"META_SEND status_code={r.status_code} body={r.text}")
+            return 200 <= r.status_code < 300
+        except Exception as e:
+            app.logger.error(f"META_SEND error={e}")
+
+    # 360dialog path
+    if D360_KEY:
+        try:
+            headers = {
+                "D360-API-KEY": D360_KEY,
+                "Content-Type": "application/json"
+            }
+            data = {
+                "to": to,
+                "type": "text",
+                "text": {"body": body}
+            }
+            r = requests.post(D360_SEND_URL, headers=headers, json=data, timeout=15)
+            app.logger.info(f"D360_SEND status_code={r.status_code} body={r.text}")
+            return 200 <= r.status_code < 300
+        except Exception as e:
+            app.logger.error(f"D360_SEND error={e}")
+
+    app.logger.warning("AUTO_REPLY skipped (no valid provider creds: META_TOKEN+phone_id or D360_KEY)")
+    return False
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
