@@ -1,7 +1,6 @@
 import os, json, logging
 from flask import Flask, request, jsonify
 from storage import init_db, create_task, get_tasks
-
 import requests
 
 app = Flask(__name__)
@@ -9,13 +8,12 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-# === Env ===
+# Env for optional outbound (we still skip sends in sandbox)
 META_TOKEN = os.getenv("META_TOKEN", "")
 D360_KEY = os.getenv("D360_KEY", "")
 D360_SEND_URL = os.getenv("D360_SEND_URL", "https://waba.360dialog.io/v1/messages")
 ADMIN_TOKEN = os.getenv("HUBFLO_ADMIN_TOKEN", "")
 
-# Ensure DB table exists on boot
 init_db()
 
 @app.route("/")
@@ -32,20 +30,24 @@ def webhook():
     text, sender, phone_id = extract_text_sender_phoneid(payload)
     app.logger.info(f"MSG_BODY={text} SENDER={sender} PHONE_ID={phone_id}")
 
+    tag = classify_text(text) if text else None
+    if tag:
+        app.logger.info(f"TAG={tag}")
+
     task_id = None
     if text and sender:
         try:
-            task_id = create_task({"text": text, "sender": sender})
+            task_id = create_task({"text": text, "sender": sender, "tag": tag})
             app.logger.info(f"TASK_CREATED id={task_id}")
         except Exception as e:
             app.logger.error(f"TASK_CREATE_ERROR: {e}")
 
-        # ---- Basic Auto-Reply (sanity loop) ----
-        reply_body = f"✅ Received: {text}"
+        # Optional auto-reply (will be blocked in 360 sandbox; keeps log clarity)
+        reply_body = f"✅ Saved (tag={tag or 'none'}): {text}"
         sent_ok = send_whatsapp_text(sender, reply_body, phone_id=phone_id)
         app.logger.info(f"AUTO_REPLY status={sent_ok}")
 
-    return jsonify(ok=True, task_id=task_id), 200
+    return jsonify(ok=True, task_id=task_id, tag=tag), 200
 
 @app.route("/admin/debug", methods=["GET"])
 def admin_debug():
@@ -54,12 +56,21 @@ def admin_debug():
         return "Unauthorized", 401
     return jsonify(get_tasks()), 200
 
+def classify_text(txt):
+    t = (txt or "").lower()
+    # simple keyword rules (can evolve)
+    if any(k in t for k in ["order:", "po ", "purchase", "vendor", "deliver", "quote", "invoice"]):
+        return "order"
+    if any(k in t for k in ["change:", "variation", "revise", "scope", "amend"]):
+        return "change"
+    if any(k in t for k in ["urgent", "asap", "immediately", "now!"]):
+        return "urgent"
+    if any(k in t for k in ["install", "fix", "task:", "todo", "schedule"]):
+        return "task"
+    return None
+
 def extract_text_sender_phoneid(p):
-    """
-    Returns (text, sender, phone_number_id or None)
-    Supports both 360dialog and Meta Cloud formats.
-    """
-    # 360dialog direct format
+    # 360dialog format
     msgs = p.get("messages")
     if msgs:
         m0 = msgs[0]
@@ -75,10 +86,9 @@ def extract_text_sender_phoneid(p):
                    or (inter.get("list_reply") or {}).get("title"))
         else:
             txt = None
-        # 360 webhook doesn’t include phone_number_id; return None for that
         return (txt, sender, None)
 
-    # Meta relay (what we’ve been seeing)
+    # Meta relay format
     try:
         entry = (p.get("entry") or [])[0]
         changes = (entry.get("changes") or [])[0]
@@ -107,11 +117,7 @@ def extract_text_sender_phoneid(p):
     return (None, None, None)
 
 def send_whatsapp_text(to, body, phone_id=None):
-    """
-    Try Meta Cloud first (if token + phone_id are present), else 360dialog.
-    Logs clear reasons if skipped. Returns True/False for 'send attempted and accepted'.
-    """
-    # Meta Cloud path
+    # Meta Cloud
     if META_TOKEN and phone_id:
         try:
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
@@ -119,29 +125,18 @@ def send_whatsapp_text(to, body, phone_id=None):
                 "Authorization": f"Bearer {META_TOKEN}",
                 "Content-Type": "application/json"
             }
-            data = {
-                "messaging_product": "whatsapp",
-                "to": to,
-                "text": {"body": body}
-            }
+            data = {"messaging_product": "whatsapp", "to": to, "text": {"body": body}}
             r = requests.post(url, headers=headers, json=data, timeout=15)
             app.logger.info(f"META_SEND status_code={r.status_code} body={r.text}")
             return 200 <= r.status_code < 300
         except Exception as e:
             app.logger.error(f"META_SEND error={e}")
 
-    # 360dialog path
+    # 360dialog
     if D360_KEY:
         try:
-            headers = {
-                "D360-API-KEY": D360_KEY,
-                "Content-Type": "application/json"
-            }
-            data = {
-                "to": to,
-                "type": "text",
-                "text": {"body": body}
-            }
+            headers = {"D360-API-KEY": D360_KEY, "Content-Type": "application/json"}
+            data = {"to": to, "type": "text", "text": {"body": body}}
             r = requests.post(D360_SEND_URL, headers=headers, json=data, timeout=15)
             app.logger.info(f"D360_SEND status_code={r.status_code} body={r.text}")
             return 200 <= r.status_code < 300
