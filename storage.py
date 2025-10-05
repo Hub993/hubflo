@@ -1,10 +1,8 @@
 # storage.py
 import os
 import datetime as dt
-from urllib.parse import urlparse
-
 from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, Text, Boolean, Float
+    create_engine, Column, Integer, String, DateTime, Text, Boolean, Float, func
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -13,13 +11,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 def _normalize_db_url(url: str) -> str:
-    """
-    Accepts sqlite or postgres URLs. Render usually provides DATABASE_URL.
-    """
     if not url:
-        # Ephemeral local sqlite fallback (OK for free-tier tests)
         return "sqlite:///hubflo.db"
-    # Render might give postgres://; SQLAlchemy wants postgresql://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     return url
@@ -36,9 +29,9 @@ class Task(Base):
     id = Column(Integer, primary_key=True)
 
     # core
-    sender = Column(String(64), index=True, nullable=True)   # wa_id or phone
-    text = Column(Text, nullable=True)                       # raw user text
-    tag = Column(String(32), index=True, nullable=True)      # order/change/task/urgent/none
+    sender = Column(String(64), index=True, nullable=True)
+    text = Column(Text, nullable=True)
+    tag = Column(String(32), index=True, nullable=True)
     ts = Column(DateTime, default=dt.datetime.utcnow, index=True)
 
     # lifecycle / status
@@ -53,19 +46,22 @@ class Task(Base):
     is_rework = Column(Boolean, default=False)
     overrun_days = Column(Float, default=0.0)
 
-    # attachments (store first; can expand to child table later)
+    # attachments (metadata only for now)
     attachment_url = Column(Text, nullable=True)
     attachment_mime = Column(String(128), nullable=True)
     attachment_name = Column(String(256), nullable=True)
 
-    # routing / roles (simple placeholders)
-    subcontractor_name = Column(String(128), nullable=True)
+    # routing / roles
+    subcontractor_name = Column(String(128), index=True, nullable=True)
     project_code = Column(String(128), index=True, nullable=True)
 
 def init_db():
     Base.metadata.create_all(ENGINE)
 
-# --- CRUD helpers ------------------------------------------------------------
+# --- Helpers ----------------------------------------------------------------
+
+def _as_dt_str(d: dt.datetime | None) -> str | None:
+    return d.strftime("%Y-%m-%d %H:%M:%S") if d else None
 
 def _as_dict(t: Task) -> dict:
     return {
@@ -73,9 +69,9 @@ def _as_dict(t: Task) -> dict:
         "sender": t.sender,
         "text": t.text,
         "tag": t.tag,
-        "ts": t.ts.strftime("%Y-%m-%d %H:%M:%S") if t.ts else None,
+        "ts": _as_dt_str(t.ts),
         "status": t.status,
-        "due_date": t.due_date.strftime("%Y-%m-%d %H:%M:%S") if t.due_date else None,
+        "due_date": _as_dt_str(t.due_date),
         "is_rework": t.is_rework,
         "overrun_days": t.overrun_days,
         "attachment": {
@@ -86,6 +82,8 @@ def _as_dict(t: Task) -> dict:
         "subcontractor_name": t.subcontractor_name,
         "project_code": t.project_code,
     }
+
+# --- CRUD -------------------------------------------------------------------
 
 def create_task(sender: str, text: str, tag: str = None,
                 attachment: dict | None = None,
@@ -110,6 +108,33 @@ def create_task(sender: str, text: str, tag: str = None,
         s.refresh(t)
         return _as_dict(t)
 
+def _apply_search(qry, q: str):
+    """
+    Case-insensitive, multi-term search across several fields.
+    Works on SQLite and Postgres.
+    """
+    terms = [t.strip() for t in (q or "").split() if t.strip()]
+    if not terms:
+        return qry
+    fields = [
+        func.coalesce(func.lower(Task.text), ""),
+        func.coalesce(func.lower(Task.tag), ""),
+        func.coalesce(func.lower(Task.sender), ""),
+        func.coalesce(func.lower(Task.subcontractor_name), ""),
+        func.coalesce(func.lower(Task.project_code), ""),
+    ]
+    for term in terms:
+        like = f"%{term.lower()}%"
+        # each term must match at least one field
+        qry = qry.filter(
+            (fields[0].like(like)) |
+            (fields[1].like(like)) |
+            (fields[2].like(like)) |
+            (fields[3].like(like)) |
+            (fields[4].like(like))
+        )
+    return qry
+
 def get_tasks(tag: str | None = None, q: str | None = None,
               sender: str | None = None, limit: int = 100):
     with SessionLocal() as s:
@@ -122,8 +147,7 @@ def get_tasks(tag: str | None = None, q: str | None = None,
         if sender:
             qry = qry.filter(Task.sender == sender)
         if q:
-            like = f"%{q}%"
-            qry = qry.filter(Task.text.ilike(like))
+            qry = _apply_search(qry, q)
         rows = qry.limit(limit).all()
         return [_as_dict(t) for t in rows]
 
@@ -137,7 +161,7 @@ def get_summary():
         latest = [_as_dict(t) for t in rows[:10]]
         return {"counts_by_tag": counts, "latest": latest}
 
-# status transitions
+# --- Status transitions ------------------------------------------------------
 
 def mark_done(task_id: int):
     with SessionLocal() as s:
@@ -146,7 +170,6 @@ def mark_done(task_id: int):
             return None
         t.status = "done"
         t.completed_at = dt.datetime.utcnow()
-        # compute overrun if due_date existed
         if t.due_date and t.completed_at:
             delta = (t.completed_at.date() - t.due_date.date()).days
             t.overrun_days = float(max(0, delta))
@@ -177,7 +200,7 @@ def reject_task(task_id: int, rework: bool = True):
         s.refresh(t)
         return _as_dict(t)
 
-# accuracy scoring for a subcontractor (simple baseline)
+# --- Accuracy scoring --------------------------------------------------------
 
 def subcontractor_accuracy(subcontractor_name: str):
     with SessionLocal() as s:
@@ -194,7 +217,7 @@ def subcontractor_accuracy(subcontractor_name: str):
                     on_time += 1
             if t.is_rework:
                 reworks += 1
-        pct = 0.0 if total == 0 else round(100.0 * on_time / total)
+        pct = 0 if total == 0 else round(100.0 * on_time / total)
         return {
             "subcontractor": subcontractor_name,
             "total": total,
