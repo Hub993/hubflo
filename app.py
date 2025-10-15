@@ -197,3 +197,21 @@ def api_stock_report():
 if __name__=="__main__":
     port=int(os.environ.get("PORT","10000"))
     app.run(host="0.0.0.0",port=port,debug=False)
+
+# ---------------------------------------------------------------------
+# External heartbeat (rigor watchdog)
+# ---------------------------------------------------------------------
+@app.route("/heartbeat", methods=["GET"])
+def heartbeat():
+    """
+    Simple external tether check. 
+    Returns 200 OK if the service is running and database reachable.
+    """
+    try:
+        from storage import SessionLocal
+        with SessionLocal() as s:
+            s.execute("SELECT 1")
+        status = {"hubflo": "alive", "db": "connected"}
+        return jsonify(status), 200
+    except Exception as e:
+        return jsonify({"hubflo": "alive", "db_error": str(e)}), 500
