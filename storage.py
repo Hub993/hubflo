@@ -1,3 +1,4 @@
+CONFIRM V6
 # storage_v6.py — HUBFLO Unified Storage Layer (Post-v5/v6 rebuild)
 # Derived from verified v5 base + reinforced tethered safeguards
 # ---------------------------------------------------------------------

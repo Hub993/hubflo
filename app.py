@@ -1,3 +1,4 @@
+CONFIRM V6
 # app_v6.py  — HubFlo Version 6
 # ---------------------------------------------------------------
 # Rebuilt from v5 base with all verified post-V5 improvements:
