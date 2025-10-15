@@ -194,9 +194,6 @@ def api_stock_report():
 # ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
-if __name__=="__main__":
-    port=int(os.environ.get("PORT","10000"))
-    app.run(host="0.0.0.0",port=port,debug=False)
 
 # ---------------------------------------------------------------------
 # External heartbeat (rigor watchdog)
@@ -215,3 +212,8 @@ def heartbeat():
         return jsonify(status), 200
     except Exception as e:
         return jsonify({"hubflo": "alive", "db_error": str(e)}), 500
+
+if __name__=="__main__":
+    port=int(os.environ.get("PORT","10000"))
+    app.run(host="0.0.0.0",port=port,debug=False)
+
