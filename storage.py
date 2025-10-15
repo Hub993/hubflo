@@ -1,16 +1,18 @@
-# v5 storage.py
+# storage_v6.py — HUBFLO Unified Storage Layer (Post-v5/v6 rebuild)
+# Derived from verified v5 base + reinforced tethered safeguards
+# ---------------------------------------------------------------------
 import os
 import datetime as dt
 from typing import Optional, Iterable
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, Text, Boolean, Float, ForeignKey
+    create_engine, Column, Integer, String, DateTime, Text, Boolean, Float
 )
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # DB bootstrap
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def _normalize_db_url(url: str) -> str:
     if not url:
         return "sqlite:///hubflo.db"
@@ -23,80 +25,72 @@ ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=ENGINE, expire_on_commit=False, future=True)
 Base = declarative_base()
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Models
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 class Task(Base):
     __tablename__ = "tasks"
 
     id = Column(Integer, primary_key=True)
-    # core
-    sender = Column(String(64), index=True, nullable=True)      # wa_id / phone
-    text = Column(Text, nullable=True)                          # raw user text
-    tag = Column(String(32), index=True, nullable=True)         # order|change|task|urgent|none
+    sender = Column(String(64), index=True)
+    text = Column(Text)
+    tag = Column(String(32), index=True)
     ts = Column(DateTime, default=dt.datetime.utcnow, index=True)
 
-    # lifecycle / status
-    status = Column(String(24), default="open", index=True)     # open|in_progress|done|approved|rejected
-    due_date = Column(DateTime, nullable=True)
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    approved_at = Column(DateTime, nullable=True)
-    rejected_at = Column(DateTime, nullable=True)
+    status = Column(String(24), default="open", index=True)
+    due_date = Column(DateTime)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    approved_at = Column(DateTime)
+    rejected_at = Column(DateTime)
 
-    # flags
     is_rework = Column(Boolean, default=False)
     overrun_days = Column(Float, default=0.0)
 
-    # routing / roles
-    subcontractor_name = Column(String(128), nullable=True)
-    project_code = Column(String(128), index=True, nullable=True)
+    subcontractor_name = Column(String(128))
+    project_code = Column(String(128), index=True)
 
-    # attachments (single-primary; can expand later)
-    attachment_url = Column(Text, nullable=True)
-    attachment_mime = Column(String(128), nullable=True)
-    attachment_name = Column(String(256), nullable=True)
+    attachment_url = Column(Text)
+    attachment_mime = Column(String(128))
+    attachment_name = Column(String(256))
 
-    # order lifecycle
-    order_state = Column(String(32), nullable=True)             # quoted|pending_approval|approved|cancelled|invoiced|enacted
+    order_state = Column(String(32))  # quoted|pending_approval|approved|cancelled|invoiced|enacted
+    subtype = Column(String(24))      # assigned|self (added in v6)
 
-    # audit
     last_updated = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
 
 class Meeting(Base):
     __tablename__ = "meetings"
 
     id = Column(Integer, primary_key=True)
-    title = Column(String(200), nullable=False)                 # e.g., "Electrical snag review"
-    project_code = Column(String(128), index=True, nullable=True)
-    subcontractor_name = Column(String(128), nullable=True)
-    site_name = Column(String(200), nullable=True)
-    scheduled_for = Column(DateTime, index=True, nullable=True)
-    started_at = Column(DateTime, nullable=True)
-    closed_at = Column(DateTime, nullable=True)
-    created_by = Column(String(64), nullable=True)              # PM wa_id
-    status = Column(String(24), default="scheduled", index=True)  # scheduled|active|closed|cancelled
-
-    # simple bind: comma-separated task ids snapshot (lightweight)
-    task_ids = Column(Text, nullable=True)                      # "12,15,19"
+    title = Column(String(200), nullable=False)
+    project_code = Column(String(128), index=True)
+    subcontractor_name = Column(String(128))
+    site_name = Column(String(200))
+    scheduled_for = Column(DateTime, index=True)
+    started_at = Column(DateTime)
+    closed_at = Column(DateTime)
+    created_by = Column(String(64))
+    status = Column(String(24), default="scheduled", index=True)
+    task_ids = Column(Text)  # comma-separated ids
 
 class Audit(Base):
     __tablename__ = "audits"
 
     id = Column(Integer, primary_key=True)
     ts = Column(DateTime, default=dt.datetime.utcnow, index=True)
-    actor = Column(String(64), nullable=True)
-    action = Column(String(64), nullable=False)                 # approve|reject|mark_done|revoke|meeting_start|etc
-    ref_type = Column(String(32), nullable=False)               # task|meeting|system
-    ref_id = Column(Integer, nullable=False)
-    details = Column(Text, nullable=True)
+    actor = Column(String(64))
+    action = Column(String(64))
+    ref_type = Column(String(32))
+    ref_id = Column(Integer)
+    details = Column(Text)
 
 def init_db():
     Base.metadata.create_all(ENGINE)
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def _ts(x: Optional[dt.datetime]) -> Optional[str]:
     return x.strftime("%Y-%m-%d %H:%M:%S") if x else None
 
@@ -115,14 +109,15 @@ def _as_task_dict(t: Task) -> dict:
         "rejected_at": _ts(t.rejected_at),
         "is_rework": t.is_rework,
         "overrun_days": t.overrun_days,
+        "subcontractor_name": t.subcontractor_name,
+        "project_code": t.project_code,
+        "order_state": t.order_state,
+        "subtype": t.subtype,
         "attachment": {
             "name": t.attachment_name,
             "mime": t.attachment_mime,
             "url": t.attachment_url,
         } if t.attachment_url else None,
-        "subcontractor_name": t.subcontractor_name,
-        "project_code": t.project_code,
-        "order_state": t.order_state,
         "last_updated": _ts(t.last_updated),
     }
 
@@ -146,28 +141,28 @@ def log_audit(actor: Optional[str], action: str, ref_type: str, ref_id: int, det
         s.add(Audit(actor=actor, action=action, ref_type=ref_type, ref_id=ref_id, details=details))
         s.commit()
 
-# -----------------------------------------------------------------------------
-# Task CRUD
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Core CRUD
+# ---------------------------------------------------------------------
 def create_task(sender: str, text: str, tag: Optional[str] = None,
                 attachment: Optional[dict] = None,
                 subcontractor_name: Optional[str] = None,
                 project_code: Optional[str] = None,
                 due_date: Optional[dt.datetime] = None,
-                order_state: Optional[str] = None) -> dict:
+                order_state: Optional[str] = None,
+                subtype: Optional[str] = None) -> dict:
     with SessionLocal() as s:
         t = Task(
-            sender=sender, text=text or "", tag=tag or None,
+            sender=sender, text=text or "", tag=tag,
             subcontractor_name=subcontractor_name, project_code=project_code,
-            due_date=due_date, order_state=order_state
+            due_date=due_date, order_state=order_state, subtype=subtype
         )
         if attachment:
             t.attachment_name = attachment.get("name")
             t.attachment_mime = attachment.get("mime")
             t.attachment_url  = attachment.get("url")
         s.add(t)
-        s.commit()
-        s.refresh(t)
+        s.commit(); s.refresh(t)
         log_audit(sender, "create", "task", t.id, details=text or "")
         return _as_task_dict(t)
 
@@ -204,7 +199,7 @@ def mark_done(task_id: int, actor: Optional[str] = None):
         if not t: return None
         t.status = "done"
         t.completed_at = dt.datetime.utcnow()
-        if t.due_date and t.completed_at:
+        if t.due_date:
             delta = (t.completed_at.date() - t.due_date.date()).days
             t.overrun_days = float(max(0, delta))
         s.commit(); s.refresh(t)
@@ -242,10 +237,6 @@ def set_order_state(task_id: int, state: str, actor: Optional[str] = None):
         return _as_task_dict(t)
 
 def revoke_last(task_id: int, actor: Optional[str] = None):
-    """
-    Soft revoke: revert last terminal status (approved/rejected/done) back to 'open'.
-    Audit trail records the revoke.
-    """
     with SessionLocal() as s:
         t = s.get(Task, task_id)
         if not t: return None
@@ -258,16 +249,14 @@ def revoke_last(task_id: int, actor: Optional[str] = None):
             log_audit(actor, "revoke", "task", t.id)
         return _as_task_dict(t)
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Accuracy scoring
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def subcontractor_accuracy(subcontractor_name: str):
     with SessionLocal() as s:
         rows: Iterable[Task] = s.query(Task).filter(Task.subcontractor_name == subcontractor_name).all()
         total = len(rows)
-        on_time = 0
-        overruns = 0
-        reworks = 0
+        on_time = 0; overruns = 0; reworks = 0
         for t in rows:
             if t.status in ("approved", "done"):
                 if (t.overrun_days or 0) > 0:
@@ -286,12 +275,15 @@ def subcontractor_accuracy(subcontractor_name: str):
             "accuracy_pct": pct,
         }
 
-# -----------------------------------------------------------------------------
-# Meetings (lightweight Phase-1)
-# -----------------------------------------------------------------------------
-def create_meeting(title: str, project_code: Optional[str], subcontractor_name: Optional[str],
-                   site_name: Optional[str], scheduled_for: Optional[dt.datetime],
-                   task_ids: Optional[list[int]], created_by: Optional[str]) -> dict:
+# ---------------------------------------------------------------------
+# Meetings (Phase-1)
+# ---------------------------------------------------------------------
+def create_meeting(title: str, project_code: Optional[str],
+                   subcontractor_name: Optional[str],
+                   site_name: Optional[str],
+                   scheduled_for: Optional[dt.datetime],
+                   task_ids: Optional[list[int]],
+                   created_by: Optional[str]) -> dict:
     with SessionLocal() as s:
         m = Meeting(
             title=title or "Site Meeting",
@@ -307,8 +299,8 @@ def create_meeting(title: str, project_code: Optional[str], subcontractor_name: 
         log_audit(created_by, "meeting_create", "meeting", m.id, details=m.title)
         return _as_meeting_dict(m)
 
-def start_meeting(meeting_id: int, actor: Optional[str] = None) -> Optional[dict]:
-    with SessionLocal() as s:
+def start_meeting(meeting_id: int, actor: Optional[str] = None):
+    with Session_local() as s:
         m = s.get(Meeting, meeting_id)
         if not m: return None
         m.status = "active"
@@ -317,7 +309,7 @@ def start_meeting(meeting_id: int, actor: Optional[str] = None) -> Optional[dict
         log_audit(actor, "meeting_start", "meeting", m.id)
         return _as_meeting_dict(m)
 
-def close_meeting(meeting_id: int, actor: Optional[str] = None) -> Optional[dict]:
+def close_meeting(meeting_id: int, actor: Optional[str] = None):
     with SessionLocal() as s:
         m = s.get(Meeting, meeting_id)
         if not m: return None
