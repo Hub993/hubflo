@@ -318,3 +318,22 @@ def close_meeting(meeting_id: int, actor: Optional[str] = None):
         s.commit(); s.refresh(m)
         log_audit(actor, "meeting_close", "meeting", m.id)
         return _as_meeting_dict(m)
+
+# ---------------------------------------------------------------------
+# Change Orders & Stock (placeholders for V6 live test)
+# ---------------------------------------------------------------------
+def record_change_order(data: dict):
+    """Temporary stub; replace with full implementation later."""
+    return {"status": "ok", "message": "Change order recorded", "data": data}
+
+def create_stock_item(data: dict):
+    """Temporary stub; replace with full implementation later."""
+    return {"status": "ok", "message": "Stock item created", "data": data}
+
+def adjust_stock(data: dict):
+    """Temporary stub; replace with full implementation later."""
+    return {"status": "ok", "message": "Stock adjusted", "data": data}
+
+def get_stock_report():
+    """Temporary stub; replace with full implementation later."""
+    return {"status": "ok", "report": []}
