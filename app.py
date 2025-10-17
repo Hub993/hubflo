@@ -1,4 +1,4 @@
-# app_v6.py  — HubFlo Version 6
+z# app_v6.py  — HubFlo Version 6
 # ---------------------------------------------------------------
 # Rebuilt from v5 base with all verified post-V5 improvements:
 # - Order-step checklist
@@ -47,6 +47,79 @@ ORDER_LIFECYCLE_STATES = [
 # Boot DB
 # ---------------------------------------------------------------------
 init_db()
+
+# ============================================================
+# HUBFLO INTEGRITY PATCH — HEARTBEAT TETHER V6 — 2025-10-17
+# Checksum: HP-V6-20251017-A01
+# Placement: below imports, above first @app.route
+# Purpose: Adds independent heartbeat tether, hygiene pin, guard, and integrity endpoint
+# ============================================================
+
+from sqlalchemy import text
+from datetime import datetime, timezone
+
+# --- System State Model (if not already present) ---
+class SystemState(db.Model):
+    __tablename__ = "system_state"
+    id = db.Column(db.Integer, primary_key=True)
+    hygiene_last_utc = db.Column(db.String(40))
+    redmode = db.Column(db.Boolean, default=False)
+    redmode_reason = db.Column(db.String(200))
+
+# --- Hygiene Functions ---
+def hygiene_pin():
+    """Record the current UTC timestamp as last healthy heartbeat."""
+    ss = SystemState.query.first()
+    if not ss:
+        ss = SystemState()
+        db.session.add(ss)
+    ss.hygiene_last_utc = datetime.now(timezone.utc).isoformat()
+    db.session.commit()
+
+def hygiene_guard(threshold_seconds=120):
+    """Check if hygiene pin is stale. Return (ok, reason)."""
+    ss = SystemState.query.first()
+    if not ss or not ss.hygiene_last_utc:
+        return False, "no-hygiene-record"
+    try:
+        last = datetime.fromisoformat(ss.hygiene_last_utc)
+    except Exception:
+        return False, "bad-hygiene-timestamp"
+    gap = (datetime.now(timezone.utc) - last).total_seconds()
+    return (gap <= threshold_seconds), f"gap={int(gap)}s"
+
+# --- Heartbeat Endpoint ---
+@app.route("/heartbeat", methods=["GET"])
+def heartbeat():
+    """Lightweight DB and hygiene check."""
+    try:
+        db.session.execute(text("SELECT 1"))
+        db.session.commit()
+        hc = "ok"
+    except Exception as e:
+        hc = f"fail:{str(e)[:80]}"
+    hygiene_pin()
+    ok, note = hygiene_guard()
+    return {
+        "db": hc,
+        "hygiene_ok": ok,
+        "note": note,
+        "utc": datetime.now(timezone.utc).isoformat()
+    }, 200
+
+# --- Integrity Status Endpoint (for external tether polling) ---
+@app.route("/integrity/status", methods=["GET"])
+def integrity_status():
+    ss = SystemState.query.first()
+    return {
+        "redmode": bool(ss.redmode) if ss else None,
+        "redmode_reason": ss.redmode_reason if ss else None,
+        "hygiene_last_utc": ss.hygiene_last_utc if ss else None
+    }, 200
+
+# ============================================================
+# END HUBFLO INTEGRITY PATCH — HEARTBEAT TETHER V6 — 2025-10-17
+# ============================================================
 
 # ---------------------------------------------------------------------
 # Tagging / classification
