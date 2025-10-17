@@ -57,6 +57,7 @@ init_db()
 
 from sqlalchemy import text
 from datetime import datetime, timezone
+from storage import db
 
 # --- System State Model (if not already present) ---
 class SystemState(db.Model):
