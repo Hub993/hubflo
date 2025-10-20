@@ -161,26 +161,59 @@ def webhook():
     sender=None
     if contacts: sender=contacts[0].get("wa_id") or sender
     for m in msgs:
-        sender=m.get("from") or sender
-        mtype=m.get("type")
-        text=(m.get("text") or {}).get("body") if mtype=="text" else None
-        if not text and mtype in ("image","document","audio","video"):
-            text=(m.get(mtype,{}) or {}).get("caption")
-        tag=classify_tag(text or "")
-        subtype=detect_subtype(text or "")
-        order_state=None
-        if tag=="order" and text:
+        sender = m.get("from") or sender
+        mtype = m.get("type")
+        text = None
+        attachment = None
+
+        if mtype == "text":
+            text = (m.get("text") or {}).get("body")
+
+        elif mtype in ("image", "document", "audio", "video"):
+            meta = m.get(mtype, {}) or {}
+            mid = meta.get("id")
+            url = f"whatsapp_media://{mtype}/{mid}" if mid else None
+            mime = meta.get("mime_type")
+            name = meta.get("filename")
+            attachment = {"url": url, "mime": mime, "name": name}
+            text = meta.get("caption")
+
+        # classification + subtype
+        tag = classify_tag(text or "")
+        subtype = detect_subtype(text or "")
+
+        # order state
+        order_state = None
+        if tag == "order" and text:
             for state in ORDER_LIFECYCLE_STATES:
-                if f"#{state}" in text.lower(): order_state=state; break
-        row=create_task(sender=sender,text=text or "",tag=tag,
-                        project_code=None,subcontractor_name=None,
-                        order_state=order_state)
-        if tag=="order": reply="Order noted."
-        elif tag=="change": reply="Change logged."
-        elif tag=="task": reply="Task created."
-        else: reply=None
-        if reply: send_whatsapp_text(phone_id,to=sender,body=reply)
-    return "",200
+                if f"#{state}" in text.lower():
+                    order_state = state
+                    break
+
+        # create task (with attachment + subtype)
+        row = create_task(
+            sender=sender,
+            text=text or "",
+            tag=tag,
+            project_code=None,
+            subcontractor_name=None,
+            order_state=order_state,
+            attachment=attachment,
+            subtype=subtype
+        )
+
+        # auto-reply (unchanged)
+        if tag == "order":
+            reply = "Order noted."
+        elif tag == "change":
+            reply = "Change logged."
+        elif tag == "task":
+            reply = "Task created."
+        else:
+            reply = None
+
+        if reply:
+            send_whatsapp_text(phone_id, sender, reply)
 
 # ---------------------------------------------------------------------
 # Admin guard
