@@ -85,6 +85,43 @@ class Audit(Base):
     ref_id = Column(Integer)
     details = Column(Text)
 
+# ---------------------------------------------------------------------
+# System integrity model (heartbeat state)
+# ---------------------------------------------------------------------
+class SystemState(Base):
+    __tablename__ = "system_state"
+
+    id = Column(Integer, primary_key=True)
+    hygiene_last_utc = Column(String(40), nullable=True)
+    redmode = Column(Boolean, default=False)
+    redmode_reason = Column(String(200), nullable=True)
+
+# ---------------------------------------------------------------------
+# Hygiene helpers (used by /heartbeat and tether checks)
+# ---------------------------------------------------------------------
+def hygiene_pin():
+    """Record current UTC timestamp for heartbeat tether."""
+    with SessionLocal() as s:
+        ss = s.query(SystemState).first()
+        if not ss:
+            ss = SystemState()
+            s.add(ss)
+        ss.hygiene_last_utc = dt.datetime.utcnow().isoformat() + "Z"
+        s.commit()
+
+def hygiene_guard(threshold_seconds=120) -> tuple[bool, str]:
+    """Return (ok, note) based on how stale the last heartbeat is."""
+    with SessionLocal() as s:
+        ss = s.query(SystemState).first()
+        if not ss or not ss.hygiene_last_utc:
+            return False, "no-hygiene-record"
+        try:
+            last = dt.datetime.fromisoformat(ss.hygiene_last_utc.replace("Z",""))
+        except Exception:
+            return False, "bad-hygiene-timestamp"
+        gap = (dt.datetime.utcnow() - last).total_seconds()
+        return (gap <= threshold_seconds), f"gap={int(gap)}s"
+
 def init_db():
     Base.metadata.create_all(ENGINE)
 
