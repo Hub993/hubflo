@@ -214,6 +214,13 @@ def webhook():
 
         if reply:
             send_whatsapp_text(phone_id, sender, reply)
+    return ("",200)
+
+# ---------------------------------------------------------------------
+# Admin views — dual output (HTML + JSON)
+# ---------------------------------------------------------------------
+
+
 
 # ---------------------------------------------------------------------
 # Admin guard
@@ -223,20 +230,59 @@ def _check_admin():
     token=request.args.get("token","")
     return not ADMIN_TOKEN or token==ADMIN_TOKEN
 
-# ---------------------------------------------------------------------
-# Admin routes (summary only for brevity; unchanged logic from v5)
-# ---------------------------------------------------------------------
-@app.route("/admin/view",methods=["GET"])
-def admin_view():
-    if not _check_admin(): return _auth_fail()
-    rows=get_tasks(limit=200)
-    body=json.dumps(rows,indent=2)
-    return Response(body,200,mimetype="application/json")
-
 @app.route("/admin/summary",methods=["GET"])
 def api_summary():
     if not _check_admin(): return _auth_fail()
     return jsonify(get_summary())
+
+@app.route("/admin/view", methods=["GET"])
+def admin_view():
+    if not _check_admin(): return _auth_fail()
+    rows = get_tasks(limit=200)
+
+    def h(s):
+        return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+    th = (
+        "<tr><th>ID</th><th>Time</th><th>Sender</th><th>Tag</th>"
+        "<th>Status</th><th>Order State</th><th>Text</th></tr>"
+    )
+    trs = []
+    for r in rows:
+        trs.append(
+            f"<tr>"
+            f"<td>{r['id']}</td>"
+            f"<td>{h(r['ts'])}</td>"
+            f"<td>{h(r.get('sender') or '')}</td>"
+            f"<td>{h(r.get('tag') or '')}</td>"
+            f"<td>{h(r.get('status') or '')}</td>"
+            f"<td>{h(r.get('order_state') or '')}</td>"
+            f"<td>{h(r['text'])}</td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <html><head><title>HubFlo Admin</title>
+    <style>
+      body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}}
+      table{{border-collapse:collapse;width:100%}}
+      th,td{{border:1px solid #ddd;padding:6px;font-size:13px}}
+      th{{background:#f2f2f2;text-align:left}}
+    </style></head><body>
+    <h2>HubFlo Admin (HTML)</h2>
+    <table>{th}{''.join(trs)}</table>
+    </body></html>
+    """
+    return Response(body, 200, mimetype="text/html")
+
+@app.route("/admin/view.json", methods=["GET"])
+def admin_view_json():
+    if not _check_admin(): return _auth_fail()
+    tag = request.args.get("tag") or None
+    q = request.args.get("q") or None
+    sender = request.args.get("sender") or None
+    limit = int(request.args.get("limit", "200"))
+    return jsonify(get_tasks(tag=tag, q=q, sender=sender, limit=limit))
 
 # ---------------------------------------------------------------------
 # Change Orders & Stock endpoints (new)

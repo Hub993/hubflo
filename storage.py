@@ -337,7 +337,7 @@ def create_meeting(title: str, project_code: Optional[str],
         return _as_meeting_dict(m)
 
 def start_meeting(meeting_id: int, actor: Optional[str] = None):
-    with Session_local() as s:
+    with SessionLocal() as s:
         m = s.get(Meeting, meeting_id)
         if not m: return None
         m.status = "active"
