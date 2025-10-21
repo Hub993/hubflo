@@ -221,7 +221,6 @@ def webhook():
 # ---------------------------------------------------------------------
 
 
-
 # ---------------------------------------------------------------------
 # Admin guard
 # ---------------------------------------------------------------------
@@ -283,6 +282,82 @@ def admin_view_json():
     sender = request.args.get("sender") or None
     limit = int(request.args.get("limit", "200"))
     return jsonify(get_tasks(tag=tag, q=q, sender=sender, limit=limit))
+
+# ---------------------------------------------------------------------
+# Admin action routes (parity with v5)
+# ---------------------------------------------------------------------
+
+@app.route("/admin/approve", methods=["POST"])
+def api_approve():
+    if not _check_admin(): return _auth_fail()
+    tid = int(request.args.get("id", "0"))
+    return jsonify(approve_task(tid, actor="admin") or {"error": "not found"})
+
+@app.route("/admin/reject", methods=["POST"])
+def api_reject():
+    if not _check_admin(): return _auth_fail()
+    tid = int(request.args.get("id", "0"))
+    rework = request.args.get("rework", "1") != "0"
+    return jsonify(reject_task(tid, rework=rework, actor="admin") or {"error": "not found"})
+
+@app.route("/admin/revoke", methods=["POST"])
+def api_revoke():
+    if not _check_admin(): return _auth_fail()
+    tid = int(request.args.get("id", "0"))
+    return jsonify(revoke_last(tid, actor="admin") or {"error": "not found"})
+
+@app.route("/admin/order_state", methods=["POST"])
+def api_order_state():
+    if not _check_admin(): return _auth_fail()
+    tid = int(request.args.get("id", "0"))
+    state = request.args.get("state", "").strip().lower()
+    allowed = ["quoted","pending_approval","approved","cancelled","invoiced","enacted"]
+    if state not in allowed:
+        return jsonify({"error": "invalid state", "allowed": allowed}), 400
+    return jsonify(set_order_state(tid, state, actor="admin") or {"error": "not found"})
+
+@app.route("/admin/accuracy", methods=["GET"])
+def api_accuracy():
+    if not _check_admin(): return _auth_fail()
+    name = request.args.get("subcontractor", "")
+    if not name:
+        return jsonify({"error": "missing subcontractor"}), 400
+    return jsonify(subcontractor_accuracy(name))
+
+@app.route("/admin/meeting/create", methods=["POST"])
+def api_meeting_create():
+    if not _check_admin(): return _auth_fail()
+    title = request.args.get("title", "Site Meeting")
+    project_code = request.args.get("project") or None
+    subcontractor_name = request.args.get("subcontractor") or None
+    site_name = request.args.get("site") or None
+    scheduled_for = request.args.get("when") or None
+    task_ids = request.args.get("tasks") or ""
+    if scheduled_for:
+        try:
+            scheduled_for = dt.datetime.fromisoformat(scheduled_for)
+        except Exception:
+            scheduled_for = None
+    ids = []
+    for t in (task_ids.split(",") if task_ids else []):
+        t = t.strip()
+        if t.isdigit(): ids.append(int(t))
+    return jsonify(create_meeting(
+        title=title, project_code=project_code, subcontractor_name=subcontractor_name,
+        site_name=site_name, scheduled_for=scheduled_for, task_ids=ids, created_by="admin"
+    ))
+
+@app.route("/admin/meeting/start", methods=["POST"])
+def api_meeting_start():
+    if not _check_admin(): return _auth_fail()
+    mid = int(request.args.get("id", "0"))
+    return jsonify(start_meeting(mid, actor="admin") or {"error": "not found"})
+
+@app.route("/admin/meeting/close", methods=["POST"])
+def api_meeting_close():
+    if not _check_admin(): return _auth_fail()
+    mid = int(request.args.get("id", "0"))
+    return jsonify(close_meeting(mid, actor="admin") or {"error": "not found"})
 
 # ---------------------------------------------------------------------
 # Change Orders & Stock endpoints (new)
