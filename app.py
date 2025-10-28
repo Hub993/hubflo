@@ -250,19 +250,16 @@ def webhook():
             subtype=subtype
         )
 
-        # auto-reply (unchanged)
+        # → ORDER CHECKLIST TRIGGER (replaces auto-reply)
         if tag == "order":
-            reply = "Order noted."
-        elif tag == "change":
-            reply = "Change logged."
-        elif tag == "task":
-            reply = "Task created."
-        else:
-            reply = None
+            send_order_checklist(phone_id, sender, row["id"])
+            return ("", 200)
 
-        if reply:
-            send_whatsapp_text(phone_id, sender, reply)
-    return ("",200)
+        # existing replies now only handle non-order messages
+        if tag == "change":
+            send_whatsapp_text(phone_id, sender, "Change logged.")
+        elif tag == "task":
+            send_whatsapp_text(phone_id, sender, "Task created.")
 
 # ---------------------------------------------------------------------
 # Admin views — dual output (HTML + JSON)
