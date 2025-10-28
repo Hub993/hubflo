@@ -136,6 +136,54 @@ def send_whatsapp_text(phone_id:str,to:str,body:str)->tuple[bool,dict]:
         log.exception("D360 send error: %s",e)
         return False,{"error":str(e)}
 
+# === ADD NEAR TOP, BELOW send_whatsapp_text ===
+import json
+
+def send_order_checklist(phone_id: str, to: str, task_id: int):
+    headers = {"D360-API-KEY": D360_KEY, "Content-Type": "application/json"}
+    payload = {
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "Order logged. Confirm next detail:"},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": f"order_item:{task_id}", "title": "Item"}},
+                    {"type": "reply", "reply": {"id": f"order_quantity:{task_id}", "title": "Quantity"}},
+                    {"type": "reply", "reply": {"id": f"order_supplier:{task_id}", "title": "Supplier"}},
+                    {"type": "reply", "reply": {"id": f"order_delivery_date:{task_id}", "title": "Delivery Date"}},
+                    {"type": "reply", "reply": {"id": f"order_drop_location:{task_id}", "title": "Drop Location"}},
+                ]
+            }
+        }
+    }
+    try:
+        r = requests.post(WHATSAPP_BASE, headers=headers, json=payload, timeout=10)
+        return (200 <= r.status_code < 300)
+    except:
+        return False
+
+
+# === MODIFY IN /webhook, inside loop after create_task(...) and before return ===
+        row = create_task(
+            sender=sender,
+            text=text or "",
+            tag=tag,
+            project_code=None,
+            subcontractor_name=None,
+            order_state=order_state,
+            attachment=attachment,
+            subtype=subtype
+        )
+
+        # send checklist for orders
+        if tag == "order":
+            send_order_checklist(phone_id, sender, row["id"])
+            return ("", 200)
+
+        # existing auto-replies remain unchanged below
+
 # ---------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------
@@ -289,32 +337,93 @@ def admin_view_json():
 
 @app.route("/admin/approve", methods=["POST"])
 def api_approve():
-    if not _check_admin(): return _auth_fail()
-    tid = int(request.args.get("id", "0"))
-    return jsonify(approve_task(tid, actor="admin") or {"error": "not found"})
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+    tid = data.get("id")
+    note = data.get("note")
+
+    if tid is None:
+        return jsonify({"error": "missing id"}), 400
+
+    result = approve_task(int(tid), actor="admin")
+
+    if not result:
+        return jsonify({"error": "not found"}), 404
+
+    # Optional note for audit (future use)
+    if note:
+        log_audit("admin", "approve_note", "task", int(tid), details=note)
+
+    return jsonify(result), 200
 
 @app.route("/admin/reject", methods=["POST"])
 def api_reject():
-    if not _check_admin(): return _auth_fail()
-    tid = int(request.args.get("id", "0"))
-    rework = request.args.get("rework", "1") != "0"
-    return jsonify(reject_task(tid, rework=rework, actor="admin") or {"error": "not found"})
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+    tid = data.get("id")
+    rework = data.get("rework", True)
+
+    if tid is None:
+        return jsonify({"error": "missing id"}), 400
+
+    result = reject_task(int(tid), rework=bool(rework), actor="admin")
+
+    if not result:
+        return jsonify({"error": "not found"}), 404
+
+    return jsonify(result), 200
 
 @app.route("/admin/revoke", methods=["POST"])
 def api_revoke():
-    if not _check_admin(): return _auth_fail()
-    tid = int(request.args.get("id", "0"))
-    return jsonify(revoke_last(tid, actor="admin") or {"error": "not found"})
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+    tid = data.get("id")
+    note = data.get("note")
+
+    if tid is None:
+        return jsonify({"error": "missing id"}), 400
+
+    result = revoke_last(int(tid), actor="admin")
+
+    if not result:
+        return jsonify({"error": "not found"}), 404
+
+    # Optional note for audit
+    if note:
+        log_audit("admin", "revoke_note", "task", int(tid), details=note)
+
+    return jsonify(result), 200
+
 
 @app.route("/admin/order_state", methods=["POST"])
 def api_order_state():
-    if not _check_admin(): return _auth_fail()
-    tid = int(request.args.get("id", "0"))
-    state = request.args.get("state", "").strip().lower()
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+    tid = data.get("id")
+    state = (data.get("state") or "").strip().lower()
+
     allowed = ["quoted","pending_approval","approved","cancelled","invoiced","enacted"]
+
+    if tid is None:
+        return jsonify({"error": "missing id"}), 400
+
     if state not in allowed:
         return jsonify({"error": "invalid state", "allowed": allowed}), 400
-    return jsonify(set_order_state(tid, state, actor="admin") or {"error": "not found"})
+
+    result = set_order_state(int(tid), state, actor="admin")
+
+    if not result:
+        return jsonify({"error": "not found"}), 404
+
+    return jsonify(result), 200
 
 @app.route("/admin/accuracy", methods=["GET"])
 def api_accuracy():
