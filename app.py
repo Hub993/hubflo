@@ -20,6 +20,8 @@ from storage import (
     record_change_order
 )
 
+from storage import Task
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("hubflo")
@@ -213,6 +215,66 @@ def webhook():
         mtype = m.get("type")
         text = None
         attachment = None
+
+        # === CHECK FOR BUTTON PRESS (interactive reply) ===
+        if mtype == "interactive":
+            br = (m.get("interactive") or {}).get("button_reply") or {}
+            bid = br.get("id", "") or ""
+
+            # item
+            if bid.startswith("order_item:"):
+                tid = int(bid.split(":")[1])
+                with SessionLocal() as s:
+                    t = s.get(Task, tid)
+                    if t:
+                        t.text = f"[await:item] {t.text or ''}"
+                        s.commit()
+                send_whatsapp_text(phone_id, sender, "Great — what item should we order?")
+                return ("", 200)
+
+            # quantity
+            if bid.startswith("order_quantity:"):
+                tid = int(bid.split(":")[1])
+                with SessionLocal() as s:
+                    t = s.get(Task, tid)
+                    if t:
+                        t.text = f"[await:quantity] {t.text or ''}"
+                        s.commit()
+                send_whatsapp_text(phone_id, sender, "Okay — what quantity do we need?")
+                return ("", 200)
+
+            # supplier
+            if bid.startswith("order_supplier:"):
+                tid = int(bid.split(":")[1])
+                with SessionLocal() as s:
+                    t = s.get(Task, tid)
+                    if t:
+                        t.text = f"[await:supplier] {t.text or ''}"
+                        s.commit()
+                send_whatsapp_text(phone_id, sender, "Got it — who should we source this from?")
+                return ("", 200)
+
+            # delivery date
+            if bid.startswith("order_delivery_date:"):
+                tid = int(bid.split(":")[1])
+                with SessionLocal() as s:
+                    t = s.get(Task, tid)
+                    if t:
+                        t.text = f"[await:delivery_date] {t.text or ''}"
+                        s.commit()
+                send_whatsapp_text(phone_id, sender, "When must this be delivered?")
+                return ("", 200)
+
+            # drop location
+            if bid.startswith("order_drop_location:"):
+                tid = int(bid.split(":")[1])
+                with SessionLocal() as s:
+                    t = s.get(Task, tid)
+                    if t:
+                        t.text = f"[await:drop_location] {t.text or ''}"
+                        s.commit()
+                send_whatsapp_text(phone_id, sender, "Where should this be dropped on site?")
+                return ("", 200)
 
         if mtype == "text":
             text = (m.get("text") or {}).get("body")
