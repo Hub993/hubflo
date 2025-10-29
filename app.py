@@ -528,6 +528,54 @@ def api_meeting_close():
     return jsonify(close_meeting(mid, actor="admin") or {"error": "not found"})
 
 # ---------------------------------------------------------------------
+# Take-On Import: Users / Roles / Hierarchy
+# ---------------------------------------------------------------------
+from storage import SessionLocal, User
+
+@app.route("/admin/import_takeon_users", methods=["POST"])
+def api_import_takeon_users():
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True)
+    if not isinstance(data, list):
+        return jsonify({"error": "expected list of user rows"}), 400
+
+    # Data format expected:
+    # [
+    #   {
+    #     "wa_id": "27821234567",
+    #     "name": "John Doe",
+    #     "role": "sub",
+    #     "subcontractor_name": "BrickBuild Co",
+    #     "project_code": "PRJ001"
+    #   },
+    #   ...
+    # ]
+
+    inserted = 0
+    with SessionLocal() as s:
+        # clear existing
+        s.query(User).delete()
+
+        for row in data:
+            u = User(
+                wa_id=str(row.get("wa_id", "")).strip(),
+                name=(row.get("name") or "").strip(),
+                role=(row.get("role") or "").strip().lower(),
+                subcontractor_name=(row.get("subcontractor_name") or "").strip() or None,
+                project_code=(row.get("project_code") or "").strip() or None,
+                phone=str(row.get("wa_id", "")).strip(),  # store same for now
+                active=True,
+            )
+            s.add(u)
+            inserted += 1
+
+        s.commit()
+
+    return jsonify({"status": "ok", "imported": inserted}), 200
+
+# ---------------------------------------------------------------------
 # Change Orders & Stock endpoints (new)
 # ---------------------------------------------------------------------
 @app.route("/admin/change_order",methods=["POST"])
