@@ -209,7 +209,8 @@ def webhook():
     except Exception:
         msgs,contacts,phone_id=[],[],DEFAULT_PHONE_ID
     sender=None
-    if contacts: sender=contacts[0].get("wa_id") or sender
+    if contacts:
+        sender=contacts[0].get("wa_id") or sender
     for m in msgs:
         sender = m.get("from") or sender
         mtype = m.get("type")
@@ -650,4 +651,6 @@ def api_stock_report():
 if __name__=="__main__":
     port=int(os.environ.get("PORT","10000"))
     app.run(host="0.0.0.0",port=port,debug=False)
+
+
 
