@@ -28,6 +28,25 @@ Base = declarative_base()
 # ---------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------
+
+# --- NEW: People & Role Model (Hierarchy Lookup) ----------------------
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    wa_id = Column(String(64), unique=True, index=True)  # WhatsApp ID
+    name = Column(String(128))
+    role = Column(String(32))  # sub | pm | ops | director | owner
+    subcontractor_name = Column(String(128), nullable=True)
+    project_code = Column(String(128), nullable=True)
+
+    phone = Column(String(64), nullable=True)
+    active = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(DateTime, default=dt.datetime.utcnow,
+                        onupdate=dt.datetime.utcnow)
+
 class Task(Base):
     __tablename__ = "tasks"
 
@@ -177,6 +196,24 @@ def log_audit(actor: Optional[str], action: str, ref_type: str, ref_id: int, det
     with SessionLocal() as s:
         s.add(Audit(actor=actor, action=action, ref_type=ref_type, ref_id=ref_id, details=details))
         s.commit()
+
+# ---------------------------------------------------------------------
+# Lookup Helpers (People / Hierarchy)
+# ---------------------------------------------------------------------
+def get_user_role(wa_id: str) -> Optional[dict]:
+    with SessionLocal() as s:
+        u = s.query(User).filter(User.wa_id == wa_id).first()
+        if not u:
+            return None
+        return {
+            "wa_id": u.wa_id,
+            "name": u.name,
+            "role": u.role,
+            "subcontractor_name": u.subcontractor_name,
+            "project_code": u.project_code,
+            "phone": u.phone,
+            "active": u.active,
+        }
 
 # ---------------------------------------------------------------------
 # Core CRUD
