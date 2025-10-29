@@ -292,7 +292,7 @@ def webhook():
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
 
-        # order state
+        # detect order lifecycle state
         order_state = None
         if tag == "order" and text:
             for state in ORDER_LIFECYCLE_STATES:
@@ -300,17 +300,44 @@ def webhook():
                     order_state = state
                     break
 
-        # create task (with attachment + subtype)
+        # lookup sender identity (role / subcontractor / project)
+        from storage import get_user_role
+        user = get_user_role(sender) or {}
+
+        # create task (now with routing)
         row = create_task(
             sender=sender,
             text=text or "",
             tag=tag,
-            project_code=None,
-            subcontractor_name=None,
+            project_code=user.get("project_code") or None,
+            subcontractor_name=user.get("subcontractor_name") or None,
             order_state=order_state,
             attachment=attachment,
             subtype=subtype
         )
+
+        # ORDER CHECKLIST (runs immediately after task creation)
+        if tag == "order":
+            send_order_checklist(phone_id, sender, row["id"])
+            return ("", 200)
+
+        # non-order auto replies
+        if tag == "change":
+            send_whatsapp_text(phone_id, sender, "Change logged.")
+        elif tag == "task":
+            send_whatsapp_text(phone_id, sender, "Task created.")
+
+# ---------------------------------------------------------------------
+# Admin views — dual output (HTML + JSON)
+# ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# Admin guard
+# ---------------------------------------------------------------------
+def _auth_fail(): return Response("Unauthorized",401)
+def _check_admin():
+    toke
 
         # → ORDER CHECKLIST TRIGGER (replaces auto-reply)
         if tag == "order":
@@ -323,7 +350,21 @@ def webhook():
         elif tag == "task":
             send_whatsapp_text(phone_id, sender, "Task created.")
 
-# ---------------------------------------------------------------------
+#        # lookup sender identity (role / subcontractor / project)
+        from storage import get_user_role
+        user = get_user_role(sender) or {}
+
+        # create task (now with real routing)
+        row = create_task(
+            sender=sender,
+            text=text or "",
+            tag=tag,
+            project_code=user.get("project_code") or None,
+            subcontractor_name=user.get("subcontractor_name") or None,
+            order_state=order_state,
+            attachment=attachment,
+            subtype=subtype
+        )---------------------------------------------------------------------
 # Admin views — dual output (HTML + JSON)
 # ---------------------------------------------------------------------
 
