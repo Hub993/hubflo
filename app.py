@@ -336,43 +336,6 @@ def webhook():
 # ---------------------------------------------------------------------
 def _auth_fail(): return Response("Unauthorized",401)
 def _check_admin():
-    toke
-
-        # → ORDER CHECKLIST TRIGGER (replaces auto-reply)
-        if tag == "order":
-            send_order_checklist(phone_id, sender, row["id"])
-            return ("", 200)
-
-        # existing replies now only handle non-order messages
-        if tag == "change":
-            send_whatsapp_text(phone_id, sender, "Change logged.")
-        elif tag == "task":
-            send_whatsapp_text(phone_id, sender, "Task created.")
-
-#        # lookup sender identity (role / subcontractor / project)
-        from storage import get_user_role
-        user = get_user_role(sender) or {}
-
-        # create task (now with real routing)
-        row = create_task(
-            sender=sender,
-            text=text or "",
-            tag=tag,
-            project_code=user.get("project_code") or None,
-            subcontractor_name=user.get("subcontractor_name") or None,
-            order_state=order_state,
-            attachment=attachment,
-            subtype=subtype
-        )---------------------------------------------------------------------
-# Admin views — dual output (HTML + JSON)
-# ---------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------
-# Admin guard
-# ---------------------------------------------------------------------
-def _auth_fail(): return Response("Unauthorized",401)
-def _check_admin():
     token=request.args.get("token","")
     return not ADMIN_TOKEN or token==ADMIN_TOKEN
 
