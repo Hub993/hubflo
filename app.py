@@ -196,33 +196,34 @@ def health():
 # ---------------------------------------------------------------------
 # Webhook (Meta/360dialog inbound)
 # ---------------------------------------------------------------------
-@app.route("/webhook",methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    raw=request.get_json(silent=True) or {}
+    raw = request.get_json(silent=True) or {}
     try:
-        entry=(raw.get("entry") or [])[0]
-        changes=(entry.get("changes") or [])[0]
-        value=changes.get("value") or {}
-        msgs=value.get("messages") or []
-        contacts=value.get("contacts") or []
-        phone_id=(value.get("metadata") or {}).get("phone_number_id") or DEFAULT_PHONE_ID
+        entry = (raw.get("entry") or [])[0]
+        changes = (entry.get("changes") or [])[0]
+        value = changes.get("value") or {}
+        msgs = value.get("messages") or []
+        contacts = value.get("contacts") or []
+        phone_id = (value.get("metadata") or {}).get("phone_number_id") or DEFAULT_PHONE_ID
     except Exception:
-        msgs,contacts,phone_id=[],[],DEFAULT_PHONE_ID
-    sender=None
+        msgs, contacts, phone_id = [], [], DEFAULT_PHONE_ID
+
+    sender = None
     if contacts:
-        sender=contacts[0].get("wa_id") or sender
+        sender = contacts[0].get("wa_id") or sender
+
     for m in msgs:
         sender = m.get("from") or sender
         mtype = m.get("type")
         text = None
         attachment = None
 
-        # === CHECK FOR BUTTON PRESS (interactive reply) ===
+        # === INTERACTIVE BUTTON HANDLING ======================================
         if mtype == "interactive":
             br = (m.get("interactive") or {}).get("button_reply") or {}
             bid = br.get("id", "") or ""
 
-            # item
             if bid.startswith("order_item:"):
                 tid = int(bid.split(":")[1])
                 with SessionLocal() as s:
@@ -233,7 +234,6 @@ def webhook():
                 send_whatsapp_text(phone_id, sender, "Great — what item should we order?")
                 return ("", 200)
 
-            # quantity
             if bid.startswith("order_quantity:"):
                 tid = int(bid.split(":")[1])
                 with SessionLocal() as s:
@@ -244,7 +244,6 @@ def webhook():
                 send_whatsapp_text(phone_id, sender, "Okay — what quantity do we need?")
                 return ("", 200)
 
-            # supplier
             if bid.startswith("order_supplier:"):
                 tid = int(bid.split(":")[1])
                 with SessionLocal() as s:
@@ -255,7 +254,6 @@ def webhook():
                 send_whatsapp_text(phone_id, sender, "Got it — who should we source this from?")
                 return ("", 200)
 
-            # delivery date
             if bid.startswith("order_delivery_date:"):
                 tid = int(bid.split(":")[1])
                 with SessionLocal() as s:
@@ -266,7 +264,6 @@ def webhook():
                 send_whatsapp_text(phone_id, sender, "When must this be delivered?")
                 return ("", 200)
 
-            # drop location
             if bid.startswith("order_drop_location:"):
                 tid = int(bid.split(":")[1])
                 with SessionLocal() as s:
@@ -277,6 +274,7 @@ def webhook():
                 send_whatsapp_text(phone_id, sender, "Where should this be dropped on site?")
                 return ("", 200)
 
+        # === MEDIA & TEXT =====================================================
         if mtype == "text":
             text = (m.get("text") or {}).get("body")
 
@@ -289,11 +287,10 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
-        # classification + subtype
+        # === CLASSIFICATION ====================================================
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
 
-        # detect order lifecycle state
         order_state = None
         if tag == "order" and text:
             for state in ORDER_LIFECYCLE_STATES:
@@ -301,11 +298,10 @@ def webhook():
                     order_state = state
                     break
 
-        # lookup sender identity (role / subcontractor / project)
         from storage import get_user_role
         user = get_user_role(sender) or {}
 
-        # create task (now with routing)
+        # === CREATE TASK =======================================================
         row = create_task(
             sender=sender,
             text=text or "",
@@ -317,16 +313,18 @@ def webhook():
             subtype=subtype
         )
 
-        # ORDER CHECKLIST (runs immediately after task creation)
+        # === ORDER CHECKLIST TRIGGER ===========================================
         if tag == "order":
             send_order_checklist(phone_id, sender, row["id"])
             return ("", 200)
 
-        # non-order auto replies
+        # === NON-ORDER ROUTES ==================================================
         if tag == "change":
             send_whatsapp_text(phone_id, sender, "Change logged.")
         elif tag == "task":
             send_whatsapp_text(phone_id, sender, "Task created.")
+
+    return ("", 200)
 
 # ---------------------------------------------------------------------
 # Admin views — dual output (HTML + JSON)
