@@ -287,6 +287,55 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
+        # === AWAIT FOLLOW-UP CAPTURE ==========================================
+        if text:
+            with SessionLocal() as s:
+                # Look for any open task from this sender currently awaiting detail
+                awaiting = (
+                    s.query(Task)
+                    .filter(Task.sender == sender, Task.status == "open", Task.text.ilike("[await:%]%"))
+                    .order_by(Task.id.desc())
+                    .first()
+                )
+
+                if awaiting:
+                    lower = awaiting.text.lower()
+
+                    # ITEM
+                    if lower.startswith("[await:item]"):
+                        awaiting.text = f"Item: {text}"
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Quantity?")
+                        return ("", 200)
+
+                    # QUANTITY
+                    if lower.startswith("[await:quantity]"):
+                        awaiting.text = f"{awaiting.text}\nQuantity: {text}"
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Supplier?")
+                        return ("", 200)
+
+                    # SUPPLIER
+                    if lower.startswith("[await:supplier]"):
+                        awaiting.text = f"{awaiting.text}\nSupplier: {text}"
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Delivery date?")
+                        return ("", 200)
+
+                    # DELIVERY DATE
+                    if lower.startswith("[await:delivery_date]"):
+                        awaiting.text = f"{awaiting.text}\nDelivery Date: {text}"
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Drop location on site?")
+                        return ("", 200)
+
+                    # DROP LOCATION
+                    if lower.startswith("[await:drop_location]"):
+                        awaiting.text = f"{awaiting.text}\nDrop Location: {text}"
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "✅ Order details recorded.")
+                        return ("", 200)
+
         # === CLASSIFICATION ====================================================
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
