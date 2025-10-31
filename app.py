@@ -309,7 +309,7 @@ def webhook():
  
                     # QUANTITY
                     if lower.startswith("[await:quantity]"):
-                        awaiting.text = f"{awaiting.text}\nQuantity: {text}"
+                        awaiting.text = f"[await:supplier] Item: {awaiting.text.split('Item:')[1].strip()}\nQuantity: {text}"
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Supplier?")
                         return ("", 200)
