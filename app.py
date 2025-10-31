@@ -1,3 +1,4 @@
+# app_v6.py - Hubflo Version 6
 # ---------------------------------------------------------------
 # Rebuilt from v5 base with all verified post-V5 improvements:
 # - Order-step checklist
@@ -289,7 +290,6 @@ def webhook():
         # === AWAIT FOLLOW-UP CAPTURE ==========================================
         if text:
             with SessionLocal() as s:
-                # Look for any open task from this sender currently awaiting detail
                 awaiting = (
                     s.query(Task)
                     .filter(Task.sender == sender, Task.status == "open", Task.text.ilike("[await:%]%"))
@@ -300,37 +300,70 @@ def webhook():
                 if awaiting:
                     lower = awaiting.text.lower()
 
+                    # normalize body (remove await prefix)
+                    body = awaiting.text
+                    if body.startswith("[await:"):
+                        body = body.split("]",1)[1].strip()
+
+                    lines = [l.strip() for l in body.splitlines() if l.strip()]
+                    fields = {}
+                    for l in lines:
+                        if ":" in l:
+                            k,v = l.split(":",1)
+                            fields[k.strip()] = v.strip()
+
+                    item     = fields.get("Item")
+                    qty      = fields.get("Quantity")
+                    supplier = fields.get("Supplier")
+                    ddate    = fields.get("Delivery Date")
+                    drop     = fields.get("Drop Location")
+
                     # ITEM
                     if lower.startswith("[await:item]"):
                         awaiting.text = f"[await:quantity] Item: {text}"
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Quantity?")
                         return ("", 200)
- 
+
                     # QUANTITY
                     if lower.startswith("[await:quantity]"):
-                        awaiting.text = f"[await:supplier] Item: {awaiting.text.split('Item:')[1].strip()}\nQuantity: {text}"
+                        awaiting.text = f"[await:supplier] Item: {item or ''}\nQuantity: {text}"
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Supplier?")
                         return ("", 200)
 
                     # SUPPLIER
                     if lower.startswith("[await:supplier]"):
-                        awaiting.text = f"[await:delivery_date] {awaiting.text.split('Item:')[1].strip()}\nQuantity: {awaiting.text.split('Quantity:')[1].splitlines()[0].strip()}\nSupplier: {text}"
+                        awaiting.text = (
+                            f"[await:delivery_date] Item: {item or ''}\n"
+                            f"Quantity: {qty or ''}\n"
+                            f"Supplier: {text}"
+                        )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Delivery date?")
                         return ("", 200)
 
                     # DELIVERY DATE
                     if lower.startswith("[await:delivery_date]"):
-                        awaiting.text = f"{awaiting.text}\nDelivery Date: {text}"
+                        awaiting.text = (
+                            f"[await:drop_location] Item: {item or ''}\n"
+                            f"Quantity: {qty or ''}\n"
+                            f"Supplier: {supplier or ''}\n"
+                            f"Delivery Date: {text}"
+                        )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Drop location on site?")
                         return ("", 200)
 
                     # DROP LOCATION
                     if lower.startswith("[await:drop_location]"):
-                        awaiting.text = f"{awaiting.text}\nDrop Location: {text}"
+                        awaiting.text = (
+                            f"Item: {item or ''}\n"
+                            f"Quantity: {qty or ''}\n"
+                            f"Supplier: {supplier or ''}\n"
+                            f"Delivery Date: {ddate or ''}\n"
+                            f"Drop Location: {text}"
+                        )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "✅ Order details recorded.")
                         return ("", 200)
@@ -668,6 +701,4 @@ def api_stock_report():
 if __name__=="__main__":
     port=int(os.environ.get("PORT","10000"))
     app.run(host="0.0.0.0",port=port,debug=False)
-
-
 
