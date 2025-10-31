@@ -698,6 +698,18 @@ def api_stock_report():
     if not _check_admin(): return _auth_fail()
     return jsonify(get_stock_report())
 
+# === DIGEST SCAFFOLDS (sandbox only) =================================
+@app.route("/admin/digest/pm", methods=["GET"])
+def admin_digest_pm():
+    if not _check_admin(): return _auth_fail()
+    return jsonify(get_summary()), 200
+
+@app.route("/admin/digest/sub", methods=["GET"])
+def admin_digest_sub():
+    if not _check_admin(): return _auth_fail()
+    sender = request.args.get("sender") or ""
+    return jsonify({"tasks": get_tasks(sender=sender, limit=200)}), 200
+
 # ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
