@@ -372,6 +372,10 @@ def webhook():
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
 
+        # Self-tasks should still behave as tasks
+        if subtype == "self" and tag is None:
+            tag = "task"
+
         # detect order lifecycle state (if any hash present)
         order_state = None
         if tag == "order" and text:
