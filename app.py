@@ -1,4 +1,3 @@
-# app_v6.py  — HubFlo Version 6
 # ---------------------------------------------------------------
 # Rebuilt from v5 base with all verified post-V5 improvements:
 # - Order-step checklist
@@ -303,11 +302,11 @@ def webhook():
 
                     # ITEM
                     if lower.startswith("[await:item]"):
-                        awaiting.text = f"Item: {text}"
+                        awaiting.text = f"[await:quantity] Item: {text}"
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Quantity?")
                         return ("", 200)
-
+ 
                     # QUANTITY
                     if lower.startswith("[await:quantity]"):
                         awaiting.text = f"{awaiting.text}\nQuantity: {text}"
