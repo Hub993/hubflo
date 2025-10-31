@@ -94,8 +94,21 @@ def integrity_status():
 # Tagging / classification
 # ---------------------------------------------------------------------
 ORDER_PREFIXES = ("order","purchase","procure","buy")
-CHANGE_PREFIXES = ("change","variation","revise","amend","adjust")
-TASK_PREFIXES  = ("task","todo","to-do","install","fix","inspect","lay","build","schedule")
+
+# CHANGE verbs = scope modifications
+CHANGE_PREFIXES = (
+    "change","variation","revise","amend","adjust",
+    "extend","enlarge","widen","lengthen","raise","lower",
+    "shift","relocate","move","reposition",
+    "replace","remove","strip","demolish","knock","add","reduce","modify","alter"
+)
+
+# TASK verbs = performing work / execution actions
+TASK_PREFIXES  = (
+    "task","todo","to-do","install","fix","inspect","lay","build","schedule",
+    "plumb","level","square","miter","build up","strip","rip","float"
+)
+
 HASHTAG_MAP = {"#order":"order","#change":"change","#task":"task","#urgent":"urgent"}
 
 def classify_tag(text:str)->Optional[str]:
