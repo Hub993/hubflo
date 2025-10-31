@@ -340,6 +340,7 @@ def webhook():
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
 
+        # detect order lifecycle state (if any hash present)
         order_state = None
         if tag == "order" and text:
             for state in ORDER_LIFECYCLE_STATES:
@@ -347,10 +348,11 @@ def webhook():
                     order_state = state
                     break
 
+        # lookup sender identity (role / subcontractor / project)
         from storage import get_user_role
         user = get_user_role(sender) or {}
 
-        # === CREATE TASK =======================================================
+        # create task (always)
         row = create_task(
             sender=sender,
             text=text or "",
@@ -362,9 +364,16 @@ def webhook():
             subtype=subtype
         )
 
-        # === ORDER CHECKLIST TRIGGER ===========================================
+        # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
         if tag == "order":
-            send_order_checklist(phone_id, sender, row["id"])
+            # immediately mark task to begin follow-up sequence
+            with SessionLocal() as s:
+                t = s.get(Task, row["id"])
+                if t and not (t.text or "").lower().startswith("[await:item]"):
+                    t.text = f"[await:item] {t.text}"
+                    s.commit()
+            # prompt next detail
+            send_whatsapp_text(phone_id, sender, "Item?")
             return ("", 200)
 
         # === NON-ORDER ROUTES ==================================================
