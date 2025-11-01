@@ -315,7 +315,12 @@ def webhook():
             with SessionLocal() as s:
                 awaiting = (
                     s.query(Task)
-                    .filter(Task.sender == sender, Task.status == "open", Task.text.ilike("[await:%]%"))
+                    .filter(
+                        Task.sender == sender,
+                        Task.status == "open",
+                        Task.tag == "order",
+                        Task.text.ilike("[await:%]%")
+                    )
                     .order_by(Task.id.desc())
                     .first()
                 )
