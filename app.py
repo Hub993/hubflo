@@ -383,7 +383,7 @@ def webhook():
                         send_whatsapp_text(phone_id, sender, "Drop location on site?")
                         return ("", 200)
 
-                    # DROP LOCATION
+                    # DROP LOCATION (FINALIZE + FORMAT)
                     if lower.startswith("[await:drop_location]"):
                         awaiting.text = (
                             f"Item: {item or ''}\n"
