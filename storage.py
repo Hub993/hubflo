@@ -93,6 +93,19 @@ class Meeting(Base):
     status = Column(String(24), default="scheduled", index=True)
     task_ids = Column(Text)  # comma-separated ids
 
+# --- PM ↔ Project Assignment ----------------------------------------
+class PMProjectMap(Base):
+    __tablename__ = "pm_project_map"
+
+    id = Column(Integer, primary_key=True)
+    pm_user_id = Column(Integer, index=True)      # FK → User.id (not enforced here)
+    project_code = Column(String(128), index=True)
+    primary_pm = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(DateTime, default=dt.datetime.utcnow,
+                        onupdate=dt.datetime.utcnow)
+
 class Audit(Base):
     __tablename__ = "audits"
 
@@ -214,6 +227,27 @@ def get_user_role(wa_id: str) -> Optional[dict]:
             "phone": u.phone,
             "active": u.active,
         }
+
+def get_pms_for_project(project_code: str) -> list[dict]:
+    if not project_code:
+        return []
+    with SessionLocal() as s:
+        rows = (
+            s.query(PMProjectMap, User)
+            .join(User, PMProjectMap.pm_user_id == User.id)
+            .filter(PMProjectMap.project_code == project_code, User.active == True)
+            .order_by(PMProjectMap.primary_pm.desc(), User.name.asc())
+            .all()
+        )
+        result = []
+        for m, u in rows:
+            result.append({
+                "wa_id": u.wa_id,
+                "name": u.name,
+                "role": u.role,
+                "primary": m.primary_pm
+            })
+        return result
 
 # ---------------------------------------------------------------------
 # Core CRUD

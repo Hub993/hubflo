@@ -104,9 +104,19 @@ CHANGE_PREFIXES = (
 )
 
 # TASK verbs = performing work / execution actions
-TASK_PREFIXES  = (
-    "task","todo","to-do","install","fix","inspect","lay","build","schedule",
-    "plumb","level","square","miter","build up","strip","rip","float"
+TASK_PREFIXES = (
+    "task","todo","to-do",
+    "install","fix","inspect","lay","build","schedule","plumb","level","square","miter",
+    "build up","strip","rip","float",
+
+    # expanded construction verbs
+    "frame","hang","set","mount","fit","align","adjust","brace","support",
+    "cut","trim","finish","sand","prime","paint","seal",
+    "dig","excavate","trench","backfill","compact",
+    "pour","tie","rebar","form","grout","cure",
+    "weld","grind","fabricate","assemble",
+    "bolt","anchor","fasten","secure",
+    "clean","prep","clear","demo","remove"
 )
 
 HASHTAG_MAP = {"#order":"order","#change":"change","#task":"task","#urgent":"urgent"}
@@ -401,6 +411,13 @@ def webhook():
         from storage import get_user_role
         user = get_user_role(sender) or {}
 
+        # PM routing lookup (project-based)
+        from storage import get_pms_for_project
+        pms = []
+        proj = user.get("project_code") or None
+        if proj:
+            pms = get_pms_for_project(proj) or []
+
         # create task (always)
         row = create_task(
             sender=sender,
@@ -412,6 +429,10 @@ def webhook():
             attachment=attachment,
             subtype=subtype
         )
+
+        # routing context available:
+        # pms = list of {"wa_id","name","role","primary"}
+        # stored now for digest + escalation layers (no outbound sends at this stage)
 
         # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
         if tag == "order":
@@ -715,13 +736,83 @@ def api_stock_report():
 @app.route("/admin/digest/pm", methods=["GET"])
 def admin_digest_pm():
     if not _check_admin(): return _auth_fail()
-    return jsonify(get_summary()), 200
+
+    pm_wa = request.args.get("pm") or ""
+    if not pm_wa:
+        return jsonify({"error": "missing pm"}), 400
+
+    from storage import SessionLocal, User, PMProjectMap, Task
+
+    with SessionLocal() as s:
+        pm = s.query(User).filter(User.wa_id == pm_wa, User.active == True).first()
+        if not pm or pm.role != "pm":
+            return jsonify({"error": "not a pm"}), 400
+
+        proj_rows = (
+            s.query(PMProjectMap.project_code)
+            .filter(PMProjectMap.pm_user_id == pm.id)
+            .all()
+        )
+        projects = [r.project_code for r in proj_rows]
+        if not projects:
+            return jsonify({"pm": pm.name, "tasks": []}), 200
+
+        tasks = (
+            s.query(Task)
+            .filter(Task.project_code.in_(projects))
+            .order_by(Task.id.desc())
+            .limit(200)
+            .all()
+        )
+
+        resp = []
+        for t in tasks:
+            resp.append({
+                "id": t.id,
+                "project": t.project_code,
+                "tag": t.tag,
+                "text": t.text,
+                "status": t.status,
+                "ts": t.ts.isoformat() if t.ts else None
+            })
+
+        return jsonify({"pm": pm.name, "projects": projects, "tasks": resp}), 200
 
 @app.route("/admin/digest/sub", methods=["GET"])
 def admin_digest_sub():
     if not _check_admin(): return _auth_fail()
-    sender = request.args.get("sender") or ""
-    return jsonify({"tasks": get_tasks(sender=sender, limit=200)}), 200
+
+    sub_wa = request.args.get("sender") or ""
+    if not sub_wa:
+        return jsonify({"error": "missing sender"}), 400
+
+    from storage import SessionLocal, User, Task
+
+    with SessionLocal() as s:
+        sub = s.query(User).filter(User.wa_id == sub_wa, User.active == True).first()
+        if not sub or sub.role != "sub":
+            return jsonify({"error": "not a subcontractor"}), 400
+
+        tasks = (
+            s.query(Task)
+            .filter(Task.sender == sub_wa)
+            .order_by(Task.id.desc())
+            .limit(200)
+            .all()
+        )
+
+        resp = []
+        for t in tasks:
+            resp.append({
+                "id": t.id,
+                "project": t.project_code,
+                "tag": t.tag,
+                "text": t.text,
+                "status": t.status,
+                "ts": t.ts.isoformat() if t.ts else None
+            })
+
+        return jsonify({"sub": sub.name, "tasks": resp}), 200
 
 # ---------------------------------------------------------------------
 # Run
