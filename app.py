@@ -531,14 +531,47 @@ def admin_view():
     """
     return Response(body, 200, mimetype="text/html")
 
-@app.route("/admin/view.json", methods=["GET"])
+@app.route("/admin/view.json")
 def admin_view_json():
-    if not _check_admin(): return _auth_fail()
-    tag = request.args.get("tag") or None
-    q = request.args.get("q") or None
-    sender = request.args.get("sender") or None
-    limit = int(request.args.get("limit", "200"))
-    return jsonify(get_tasks(tag=tag, q=q, sender=sender, limit=limit))
+    token = request.args.get("token")
+    if token != ADMIN_TOKEN:
+        return jsonify([])
+
+    limit = int(request.args.get("limit", 50))
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(Task)
+            .order_by(Task.id.desc())
+            .limit(limit)
+            .all()
+        )
+
+    out = []
+    for r in rows:
+        out.append({
+            "id": r.id,
+            "ts": r.ts,
+            "sender": r.sender,
+            "text": r.text,
+            "tag": r.tag,
+            "subtype": r.subtype,
+            "order_state": r.order_state,
+            "status": r.status,
+            "project_code": r.project_code,
+            "subcontractor_name": r.subcontractor_name,
+            "approved_at": r.approved_at,
+            "rejected_at": r.rejected_at,
+            "completed_at": r.completed_at,
+            "started_at": r.started_at,
+            "due_date": r.due_date,
+            "overrun_days": r.overrun_days,
+            "is_rework": r.is_rework,
+            "attachment": r.attachment,
+            "last_updated": r.last_updated,
+        })
+
+    return jsonify(out)
 
 # ---------------------------------------------------------------------
 # Admin action routes (parity with v5)
