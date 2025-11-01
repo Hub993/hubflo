@@ -440,7 +440,7 @@ def webhook():
         # stored now for digest + escalation layers (no outbound sends at this stage)
 
         # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
-        if tag == "order":
+        if tag == "order" and "[await:" not in (text or "").lower():
             # immediately mark task to begin follow-up sequence
             with SessionLocal() as s:
                 t = s.get(Task, row["id"])
