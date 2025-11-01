@@ -151,9 +151,11 @@ def classify_tag(text:str)->Optional[str]:
     return None
 
 def detect_subtype(text:str)->str:
-    if not text: return "assigned"
-    t=text.lower()
-    if "i will" in t or "i'll" in t or "my task" in t: return "self"
+    if not text:
+        return "assigned"
+    t = text.lower().replace("’", "'")  # normalize curly apostrophe to straight
+    if "i will" in t or "i'll" in t:
+        return "self"
     return "assigned"
 
 # ---------------------------------------------------------------------
