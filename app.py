@@ -446,8 +446,7 @@ def webhook():
             subcontractor_name=user.get("subcontractor_name") or None,
             order_state=order_state,
             attachment=attachment,
-            subtype=subtype,
-            pm_wa_id=sender  # sandbox: sender acts as PM for project
+            subtype=subtype
         )
 
         # routing context available:
