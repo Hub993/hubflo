@@ -445,3 +445,22 @@ def adjust_stock(data: dict):
 def get_stock_report():
     """Temporary stub; replace with full implementation later."""
     return {"status": "ok", "report": []}
+
+# ---------------------------------------------------------------------
+# Project → PM lookup (stub; returns all PMs matching project_code)
+# ---------------------------------------------------------------------
+def get_pms_for_project(project_code: str):
+    with SessionLocal() as s:
+        return [
+            {
+                "wa_id": u.wa_id,
+                "name": u.name,
+                "role": u.role,
+                "primary": True  # default until multi-PM assignment
+            }
+            for u in s.query(User).filter(
+                User.project_code == project_code,
+                User.role == "pm",
+                User.active == True
+            ).all()
+        ]
