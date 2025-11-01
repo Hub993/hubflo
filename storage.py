@@ -69,6 +69,8 @@ class Task(Base):
     subcontractor_name = Column(String(128))
     project_code = Column(String(128), index=True)
 
+    pm_wa_id = Column(String(64), nullable=True, index=True)
+
     attachment_url = Column(Text)
     attachment_mime = Column(String(128))
     attachment_name = Column(String(256))
@@ -263,6 +265,7 @@ def create_task(sender: str, text: str, tag: Optional[str] = None,
         t = Task(
             sender=sender, text=text or "", tag=tag,
             subcontractor_name=subcontractor_name, project_code=project_code,
+            pm_wa_id=kwargs.get("pm_wa_id"),
             due_date=due_date, order_state=order_state, subtype=subtype
         )
         if attachment:
