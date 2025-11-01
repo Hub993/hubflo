@@ -105,18 +105,27 @@ CHANGE_PREFIXES = (
 
 # TASK verbs = performing work / execution actions
 TASK_PREFIXES = (
-    "task","todo","to-do",
-    "install","fix","inspect","lay","build","schedule","plumb","level","square","miter",
-    "build up","strip","rip","float",
+    # general
+    "task","todo","to-do","install","fix","inspect","lay","build","schedule",
+    "plumb","level","square","miter","float","strip","rip",
 
-    # expanded construction verbs
-    "frame","hang","set","mount","fit","align","adjust","brace","support",
-    "cut","trim","finish","sand","prime","paint","seal",
-    "dig","excavate","trench","backfill","compact",
-    "pour","tie","rebar","form","grout","cure",
-    "weld","grind","fabricate","assemble",
-    "bolt","anchor","fasten","secure",
-    "clean","prep","clear","demo","remove"
+    # carpentry
+    "brace","notch","rebate","plane","sand","sheet","hang","frame","fit","align",
+
+    # drywall / plaster / finishing
+    "skim","screed","mud","tape","feather","finish","patch","caulk",
+
+    # concrete / masonry
+    "pour","set","mix","trowel","grout","point","stack","bed",
+
+    # roofing
+    "shingle","flash","seal","weatherproof",
+
+    # electrical / plumbing routing
+    "terminate","wire","run conduit","tie-in","mount","secure",
+
+    # earthworks / prep
+    "trench","compact","grade","stake","stringline"
 )
 
 HASHTAG_MAP = {"#order":"order","#change":"change","#task":"task","#urgent":"urgent"}
