@@ -137,6 +137,9 @@ def classify_tag(text:str)->Optional[str]:
         if h in t: return tag
     for p in ORDER_PREFIXES:
         if t.startswith(p+" "): return "order"
+    # override: "pour" always treated as task (site work, not procurement)
+    if t.startswith("pour "):
+        return "task"
     for p in CHANGE_PREFIXES:
         if t.startswith(p+" "): return "change"
     for p in TASK_PREFIXES:
