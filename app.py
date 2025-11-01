@@ -238,6 +238,7 @@ def webhook():
     raw = request.get_json(silent=True) or {}
     try:
         entry = (raw.get("entry") or [])[0]
+        log.info("WEBHOOK_INBOUND: %s", json.dumps(raw)[:500])
         changes = (entry.get("changes") or [])[0]
         value = changes.get("value") or {}
         msgs = value.get("messages") or []
