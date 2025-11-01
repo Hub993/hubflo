@@ -383,19 +383,6 @@ def webhook():
                         send_whatsapp_text(phone_id, sender, "Drop location on site?")
                         return ("", 200)
 
-                    # DROP LOCATION (FINALIZE + MULTILINE FORMAT)
-                    if lower.startswith("[await:drop_location]"):
-                        awaiting.text = (
-                            f"Item: {item or ''}\n"
-                            f"Quantity: {qty or ''}\n"
-                            f"Supplier: {supplier or ''}\n"
-                            f"Delivery Date: {ddate or ''}\n"
-                            f"Drop Location: {text}"
-                        )
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "✅ Order details recorded.")
-                        return ("", 200)
-
         # === CLASSIFICATION ====================================================
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
@@ -438,6 +425,19 @@ def webhook():
         # routing context available:
         # pms = list of {"wa_id","name","role","primary"}
         # stored now for digest + escalation layers (no outbound sends at this stage)
+
+        # DROP LOCATION (FINALIZE + MULTILINE FORMAT)
+        if lower.startswith("[await:drop_location]"):
+            awaiting.text = (
+                f"Item: {item or ''}\n"
+                f"Quantity: {qty or ''}\n"
+                f"Supplier: {supplier or ''}\n"
+                f"Delivery Date: {ddate or ''}\n"
+                f"Drop Location: {text}"
+            )
+            s.commit()
+            send_whatsapp_text(phone_id, sender, "✅ Order details recorded.")
+            return ("", 200)
 
         # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
         if tag == "order" and "[await:" not in (text or "").lower():
