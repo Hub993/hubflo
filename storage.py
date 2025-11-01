@@ -265,7 +265,7 @@ def create_task(sender: str, text: str, tag: Optional[str] = None,
         t = Task(
             sender=sender, text=text or "", tag=tag,
             subcontractor_name=subcontractor_name, project_code=project_code,
-            pm_wa_id=kwargs.get("pm_wa_id"),
+            pm_wa_id=pm_wa_id,
             due_date=due_date, order_state=order_state, subtype=subtype
         )
         if attachment:
