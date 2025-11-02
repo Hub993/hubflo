@@ -334,7 +334,7 @@ def webhook():
                         Task.sender == sender,
                         Task.status == "open",
                         Task.tag == "order",
-                        Task.text.ilike("[await:%]%")
+                        Task.text.like("[await:%]%")
                     )
                     .order_by(Task.id.desc())
                     .first()
@@ -456,23 +456,13 @@ def webhook():
 
         # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
         if tag == "order" and "[await:" not in (text or "").lower():
-            # immediately mark task to begin follow-up sequence
             with SessionLocal() as s:
                 t = s.get(Task, row["id"])
                 if t and not (t.text or "").lower().startswith("[await:item]"):
                     t.text = f"[await:item] {t.text}"
                     s.commit()
-            # prompt next detail
             send_whatsapp_text(phone_id, sender, "Item?")
             return ("", 200)
-
-        # === NON-ORDER ROUTES ==================================================
-        if tag == "change":
-            send_whatsapp_text(phone_id, sender, "Change logged.")
-        elif tag == "task":
-            send_whatsapp_text(phone_id, sender, "Task created.")
-
-    return ("", 200)
 
 # ---------------------------------------------------------------------
 # Admin views — dual output (HTML + JSON)
