@@ -105,27 +105,29 @@ CHANGE_PREFIXES = (
 
 # TASK verbs = performing work / execution actions
 TASK_PREFIXES = (
-    # general
-    "task","todo","to-do","install","fix","inspect","lay","build","schedule",
-    "plumb","level","square","miter","float","strip","rip",
+    # general site work
+    "install","fix","inspect","lay","build","schedule",
+    "plumb","level","square","miter","float","strip","rip","cut","measure",
+    "clean","clear","prepare","check","align","mark","set up","assemble",
 
     # carpentry
     "brace","notch","rebate","plane","sand","sheet","hang","frame","fit","align",
+    "trim","mitre","screw","nail","bolt","fasten","anchor",
 
     # drywall / plaster / finishing
-    "skim","screed","mud","tape","feather","finish","patch","caulk",
+    "skim","screed","mud","tape","feather","finish","patch","caulk","paint","prime",
 
     # concrete / masonry
-    "pour","set","mix","trowel","grout","point","stack","bed",
+    "pour","set","mix","trowel","grout","point","stack","bed","vibrate","float slab",
 
     # roofing
     "shingle","flash","seal","weatherproof",
 
     # electrical / plumbing routing
-    "terminate","wire","run conduit","tie-in","mount","secure",
+    "terminate","wire","run","route","mount","secure","connect","tie-in","crimp",
 
-    # earthworks / prep
-    "trench","compact","grade","stake","stringline"
+    # earthworks / preparation
+    "trench","compact","grade","stake","stringline","excavate","backfill"
 )
 
 HASHTAG_MAP = {"#order":"order","#change":"change","#task":"task","#urgent":"urgent"}
