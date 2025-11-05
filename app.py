@@ -466,6 +466,9 @@ def webhook():
             send_whatsapp_text(phone_id, sender, "Item?")
             return ("", 200)
 
+    # --- FALLBACK RETURN (ensures webhook always returns 200) ---
+    return ("", 200)
+
 # ---------------------------------------------------------------------
 # Admin views — dual output (HTML + JSON)
 # ---------------------------------------------------------------------
