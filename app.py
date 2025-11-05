@@ -828,7 +828,8 @@ def admin_digest_pm():
 
 @app.route("/admin/digest/sub", methods=["GET"])
 def admin_digest_sub():
-    if not _check_admin(): return _auth_fail()
+    if not _check_admin(): 
+        return _auth_fail()
 
     sub_wa = request.args.get("sender") or ""
     if not sub_wa:
@@ -837,7 +838,11 @@ def admin_digest_sub():
     from storage import SessionLocal, User, Task
 
     with SessionLocal() as s:
-        sub = s.query(User).filter(User.wa_id == sub_wa, User.active == True).first()
+        sub = (
+            s.query(User)
+            .filter(User.wa_id == sub_wa, User.active == True)
+            .first()
+        )
         if not sub or sub.role != "sub":
             return jsonify({"error": "not a subcontractor"}), 400
 
@@ -849,15 +854,17 @@ def admin_digest_sub():
             .all()
         )
 
-        resp.append({
-            "id": t.id,
-            "project": t.project_code,
-            "tag": t.tag,
-            "subtype": t.subtype,  # <-- added
-            "text": t.text,
-            "status": t.status,
-            "ts": t.ts.isoformat() if t.ts else None
-        })
+        resp = []
+        for t in tasks:
+            resp.append({
+                "id": t.id,
+                "project": t.project_code,
+                "tag": t.tag,
+                "subtype": t.subtype,
+                "text": t.text,
+                "status": t.status,
+                "ts": t.ts.isoformat() if t.ts else None
+            })
 
         return jsonify({"sub": sub.name, "tasks": resp}), 200
 
