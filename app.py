@@ -456,6 +456,14 @@ def webhook():
         # pms = list of {"wa_id","name","role","primary"}
         # stored now for digest + escalation layers (no outbound sends at this stage)
 
+        # send interactive buttons when explicitly enabled (prod only)
+        if tag == "order" and os.environ.get("ENABLE_BUTTONS") == "1":
+            try:
+                send_order_checklist(phone_id, sender, row["id"])
+            except Exception:
+                pass
+            return ("", 200)
+
         # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
         if tag == "order" and "[await:" not in (text or "").lower():
             with SessionLocal() as s:
