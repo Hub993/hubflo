@@ -846,16 +846,15 @@ def admin_digest_sub():
             .all()
         )
 
-        resp = []
-        for t in tasks:
-            resp.append({
-                "id": t.id,
-                "project": t.project_code,
-                "tag": t.tag,
-                "text": t.text,
-                "status": t.status,
-                "ts": t.ts.isoformat() if t.ts else None
-            })
+        resp.append({
+            "id": t.id,
+            "project": t.project_code,
+            "tag": t.tag,
+            "subtype": t.subtype,  # <-- added
+            "text": t.text,
+            "status": t.status,
+            "ts": t.ts.isoformat() if t.ts else None
+        })
 
         return jsonify({"sub": sub.name, "tasks": resp}), 200
 
