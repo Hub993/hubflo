@@ -908,6 +908,38 @@ def admin_digest_sub_preview():
             "total_open": len(tasks)
         }), 200
 
+@app.route("/admin/digest/sub/send", methods=["POST"])
+def admin_digest_sub_send():
+    if not _check_admin(): 
+        return _auth_fail()
+
+    sub_wa = request.args.get("sender") or ""
+    if not sub_wa:
+        return jsonify({"error": "missing sender"}), 400
+
+    from storage import SessionLocal, User, Task
+    with SessionLocal() as s:
+        sub = s.query(User).filter(User.wa_id == sub_wa, User.active == True).first()
+        if not sub or sub.role != "sub":
+            return jsonify({"error": "not a subcontractor"}), 400
+
+        tasks = (
+            s.query(Task)
+            .filter(Task.sender == sub_wa, Task.status == "open")
+            .order_by(Task.id.asc())
+            .all()
+        )
+
+        lines = [f"📋 Daily Tasks for {sub.name} ({sub.subcontractor_name or 'No Company'})"]
+        for t in tasks:
+            lines.append(f"- ({t.id}) {t.text}")
+
+        message = "\n".join(lines)
+
+    # No real send (sandbox). Just log/acknowledge success.
+    log.info(f"DAILY_DIGEST_SEND_SANDBOX → {sub_wa}: {message}")
+    return jsonify({"status": "ok", "sent_to": sub_wa}), 200
+
 # ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
