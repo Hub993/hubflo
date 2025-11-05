@@ -43,6 +43,21 @@ class User(Base):
     phone = Column(String(64), nullable=True)
     active = Column(Boolean, default=True)
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    wa_id = Column(String(64), unique=True, index=True)  # WhatsApp ID
+    name = Column(String(128))
+    role = Column(String(32))  # sub | pm | ops | director | owner
+    subcontractor_name = Column(String(128), nullable=True)
+    project_code = Column(String(128), nullable=True)
+
+    phone = Column(String(64), nullable=True)
+    active = Column(Boolean, default=True)
+
+    timezone = Column(String(64), default="America/New_York")  # default timezone
+
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow,
                         onupdate=dt.datetime.utcnow)
