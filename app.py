@@ -829,6 +829,50 @@ def admin_digest_pm():
             "projects": projects
         }), 200
 
+@app.route("/admin/digest/pm/send", methods=["POST"])
+def admin_digest_pm_send():
+    if not _check_admin(): 
+        return _auth_fail()
+
+    pm_wa = request.args.get("pm") or ""
+    if not pm_wa:
+        return jsonify({"error": "missing pm"}), 400
+
+    from storage import SessionLocal, User, PMProjectMap, Task
+
+    with SessionLocal() as s:
+        pm = s.query(User).filter(User.wa_id == pm_wa, User.active == True).first()
+        if not pm or pm.role != "pm":
+            return jsonify({"error": "not a pm"}), 400
+
+        proj_rows = (
+            s.query(PMProjectMap.project_code)
+            .filter(PMProjectMap.pm_user_id == pm.id)
+            .all()
+        )
+        projects = [r.project_code for r in proj_rows]
+
+        tasks = (
+            s.query(Task)
+            .filter(Task.project_code.in_(projects), Task.status == "open")
+            .order_by(Task.id.asc())
+            .all()
+        )
+
+        if not tasks:
+            return jsonify({"status": "no-open-tasks", "sent_to": pm_wa}), 200
+
+        lines = [f"📋 Daily PM Digest for {pm.name}"]
+        for t in tasks:
+            label = f"[{t.tag.upper()}]" if t.tag else ""
+            lines.append(f"- ({t.id}) {label} {t.text}")
+        message = "\n".join(lines)
+
+        # Sandbox-safe send
+        log.info(f"DAILY_PM_DIGEST_SEND_SANDBOX → {pm_wa}: {message}")
+
+        return jsonify({"status": "ok", "sent_to": pm_wa}), 200
+
 @app.route("/admin/digest/sub", methods=["GET"])
 def admin_digest_sub():
     if not _check_admin(): 
@@ -986,6 +1030,30 @@ def daily_digest_scheduler():
 
 # start scheduler thread (daemon)
 threading.Thread(target=daily_digest_scheduler, daemon=True).start()
+
+def daily_pm_digest_scheduler():
+    while True:
+        now_utc = datetime.utcnow()
+
+        with SessionLocal() as s:
+            pms = s.query(User).filter(User.role == "pm", User.active == True).all()
+
+            for pm in pms:
+                tzname = pm.timezone or "America/New_York"
+                try:
+                    tz = pytz.timezone(tzname)
+                except:
+                    tz = pytz.timezone("America/New_York")
+
+                local_now = now_utc.replace(tzinfo=pytz.utc).astimezone(tz)
+
+                # Trigger at exactly 18:00 local
+                if local_now.hour == 18 and local_now.minute == 0:
+                    # sandbox-safe auto send
+                    log.info(f"DAILY_PM_DIGEST_AUTO_SEND → {pm.wa_id}")
+        time.sleep(60)
+
+threading.Thread(target=daily_pm_digest_scheduler, daemon=True).start()
 
 # ---------------------------------------------------------------------
 # Run
