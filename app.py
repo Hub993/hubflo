@@ -810,29 +810,24 @@ def admin_digest_pm():
             .all()
         )
         projects = [r.project_code for r in proj_rows]
-        if not projects:
-            return jsonify({"pm": pm.name, "tasks": []}), 200
 
         tasks = (
             s.query(Task)
-            .filter(Task.project_code.in_(projects))
-            .order_by(Task.id.desc())
-            .limit(200)
+            .filter(Task.project_code.in_(projects), Task.status == "open")
+            .order_by(Task.id.asc())
             .all()
         )
 
-        resp = []
+        lines = [f"📋 Daily PM Digest for {pm.name}"]
         for t in tasks:
-            resp.append({
-                "id": t.id,
-                "project": t.project_code,
-                "tag": t.tag,
-                "text": t.text,
-                "status": t.status,
-                "ts": t.ts.isoformat() if t.ts else None
-            })
+            label = f"[{t.tag.upper()}]" if t.tag else ""
+            lines.append(f"- ({t.id}) {label} {t.text}")
 
-        return jsonify({"pm": pm.name, "projects": projects, "tasks": resp}), 200
+        return jsonify({
+            "preview_text": "\n".join(lines),
+            "total_open": len(tasks),
+            "projects": projects
+        }), 200
 
 @app.route("/admin/digest/sub", methods=["GET"])
 def admin_digest_sub():
@@ -939,6 +934,58 @@ def admin_digest_sub_send():
     # No real send (sandbox). Just log/acknowledge success.
     log.info(f"DAILY_DIGEST_SEND_SANDBOX → {sub_wa}: {message}")
     return jsonify({"status": "ok", "sent_to": sub_wa}), 200
+
+import threading
+import time
+import pytz
+from datetime import datetime
+from storage import SessionLocal, User, Task
+
+def daily_digest_scheduler():
+    while True:
+        now_utc = datetime.utcnow()
+
+        with SessionLocal() as s:
+            subs = s.query(User).filter(User.role == "sub", User.active == True).all()
+
+            for sub in subs:
+                tzname = sub.timezone or "America/New_York"
+                try:
+                    tz = pytz.timezone(tzname)
+                except:
+                    tz = pytz.timezone("America/New_York")
+
+                local_now = now_utc.replace(tzinfo=pytz.utc).astimezone(tz)
+
+                # Only fire at exactly 06:00 local, minutes only (safe in 1-min cycle)
+                if local_now.hour == 6 and local_now.minute == 0:
+
+                    # fetch open tasks
+                    tasks = (
+                        s.query(Task)
+                        .filter(Task.sender == sub.wa_id, Task.status == "open")
+                        .order_by(Task.id.asc())
+                        .all()
+                    )
+
+                    # If no open tasks → send nothing (silent skip)
+                    if not tasks:
+                        continue
+
+                    # Build message
+                    lines = [f"📋 Daily Tasks for {sub.name} ({sub.subcontractor_name or 'No Company'})"]
+                    for t in tasks:
+                        lines.append(f"- ({t.id}) {t.text}")
+                    message = "\n".join(lines)
+
+                    # Sandbox-safe "send"
+                    log.info(f"DAILY_DIGEST_AUTO_SEND → {sub.wa_id}: {message}")
+
+        time.sleep(60)
+
+
+# start scheduler thread (daemon)
+threading.Thread(target=daily_digest_scheduler, daemon=True).start()
 
 # ---------------------------------------------------------------------
 # Run
