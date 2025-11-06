@@ -788,6 +788,43 @@ def api_stock_report():
     if not _check_admin(): return _auth_fail()
     return jsonify(get_stock_report())
 
+# === PM ↔ PROJECT ASSIGNMENT (ADMIN) =================================
+@app.route("/admin/assign_pm", methods=["POST"])
+def admin_assign_pm():
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True, silent=True) or {}
+    pm_wa = data.get("pm_wa", "").strip()
+    project_code = data.get("project_code", "").strip()
+
+    if not pm_wa or not project_code:
+        return jsonify({"error": "missing pm_wa or project_code"}), 400
+
+    from storage import SessionLocal, User, PMProjectMap
+
+    with SessionLocal() as s:
+        pm = (
+            s.query(User)
+            .filter(User.wa_id == pm_wa, User.active == True)
+            .first()
+        )
+        if not pm or pm.role != "pm":
+            return jsonify({"error": "not a valid pm"}), 400
+
+        existing = (
+            s.query(PMProjectMap)
+            .filter(PMProjectMap.pm_user_id == pm.id,
+                    PMProjectMap.project_code == project_code)
+            .first()
+        )
+        if not existing:
+            m = PMProjectMap(pm_user_id=pm.id, project_code=project_code, primary_pm=True)
+            s.add(m)
+            s.commit()
+
+        return jsonify({"status": "ok", "pm": pm_wa, "project_code": project_code}), 200
+
 # === DIGEST SCAFFOLDS (sandbox only) =================================
 @app.route("/admin/digest/pm", methods=["GET"])
 def admin_digest_pm():
