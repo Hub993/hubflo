@@ -1087,6 +1087,11 @@ def daily_pm_digest_scheduler():
                 # Trigger at exactly 18:00 local
                 if local_now.hour == 18 and local_now.minute == 0:
                     # sandbox-safe auto send
+                    # one-per-day guard
+                    state_key = f"pm_digest_{pm.wa_id}_{local_now.strftime('%Y-%m-%d')}"
+                    if os.environ.get(state_key) == "sent":
+                        continue
+                    os.environ[state_key] = "sent"
                     log.info(f"DAILY_PM_DIGEST_AUTO_SEND → {pm.wa_id}")
         time.sleep(60)
 
@@ -1105,6 +1110,10 @@ def admin_digest_pm_tick():
 def admin_digest_sub_tick():
     if not _check_admin(): return _auth_fail()
     log.info("SLC18: MANUAL_SUB_DIGEST_TICK")
+    # resolve subcontractor WA ID for manual trigger
+    sub_wa = request.args.get("sender") or request.args.get("sub") or ""
+    if not sub_wa:
+        return jsonify({"error": "missing sender"}), 400
     return admin_digest_sub_send()
 
 # ---------------------------------------------------------------------
