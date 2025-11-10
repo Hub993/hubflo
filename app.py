@@ -1092,6 +1092,21 @@ def daily_pm_digest_scheduler():
 
 threading.Thread(target=daily_pm_digest_scheduler, daemon=True).start()
 
+# ============================================================
+# MANUAL SCHEDULER TRIGGER (SLC18 — DRY RUN)
+# ============================================================
+@app.route("/admin/digest/pm/tick", methods=["POST"])
+def admin_digest_pm_tick():
+    if not _check_admin(): return _auth_fail()
+    log.info("SLC18: MANUAL_PM_DIGEST_TICK")
+    return admin_digest_pm_send()
+
+@app.route("/admin/digest/sub/tick", methods=["POST"])
+def admin_digest_sub_tick():
+    if not _check_admin(): return _auth_fail()
+    log.info("SLC18: MANUAL_SUB_DIGEST_TICK")
+    return admin_digest_sub_send()
+
 # ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
