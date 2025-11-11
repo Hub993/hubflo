@@ -101,33 +101,38 @@ CHANGE_PREFIXES = (
     "extend","enlarge","widen","lengthen","raise","lower",
     "shift","relocate","move","reposition",
     "replace","remove","strip","demolish","knock","add","reduce","modify","alter"
+
 )
 
 # TASK verbs = performing work / execution actions
 TASK_PREFIXES = (
     # general site work
-    "install","fix","inspect","lay","build","schedule",
-    "plumb","level","square","miter","float","strip","rip","cut","measure",
-    "clean","clear","prepare","check","align","mark","set up","assemble",
+    "align","assemble","build","carry","check","clean","clear","cut","dig",
+    "fix","fix up","float","inspect","install","lay","level","lift","mark",
+    "measure","miter","prepare","prep","rip","schedule","set up","strip",
+    "touch up","unload",
 
     # carpentry
-    "brace","notch","rebate","plane","sand","sheet","hang","frame","fit","align",
-    "trim","mitre","screw","nail","bolt","fasten","anchor",
+    "anchor","batten","bolt","bolt-up","brace","clad","counterbatten","fit",
+    "frame","hang","mitre","notch","plane","rebate","sand","sheet","sheeting",
+    "screw","trim",
 
     # drywall / plaster / finishing
-    "skim","screed","mud","tape","feather","finish","patch","caulk","paint","prime",
+    "caulk","feather","finish","mask","mud","paint","patch","prime","screed",
+    "skim","tape",
 
     # concrete / masonry
-    "pour","set","mix","trowel","grout","point","stack","bed","vibrate","float slab",
+    "bed","chase","float slab","grout","mix","point","pour","rake out",
+    "set","stack","trowel","vibrate",
 
     # roofing
-    "shingle","flash","seal","weatherproof",
+    "flash","seal","shingle","weatherproof",
 
     # electrical / plumbing routing
-    "terminate","wire","run","route","mount","secure","connect","tie-in","crimp",
+    "connect","crimp","mount","route","run","secure","terminate","tie-in","wire",
 
     # earthworks / preparation
-    "trench","compact","grade","stake","stringline","excavate","backfill"
+    "backfill","compact","excavate","grade","stake","stringline","trench",
 )
 
 HASHTAG_MAP = {"#order":"order","#change":"change","#task":"task","#urgent":"urgent"}
