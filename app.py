@@ -576,6 +576,11 @@ def admin_view_json():
             "due_date": r.due_date,
             "overrun_days": r.overrun_days,
             "is_rework": r.is_rework,
+            "attachment": {
+                "name": r.attachment_name,
+                "mime": r.attachment_mime,
+                "url": r.attachment_url,
+            } if r.attachment_url else None,
             "attachment": r.attachment,
             "last_updated": r.last_updated,
         })
