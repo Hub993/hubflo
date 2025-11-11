@@ -1126,6 +1126,18 @@ def admin_digest_sub_tick():
         return jsonify({"error": "missing sender"}), 400
     return admin_digest_sub_send()
 
+# === TEMPORARY SCHEMA SYNC ROUTE (REMOVE AFTER SUCCESS) =====================
+@app.route("/admin/db_sync_change_order", methods=["POST"])
+def admin_db_sync_change_order():
+    if not _check_admin(): 
+        return _auth_fail()
+    from storage import Base, ENGINE
+    try:
+        Base.metadata.create_all(ENGINE)
+        return jsonify({"status": "ok", "note": "schema synced"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
 # ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
