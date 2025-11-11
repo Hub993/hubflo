@@ -77,8 +77,13 @@ class Task(Base):
     attachment_mime = Column(String(128))
     attachment_name = Column(String(256))
 
-    order_state = Column(String(32))  # quoted|pending_approval|approved|cancelled|invoiced|enacted
-    subtype = Column(String(24))      # assigned|self (added in v6)
+    order_state = Column(String(32))
+    subtype = Column(String(24))
+
+    # === NEW FIELDS (CHANGE-ORDER STRUCTURE) ===
+    cost = Column(Float, nullable=True)
+    time_impact_days = Column(Float, nullable=True)
+    approval_required = Column(Boolean, default=False)
 
     last_updated = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
 
@@ -186,6 +191,9 @@ def _as_task_dict(t: Task) -> dict:
         "project_code": t.project_code,
         "order_state": t.order_state,
         "subtype": t.subtype,
+        "cost": t.cost,
+        "time_impact_days": t.time_impact_days,
+        "approval_required": t.approval_required,
         "attachment": {
             "name": t.attachment_name,
             "mime": t.attachment_mime,
@@ -435,8 +443,23 @@ def close_meeting(meeting_id: int, actor: Optional[str] = None):
 # Change Orders & Stock (placeholders for V6 live test)
 # ---------------------------------------------------------------------
 def record_change_order(data: dict):
-    """Temporary stub; replace with full implementation later."""
-    return {"status": "ok", "message": "Change order recorded", "data": data}
+    with SessionLocal() as s:
+        tid = data.get("task_id")
+        cost = data.get("cost")
+        time_impact = data.get("time_impact_days")
+        approval = data.get("approval_required")
+
+        t = s.get(Task, tid)
+        if not t:
+            return {"error": "task not found"}
+
+        t.cost = float(cost) if cost is not None else None
+        t.time_impact_days = float(time_impact) if time_impact is not None else None
+        t.approval_required = bool(approval)
+        s.commit(); s.refresh(t)
+
+        log_audit(data.get("actor"), "change_order_update", "task", t.id)
+        return _as_task_dict(t)
 
 def create_stock_item(data: dict):
     """Temporary stub; replace with full implementation later."""
