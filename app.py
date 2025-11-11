@@ -581,7 +581,7 @@ def admin_view_json():
                 "mime": r.attachment_mime,
                 "url": r.attachment_url,
             } if r.attachment_url else None,
-            "attachment": r.attachment,
+            "attachment_url": r.attachment_url,
             "last_updated": r.last_updated,
         })
 
