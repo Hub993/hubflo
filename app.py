@@ -1156,7 +1156,7 @@ def admin_digest_sub_tick():
     return admin_digest_sub_send()
 
 # ---------------------------------------------------------------------
-# Admin Reporting Scaffold (Phase: Company-Level Summary)
+# Admin Reporting — Aggregated Summary (Phase 2)
 # ---------------------------------------------------------------------
 @app.route("/admin/report/summary", methods=["GET"])
 def admin_report_summary():
@@ -1164,16 +1164,20 @@ def admin_report_summary():
         return _auth_fail()
 
     from storage import SessionLocal, Task
+    from sqlalchemy import func
 
     with SessionLocal() as s:
-        total_tasks = s.query(Task).count()
-        open_tasks = s.query(Task).filter(Task.status == "open").count()
-        approved = s.query(Task).filter(Task.status == "approved").count()
-        rejected = s.query(Task).filter(Task.status == "rejected").count()
-        done = s.query(Task).filter(Task.status == "done").count()
+        total_tasks = s.query(func.count(Task.id)).scalar() or 0
+        open_tasks = s.query(func.count(Task.id)).filter(Task.status == "open").scalar() or 0
+        approved = s.query(func.count(Task.id)).filter(Task.status == "approved").scalar() or 0
+        rejected = s.query(func.count(Task.id)).filter(Task.status == "rejected").scalar() or 0
+        done = s.query(func.count(Task.id)).filter(Task.status == "done").scalar() or 0
 
-        cost_sum = s.query(Task).filter(Task.cost != None).count()  # placeholder
-        time_impacts = s.query(Task).filter(Task.time_impact_days != None).count()
+        total_cost = s.query(func.sum(Task.cost)).scalar() or 0.0
+        total_time_impact = s.query(func.sum(Task.time_impact_days)).scalar() or 0.0
+
+        with_cost = s.query(func.count(Task.id)).filter(Task.cost != None).scalar() or 0
+        with_time = s.query(func.count(Task.id)).filter(Task.time_impact_days != None).scalar() or 0
 
     return jsonify({
         "summary": {
@@ -1184,10 +1188,12 @@ def admin_report_summary():
             "done": done
         },
         "change_orders": {
-            "with_cost": cost_sum,
-            "with_time_impact": time_impacts
+            "total_cost": round(total_cost, 2),
+            "total_time_impact_days": float(total_time_impact),
+            "count_with_cost": with_cost,
+            "count_with_time_impact": with_time
         },
-        "status": "scaffold-ok"
+        "status": "aggregated-ok"
     }), 200
 
 # ---------------------------------------------------------------------
