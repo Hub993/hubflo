@@ -1438,6 +1438,97 @@ def admin_report_project_view():
 # ================================================================
 
 # ---------------------------------------------------------------------
+# Admin Reporting — Global Overview (Phase 6)
+# ---------------------------------------------------------------------
+@app.route("/admin/report/overview", methods=["GET"])
+def admin_report_overview():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage import SessionLocal, Task
+    from sqlalchemy import func
+
+    with SessionLocal() as s:
+        total_tasks = s.query(func.count(Task.id)).scalar() or 0
+        open_tasks = s.query(func.count(Task.id)).filter(Task.status == "open").scalar() or 0
+        approved = s.query(func.count(Task.id)).filter(Task.status == "approved").scalar() or 0
+        rejected = s.query(func.count(Task.id)).filter(Task.status == "rejected").scalar() or 0
+        done = s.query(func.count(Task.id)).filter(Task.status == "done").scalar() or 0
+
+        total_cost = s.query(func.sum(Task.cost)).scalar() or 0.0
+        total_time = s.query(func.sum(Task.time_impact_days)).scalar() or 0.0
+
+        total_subs = s.query(func.count(func.distinct(Task.subcontractor_name))).scalar() or 0
+        total_projects = s.query(func.count(func.distinct(Task.project_code))).scalar() or 0
+
+    return jsonify({
+        "summary": {
+            "total_tasks": total_tasks,
+            "open": open_tasks,
+            "approved": approved,
+            "done": done,
+            "rejected": rejected,
+        },
+        "totals": {
+            "projects": total_projects,
+            "subcontractors": total_subs,
+            "total_cost": round(total_cost, 2),
+            "total_time_impact_days": float(total_time),
+        },
+        "status": "ok"
+    }), 200
+
+
+# === ADMIN OVERVIEW DASHBOARD (HTML VIEW) ============================
+@app.route("/admin/report/overview/view", methods=["GET"])
+def admin_report_overview_view():
+    if not _check_admin():
+        return _auth_fail()
+
+    from flask import url_for
+    summary = app.test_client().get(
+        url_for("admin_report_overview", token=request.args.get("token"))
+    ).get_json(force=True)
+
+    s = summary.get("summary", {})
+    t = summary.get("totals", {})
+
+    body = f"""
+    <html><head><title>HubFlo Global Overview</title>
+    <style>
+      body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:20px;}}
+      table{{border-collapse:collapse;width:50%;margin-top:10px}}
+      th,td{{border:1px solid #ccc;padding:6px 10px;font-size:14px;text-align:left}}
+      th{{background:#f4f4f4}}
+    </style></head><body>
+      <h2>HubFlo Global Overview</h2>
+      <table>
+        <tr><th colspan=2>Task Totals</th></tr>
+        <tr><td>Total Tasks</td><td>{s.get('total_tasks',0)}</td></tr>
+        <tr><td>Open</td><td>{s.get('open',0)}</td></tr>
+        <tr><td>Approved</td><td>{s.get('approved',0)}</td></tr>
+        <tr><td>Done</td><td>{s.get('done',0)}</td></tr>
+        <tr><td>Rejected</td><td>{s.get('rejected',0)}</td></tr>
+      </table>
+
+      <table>
+        <tr><th colspan=2>Totals</th></tr>
+        <tr><td>Projects</td><td>{t.get('projects',0)}</td></tr>
+        <tr><td>Subcontractors</td><td>{t.get('subcontractors',0)}</td></tr>
+        <tr><td>Total Cost ($)</td><td>{t.get('total_cost',0.0)}</td></tr>
+        <tr><td>Total Time Impact (days)</td><td>{t.get('total_time_impact_days',0.0)}</td></tr>
+      </table>
+
+      <p style="margin-top:20px;color:#666;font-size:13px">
+        Status: {summary.get('status')}<br>
+        Token used: {request.args.get('token','')}
+      </p>
+    </body></html>
+    """
+    return Response(body, 200, mimetype="text/html")
+# ================================================================
+
+# ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
 
