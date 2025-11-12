@@ -1196,6 +1196,58 @@ def admin_report_summary():
         "status": "aggregated-ok"
     }), 200
 
+# === ADMIN REPORT DASHBOARD (HTML VIEW) ============================
+@app.route("/admin/report/view", methods=["GET"])
+def admin_report_view():
+    if not _check_admin():
+        return _auth_fail()
+
+    # Fetch JSON data from the same summary route
+    from flask import url_for
+    summary = app.test_client().get(
+        url_for("admin_report_summary", token=request.args.get("token"))
+    ).get_json(force=True)
+
+    ch = summary.get("change_orders", {})
+    s = summary.get("summary", {})
+
+    body = f"""
+    <html><head><title>HubFlo Report Dashboard</title>
+    <style>
+      body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:20px;}}
+      h2{{margin-top:0}}
+      table{{border-collapse:collapse;width:60%;margin-top:10px}}
+      th,td{{border:1px solid #ccc;padding:6px 10px;font-size:14px;text-align:left}}
+      th{{background:#f4f4f4}}
+    </style></head><body>
+      <h2>HubFlo Summary Dashboard</h2>
+
+      <table>
+        <tr><th colspan=2>Task Summary</th></tr>
+        <tr><td>Total Tasks</td><td>{s.get('total_tasks',0)}</td></tr>
+        <tr><td>Open</td><td>{s.get('open',0)}</td></tr>
+        <tr><td>Approved</td><td>{s.get('approved',0)}</td></tr>
+        <tr><td>Done</td><td>{s.get('done',0)}</td></tr>
+        <tr><td>Rejected</td><td>{s.get('rejected',0)}</td></tr>
+      </table>
+
+      <table>
+        <tr><th colspan=2>Change Orders</th></tr>
+        <tr><td>Count w/ Cost</td><td>{ch.get('count_with_cost',0)}</td></tr>
+        <tr><td>Count w/ Time Impact</td><td>{ch.get('count_with_time_impact',0)}</td></tr>
+        <tr><td>Total Cost ($)</td><td>{ch.get('total_cost',0.0)}</td></tr>
+        <tr><td>Total Time Impact (days)</td><td>{ch.get('total_time_impact_days',0.0)}</td></tr>
+      </table>
+
+      <p style="margin-top:20px;color:#666;font-size:13px">
+        Status: {summary.get('status')}<br>
+        Token used: {request.args.get('token','')}
+      </p>
+    </body></html>
+    """
+    return Response(body, 200, mimetype="text/html")
+# ================================================================
+
 # ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
