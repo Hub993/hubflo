@@ -1156,6 +1156,41 @@ def admin_digest_sub_tick():
     return admin_digest_sub_send()
 
 # ---------------------------------------------------------------------
+# Admin Reporting Scaffold (Phase: Company-Level Summary)
+# ---------------------------------------------------------------------
+@app.route("/admin/report/summary", methods=["GET"])
+def admin_report_summary():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage import SessionLocal, Task
+
+    with SessionLocal() as s:
+        total_tasks = s.query(Task).count()
+        open_tasks = s.query(Task).filter(Task.status == "open").count()
+        approved = s.query(Task).filter(Task.status == "approved").count()
+        rejected = s.query(Task).filter(Task.status == "rejected").count()
+        done = s.query(Task).filter(Task.status == "done").count()
+
+        cost_sum = s.query(Task).filter(Task.cost != None).count()  # placeholder
+        time_impacts = s.query(Task).filter(Task.time_impact_days != None).count()
+
+    return jsonify({
+        "summary": {
+            "total_tasks": total_tasks,
+            "open": open_tasks,
+            "approved": approved,
+            "rejected": rejected,
+            "done": done
+        },
+        "change_orders": {
+            "with_cost": cost_sum,
+            "with_time_impact": time_impacts
+        },
+        "status": "scaffold-ok"
+    }), 200
+
+# ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
 
