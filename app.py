@@ -510,7 +510,9 @@ def admin_view():
 
     th = (
         "<tr><th>ID</th><th>Time</th><th>Sender</th><th>Tag</th>"
-        "<th>Status</th><th>Order State</th><th>Text</th></tr>"
+        "<th>Status</th><th>Order State</th>"
+        "<th>Cost ($)</th><th>Time Impact (days)</th><th>Approval Req</th>"
+        "<th>Text</th></tr>"
     )
     trs = []
     for r in rows:
@@ -522,6 +524,9 @@ def admin_view():
             f"<td>{h(r.get('tag') or '')}</td>"
             f"<td>{h(r.get('status') or '')}</td>"
             f"<td>{h(r.get('order_state') or '')}</td>"
+            f"<td>{h(str(r.get('cost') or ''))}</td>"
+            f"<td>{h(str(r.get('time_impact_days') or ''))}</td>"
+            f"<td>{'✅' if r.get('approval_required') else ''}</td>"
             f"<td>{h(r['text'])}</td>"
             f"</tr>"
         )
@@ -566,6 +571,9 @@ def admin_view_json():
             "tag": r.tag,
             "subtype": r.subtype,
             "order_state": r.order_state,
+            "cost": r.cost,
+            "time_impact_days": r.time_impact_days,
+            "approval_required": r.approval_required,
             "status": r.status,
             "project_code": r.project_code,
             "subcontractor_name": r.subcontractor_name,
