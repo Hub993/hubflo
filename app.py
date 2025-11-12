@@ -966,7 +966,6 @@ def admin_digest_sub():
 
         resp = []
         for t in tasks:
-        for t in tasks:
             resp.append({
                 "id": t.id,
                 "project": t.project_code,
