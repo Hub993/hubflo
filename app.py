@@ -876,12 +876,10 @@ def admin_digest_pm():
         lines = [f"📋 Daily PM Digest for {pm.name}"]
         for t in tasks:
             label = f"[{t.tag.upper()}]" if t.tag else ""
-            extra = []
-            if t.cost: extra.append(f"${t.cost:.2f}")
-            if t.time_impact_days: extra.append(f"{t.time_impact_days} d")
-            if t.approval_required: extra.append("⚠ Approval")
-            note = f" ({', '.join(extra)})" if extra else ""
-            lines.append(f"- ({t.id}) {label} {t.text}{note}")
+            cost = f" | 💲{t.cost}" if t.cost is not None else ""
+            time_imp = f" | ⏱{t.time_impact_days}d" if t.time_impact_days is not None else ""
+            approval = " | ✅Approval" if t.approval_required else ""
+            lines.append(f"- ({t.id}) {label} {t.text}{cost}{time_imp}{approval}")
 
         return jsonify({
             "preview_text": "\n".join(lines),
@@ -968,6 +966,7 @@ def admin_digest_sub():
 
         resp = []
         for t in tasks:
+        for t in tasks:
             resp.append({
                 "id": t.id,
                 "project": t.project_code,
@@ -975,6 +974,9 @@ def admin_digest_sub():
                 "subtype": t.subtype,
                 "text": t.text,
                 "status": t.status,
+                "cost": t.cost,
+                "time_impact_days": t.time_impact_days,
+                "approval_required": t.approval_required,
                 "ts": t.ts.isoformat() if t.ts else None
             })
 
