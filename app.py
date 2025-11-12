@@ -876,7 +876,12 @@ def admin_digest_pm():
         lines = [f"📋 Daily PM Digest for {pm.name}"]
         for t in tasks:
             label = f"[{t.tag.upper()}]" if t.tag else ""
-            lines.append(f"- ({t.id}) {label} {t.text}")
+            extra = []
+            if t.cost: extra.append(f"${t.cost:.2f}")
+            if t.time_impact_days: extra.append(f"{t.time_impact_days} d")
+            if t.approval_required: extra.append("⚠ Approval")
+            note = f" ({', '.join(extra)})" if extra else ""
+            lines.append(f"- ({t.id}) {label} {t.text}{note}")
 
         return jsonify({
             "preview_text": "\n".join(lines),
@@ -920,7 +925,12 @@ def admin_digest_pm_send():
         lines = [f"📋 Daily PM Digest for {pm.name}"]
         for t in tasks:
             label = f"[{t.tag.upper()}]" if t.tag else ""
-            lines.append(f"- ({t.id}) {label} {t.text}")
+            extra = []
+            if t.cost: extra.append(f"${t.cost:.2f}")
+            if t.time_impact_days: extra.append(f"{t.time_impact_days} d")
+            if t.approval_required: extra.append("⚠ Approval")
+            note = f" ({', '.join(extra)})" if extra else ""
+            lines.append(f"- ({t.id}) {label} {t.text}{note}")
         message = "\n".join(lines)
 
         # Sandbox-safe send
@@ -995,7 +1005,12 @@ def admin_digest_sub_preview():
 
         lines = [f"📋 Daily Tasks for {sub.name} ({sub.subcontractor_name or 'No Company'})"]
         for t in tasks:
-            lines.append(f"- ({t.id}) {t.text}")
+            extra = []
+            if t.cost: extra.append(f"${t.cost:.2f}")
+            if t.time_impact_days: extra.append(f"{t.time_impact_days} d")
+            if t.approval_required: extra.append("⚠ Approval")
+            note = f" ({', '.join(extra)})" if extra else ""
+            lines.append(f"- ({t.id}) {t.text}{note}")
 
         return jsonify({
             "preview_text": "\n".join(lines),
@@ -1026,7 +1041,12 @@ def admin_digest_sub_send():
 
         lines = [f"📋 Daily Tasks for {sub.name} ({sub.subcontractor_name or 'No Company'})"]
         for t in tasks:
-            lines.append(f"- ({t.id}) {t.text}")
+            extra = []
+            if t.cost: extra.append(f"${t.cost:.2f}")
+            if t.time_impact_days: extra.append(f"{t.time_impact_days} d")
+            if t.approval_required: extra.append("⚠ Approval")
+            note = f" ({', '.join(extra)})" if extra else ""
+            lines.append(f"- ({t.id}) {t.text}{note}")
 
         message = "\n".join(lines)
 
