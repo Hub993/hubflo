@@ -1345,6 +1345,99 @@ def admin_report_performance_view():
 # ================================================================
 
 # ---------------------------------------------------------------------
+# Admin Reporting — Per-Project Summary (Phase 5)
+# ---------------------------------------------------------------------
+@app.route("/admin/report/project", methods=["GET"])
+def admin_report_project():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage import SessionLocal, Task
+    from sqlalchemy import func
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(
+                Task.project_code,
+                func.count(Task.id).label("total"),
+                func.sum(func.coalesce(Task.cost, 0)).label("total_cost"),
+                func.sum(func.coalesce(Task.time_impact_days, 0)).label("total_time_impact_days"),
+                func.sum(func.case((Task.status == "open", 1), else_=0)).label("open"),
+                func.sum(func.case((Task.status == "approved", 1), else_=0)).label("approved"),
+                func.sum(func.case((Task.status == "done", 1), else_=0)).label("done"),
+                func.sum(func.case((Task.status == "rejected", 1), else_=0)).label("rejected"),
+            )
+            .group_by(Task.project_code)
+            .order_by(Task.project_code.asc())
+            .all()
+        )
+
+        result = []
+        for r in rows:
+            result.append({
+                "project_code": r.project_code or "(unassigned)",
+                "total_tasks": r.total or 0,
+                "open": r.open or 0,
+                "approved": r.approved or 0,
+                "done": r.done or 0,
+                "rejected": r.rejected or 0,
+                "total_cost": round(float(r.total_cost or 0), 2),
+                "total_time_impact_days": float(r.total_time_impact_days or 0),
+            })
+
+    return jsonify({"status": "ok", "projects": result}), 200
+
+
+# === ADMIN PROJECT SUMMARY DASHBOARD (HTML VIEW) =====================
+@app.route("/admin/report/project/view", methods=["GET"])
+def admin_report_project_view():
+    if not _check_admin():
+        return _auth_fail()
+
+    from flask import url_for
+    summary = app.test_client().get(
+        url_for("admin_report_project", token=request.args.get("token"))
+    ).get_json(force=True)
+
+    rows = summary.get("projects", [])
+
+    body_rows = ""
+    for r in rows:
+        body_rows += (
+            f"<tr><td>{r['project_code']}</td>"
+            f"<td>{r['total_tasks']}</td>"
+            f"<td>{r['open']}</td>"
+            f"<td>{r['approved']}</td>"
+            f"<td>{r['done']}</td>"
+            f"<td>{r['rejected']}</td>"
+            f"<td>{r['total_cost']}</td>"
+            f"<td>{r['total_time_impact_days']}</td></tr>"
+        )
+
+    body = f"""
+    <html><head><title>HubFlo Project Summary</title>
+    <style>
+      body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:20px;}}
+      table{{border-collapse:collapse;width:80%;margin-top:10px}}
+      th,td{{border:1px solid #ccc;padding:6px 10px;font-size:14px;text-align:left}}
+      th{{background:#f4f4f4}}
+    </style></head><body>
+      <h2>HubFlo Per-Project Summary</h2>
+      <table>
+        <tr><th>Project</th><th>Total</th><th>Open</th><th>Approved</th>
+            <th>Done</th><th>Rejected</th><th>Total Cost ($)</th><th>Time Impact (days)</th></tr>
+        {body_rows if body_rows else "<tr><td colspan=8>No data</td></tr>"}
+      </table>
+      <p style="margin-top:20px;color:#666;font-size:13px">
+        Status: {summary.get('status')}<br>
+        Token used: {request.args.get('token','')}
+      </p>
+    </body></html>
+    """
+    return Response(body, 200, mimetype="text/html")
+# ================================================================
+
+# ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
 
