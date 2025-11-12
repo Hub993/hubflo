@@ -1353,7 +1353,7 @@ def admin_report_project():
         return _auth_fail()
 
     from storage import SessionLocal, Task
-    from sqlalchemy import func
+    from sqlalchemy import func, case
 
     with SessionLocal() as s:
         rows = (
@@ -1362,10 +1362,10 @@ def admin_report_project():
                 func.count(Task.id).label("total"),
                 func.sum(func.coalesce(Task.cost, 0)).label("total_cost"),
                 func.sum(func.coalesce(Task.time_impact_days, 0)).label("total_time_impact_days"),
-                func.sum(func.case((Task.status == "open", 1), else_=0)).label("open"),
-                func.sum(func.case((Task.status == "approved", 1), else_=0)).label("approved"),
-                func.sum(func.case((Task.status == "done", 1), else_=0)).label("done"),
-                func.sum(func.case((Task.status == "rejected", 1), else_=0)).label("rejected"),
+                func.sum(case((Task.status == "open", 1), else_=0)).label("open"),
+                func.sum(case((Task.status == "approved", 1), else_=0)).label("approved"),
+                func.sum(case((Task.status == "done", 1), else_=0)).label("done"),
+                func.sum(case((Task.status == "rejected", 1), else_=0)).label("rejected"),
             )
             .group_by(Task.project_code)
             .order_by(Task.project_code.asc())
