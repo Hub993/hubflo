@@ -1257,18 +1257,18 @@ def admin_report_performance():
         return _auth_fail()
 
     from storage import SessionLocal, Task
-    from sqlalchemy import func
+    from sqlalchemy import func, case
 
     with SessionLocal() as s:
         rows = (
             s.query(
                 Task.subcontractor_name,
                 func.count(Task.id).label("total"),
-                func.sum(func.case((Task.status == "done", 1), else_=0)).label("done"),
-                func.sum(func.case((Task.status == "approved", 1), else_=0)).label("approved"),
-                func.sum(func.case((Task.status == "rejected", 1), else_=0)).label("rejected"),
-                func.sum(func.case((Task.is_rework == True, 1), else_=0)).label("reworks"),
-                func.sum(func.case(((Task.overrun_days > 0), 1), else_=0)).label("overruns"),
+                func.sum(case((Task.status == "done", 1), else_=0)).label("done"),
+                func.sum(case((Task.status == "approved", 1), else_=0)).label("approved"),
+                func.sum(case((Task.status == "rejected", 1), else_=0)).label("rejected"),
+                func.sum(case((Task.is_rework.is_(True), 1), else_=0)).label("reworks"),
+                func.sum(case(((Task.overrun_days > 0), 1), else_=0)).label("overruns"),
             )
             .group_by(Task.subcontractor_name)
             .order_by(Task.subcontractor_name.asc())
