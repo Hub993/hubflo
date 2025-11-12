@@ -1249,6 +1249,102 @@ def admin_report_view():
 # ================================================================
 
 # ---------------------------------------------------------------------
+# Admin Reporting — Subcontractor Performance (Phase 4)
+# ---------------------------------------------------------------------
+@app.route("/admin/report/performance", methods=["GET"])
+def admin_report_performance():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage import SessionLocal, Task
+    from sqlalchemy import func
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(
+                Task.subcontractor_name,
+                func.count(Task.id).label("total"),
+                func.sum(func.case((Task.status == "done", 1), else_=0)).label("done"),
+                func.sum(func.case((Task.status == "approved", 1), else_=0)).label("approved"),
+                func.sum(func.case((Task.status == "rejected", 1), else_=0)).label("rejected"),
+                func.sum(func.case((Task.is_rework == True, 1), else_=0)).label("reworks"),
+                func.sum(func.case(((Task.overrun_days > 0), 1), else_=0)).label("overruns"),
+            )
+            .group_by(Task.subcontractor_name)
+            .order_by(Task.subcontractor_name.asc())
+            .all()
+        )
+
+        result = []
+        for r in rows:
+            name = r.subcontractor_name or "(unassigned)"
+            total = r.total or 0
+            on_time = (r.done or 0) - (r.overruns or 0)
+            pct = 0 if total == 0 else round(100.0 * on_time / total, 1)
+            result.append({
+                "subcontractor": name,
+                "total": total,
+                "done": r.done or 0,
+                "approved": r.approved or 0,
+                "rejected": r.rejected or 0,
+                "reworks": r.reworks or 0,
+                "overruns": r.overruns or 0,
+                "accuracy_pct": pct,
+            })
+
+    return jsonify({"status": "ok", "performance": result}), 200
+
+
+# === ADMIN PERFORMANCE DASHBOARD (HTML VIEW) ============================
+@app.route("/admin/report/performance/view", methods=["GET"])
+def admin_report_performance_view():
+    if not _check_admin():
+        return _auth_fail()
+
+    from flask import url_for
+    summary = app.test_client().get(
+        url_for("admin_report_performance", token=request.args.get("token"))
+    ).get_json(force=True)
+
+    rows = summary.get("performance", [])
+    body_rows = "".join(
+        f"<tr><td>{r['subcontractor']}</td>"
+        f"<td>{r['total']}</td>"
+        f"<td>{r['done']}</td>"
+        f"<td>{r['approved']}</td>"
+        f"<td>{r['rejected']}</td>"
+        f"<td>{r['reworks']}</td>"
+        f"<td>{r['overruns']}</td>"
+        f"<td>{r['accuracy_pct']}%</td></tr>"
+        for r in rows
+    )
+
+    body = f"""
+    <html><head><title>HubFlo Performance Report</title>
+    <style>
+      body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:20px;}}
+      table{{border-collapse:collapse;width:90%;margin-top:10px}}
+      th,td{{border:1px solid #ccc;padding:6px 10px;font-size:14px;text-align:left}}
+      th{{background:#f4f4f4}}
+    </style></head><body>
+      <h2>HubFlo Subcontractor Performance</h2>
+      <table>
+        <tr>
+          <th>Subcontractor</th><th>Total</th><th>Done</th><th>Approved</th>
+          <th>Rejected</th><th>Reworks</th><th>Overruns</th><th>Accuracy %</th>
+        </tr>
+        {body_rows or "<tr><td colspan=8>No data</td></tr>"}
+      </table>
+      <p style="margin-top:20px;color:#666;font-size:13px">
+        Status: {summary.get('status')}<br>
+        Token used: {request.args.get('token','')}
+      </p>
+    </body></html>
+    """
+    return Response(body, 200, mimetype="text/html")
+# ================================================================
+
+# ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
 
