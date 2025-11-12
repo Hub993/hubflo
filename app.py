@@ -418,6 +418,15 @@ def webhook():
                         send_whatsapp_text(phone_id, sender, "✅ Order details recorded.")
                         return ("", 200)
 
+                    # --- Auto-finalize full order chain (optional improvement) ---
+                    lines = awaiting.text.lower()
+                    if all(k in lines for k in ["item:", "quantity:", "supplier:", "delivery date:", "drop location:"]):
+                        awaiting.status = "pending_approval"
+                        awaiting.last_updated = datetime.utcnow()
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "✅ All order fields complete. Awaiting PM approval.")
+                        return ("", 200)
+
         # === CLASSIFICATION ====================================================
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
