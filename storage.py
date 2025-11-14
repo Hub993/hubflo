@@ -16,8 +16,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 def _normalize_db_url(url: str) -> str:
     if not url:
         return "sqlite:///hubflo.db"
+    # Use psycopg (v3) driver explicitly
     if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
     return url
 
 DATABASE_URL = _normalize_db_url(os.environ.get("DATABASE_URL", "").strip())
