@@ -1,4 +1,4 @@
-# app_v6.py - Hubflo Version 6
+# app_v6._1.py - Hubflo V6.1 working
 # ---------------------------------------------------------------
 # Rebuilt from v5 base with all verified post-V5 improvements:
 # - Order-step checklist
@@ -44,6 +44,8 @@ ORDER_LIFECYCLE_STATES = [
     "quoted","pending_approval","approved",
     "cancelled","invoiced","enacted"
 ]
+
+_PHASE_DIGEST_TOGGLE = {}
 
 # ---------------------------------------------------------------------
 # Boot DB
@@ -93,76 +95,124 @@ def integrity_status():
 # ---------------------------------------------------------------------
 # Tagging / classification
 # ---------------------------------------------------------------------
-ORDER_PREFIXES = ("order","purchase","procure","buy")
+ORDER_PREFIXES = ("order", "purchase", "procure", "buy")
 
 # CHANGE verbs = scope modifications
 CHANGE_PREFIXES = (
-    "change","variation","revise","amend","adjust",
-    "extend","enlarge","widen","lengthen","raise","lower",
-    "shift","relocate","move","reposition",
-    "replace","remove","strip","demolish","knock","add","reduce","modify","alter"
-
+    "change", "variation", "revise", "amend", "adjust",
+    "extend", "enlarge", "widen", "lengthen", "raise", "lower",
+    "shift", "relocate", "move", "reposition",
+    "replace", "remove", "strip", "demolish", "knock", "add",
+    "reduce", "modify", "alter",
 )
 
 # TASK verbs = performing work / execution actions
 TASK_PREFIXES = (
     # general site work
-    "align","assemble","build","carry","check","clean","clear","cut","dig",
-    "fix","fix up","float","inspect","install","lay","level","lift","mark",
-    "measure","miter","prepare","prep","rip","schedule","set up","strip",
-    "touch up","unload",
+    "align", "assemble", "build", "carry", "check", "clean", "clear",
+    "cut", "dig", "fix", "fix up", "float", "inspect", "install", "lay",
+    "level", "lift", "mark", "measure", "miter", "prepare", "prep",
+    "rip", "schedule", "set up", "strip", "touch up", "unload",
+    "load", "stack",
 
     # carpentry
-    "anchor","batten","bolt","bolt-up","brace","clad","counterbatten","fit",
-    "frame","hang","mitre","notch","plane","rebate","sand","sheet","sheeting",
-    "screw","trim",
+    "anchor", "batten", "bolt", "bolt-up", "brace", "clad",
+    "counterbatten", "fit", "frame", "hang", "mitre", "notch",
+    "plane", "rebate", "sand", "sheet", "sheeting", "screw", "trim",
+    "weld",
 
     # drywall / plaster / finishing
-    "caulk","feather","finish","mask","mud","paint","patch","prime","screed",
-    "skim","tape",
+    "caulk", "feather", "finish", "mask", "mud", "paint", "patch",
+    "prime", "screed", "skim", "tape", "plaster",
 
     # concrete / masonry
-    "bed","chase","float slab","grout","mix","point","pour","rake out",
-    "set","stack","trowel","vibrate",
+    "bed", "chase", "float slab", "grout", "mix", "point", "pour",
+    "rake out", "set", "stack", "trowel", "vibrate",
 
     # roofing
-    "flash","seal","shingle","weatherproof",
+    "flash", "seal", "shingle", "weatherproof",
 
     # electrical / plumbing routing
-    "connect","crimp","mount","route","run","secure","terminate","tie-in","wire",
+    "connect", "crimp", "mount", "route", "run", "secure", "terminate",
+    "tie-in", "wire",
 
     # earthworks / preparation
-    "backfill","compact","excavate","grade","stake","stringline","trench",
+    "backfill", "compact", "excavate", "grade", "stake",
+    "stringline", "trench",
+
+    # generic repair verbs
+    "repair",
 )
 
-HASHTAG_MAP = {"#order":"order","#change":"change","#task":"task","#urgent":"urgent"}
+HASHTAG_MAP = {
+    "#order": "order",
+    "#change": "change",
+    "#task": "task",
+    "#urgent": "urgent",
+}
 
-def classify_tag(text:str)->Optional[str]:
-    if not text: return None
-    t=text.strip().lower()
-    for h,tag in HASHTAG_MAP.items():
-        if h in t: return tag
+def classify_tag(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = text.strip().lower()
+
+    # explicit hashtags win
+    for h, tag in HASHTAG_MAP.items():
+        if h in t:
+            return tag
+
+    # classic "order ..." shape
     for p in ORDER_PREFIXES:
-        if t.startswith(p+" "): return "order"
-    # override: "pour" always treated as task (site work, not procurement)
+        if t.startswith(p + " "):
+            return "order"
+
+    # override: "pour" is always treated as task (site work, not procurement)
     if t.startswith("pour "):
         return "task"
+
+    # change verbs
     for p in CHANGE_PREFIXES:
-        if t.startswith(p+" "): return "change"
+        if t.startswith(p + " "):
+            return "change"
+
+    # task verbs
     for p in TASK_PREFIXES:
-        if t.startswith(p+" "): return "task"
-    if any(u in t for u in ["m ","meter","metre","roll","cable","conduit"]) and any(ch.isdigit() for ch in t):
+        if t.startswith(p + " "):
+            return "task"
+
+    # heuristic: numeric + material-ish unit → treat as order
+    if any(u in t for u in ["m ", "meter", "metre", "roll", "cable", "conduit"]) and any(
+        ch.isdigit() for ch in t
+    ):
         return "order"
-    if any(w in t for w in ["urgent","asap","immediately"]):
+
+    # urgency hints
+    if any(w in t for w in ["urgent", "asap", "immediately"]):
         return "urgent"
+
     return None
 
-def detect_subtype(text:str)->str:
+def detect_subtype(text: str) -> str:
+    """
+    Detect whether a task is 'self' (speaker taking it on) or 'assigned'.
+    """
     if not text:
         return "assigned"
-    t = text.lower().replace("’", "'")  # normalize curly apostrophe to straight
-    if "i will" in t or "i'll" in t:
+
+    t = text.lower().replace("’", "'")
+
+    # self-commitment patterns
+    self_markers = (
+        "i will ",
+        "i'll ",
+        "i can ",
+        "let me ",
+        "i'm going to ",
+        "i shall ",
+    )
+    if any(marker in t for marker in self_markers):
         return "self"
+
     return "assigned"
 
 # ---------------------------------------------------------------------
@@ -427,6 +477,19 @@ def webhook():
                         send_whatsapp_text(phone_id, sender, "✅ All order fields complete. Awaiting PM approval.")
                         return ("", 200)
 
+                    # >>> PATCH_2_APP_START — REMIND-ME CALL PARSER <<<
+                    from storage_v6_1 import create_call_reminder
+
+                    if text:
+                        lower_t = text.lower().strip()
+
+                        if lower_t.startswith("remind me to call "):
+                            target = lower_t.replace("remind me to call", "", 1).strip()
+                            if target:
+                                create_call_reminder(sender, text, target)
+                                return ("", 200)
+                    # >>> PATCH_2_APP_END <<<
+
         # === CLASSIFICATION ====================================================
         tag = classify_tag(text or "")
         subtype = detect_subtype(text or "")
@@ -518,18 +581,21 @@ def admin_view():
         return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
     th = (
-        "<tr><th>ID</th><th>Time</th><th>Sender</th><th>Tag</th>"
+        "<tr><th>ID</th><th>Time</th><th>Sender</th><th>Client</th><th>Tag</th>"
         "<th>Status</th><th>Order State</th>"
         "<th>Cost ($)</th><th>Time Impact (days)</th><th>Approval Req</th>"
         "<th>Text</th></tr>"
     )
     trs = []
     for r in rows:
+        # NEW: derive client-display (safe)
+        client_display = r.get('project_code') or ""
         trs.append(
             f"<tr>"
             f"<td>{r['id']}</td>"
             f"<td>{h(r['ts'])}</td>"
             f"<td>{h(r.get('sender') or '')}</td>"
+            f"<td>{h(client_display)}</td>"
             f"<td>{h(r.get('tag') or '')}</td>"
             f"<td>{h(r.get('status') or '')}</td>"
             f"<td>{h(r.get('order_state') or '')}</td>"
@@ -604,9 +670,108 @@ def admin_view_json():
 
     return jsonify(out)
 
+# >>> PATCH_11_APP_START — SUPPLIER DIRECTORY <<<
+
+@app.route("/admin/supplier/create", methods=["POST"])
+def admin_supplier_create():
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+    from storage_v6_1 import supplier_create
+    result = supplier_create(data)
+    return jsonify(result)
+
+@app.route("/admin/suppliers", methods=["GET"])
+def admin_supplier_list():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage_v6_1 import supplier_list
+    result = supplier_list()
+    return jsonify(result)
+
+# >>> PATCH_11_APP_END <<<
+
 # ---------------------------------------------------------------------
 # Admin action routes (parity with v5)
 # ---------------------------------------------------------------------
+
+# >>> PATCH_14_APP_START — CRITICAL FLAGS IN DIGESTS <<<
+
+def _task_is_critical_for_digest(t: dict) -> bool:
+    """
+    Mirrors storage.is_task_critical but operates on the
+    already-serialized task dictionaries passed into digest builders.
+    """
+    cost = t.get("cost")
+    time_impact = t.get("time_impact_days")
+    approval = t.get("approval_required")
+
+    if cost and cost >= 1000:
+        return True
+    if time_impact and time_impact >= 3:
+        return True
+    if approval:
+        return True
+    return False
+
+# >>> PATCH_14_APP_END <<<
+
+# >>> PATCH_3_APP_START — INLINE TASK TEXT EDIT <<<
+
+@app.route("/admin/task/edit", methods=["POST"])
+def admin_task_edit():
+    token = request.args.get("token", "").strip()
+    if token != ADMIN_TOKEN:
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    tid = data.get("task_id")
+    new_text = data.get("new_text")
+    actor = data.get("actor")
+
+    if not tid or not new_text:
+        return {"error": "missing fields"}, 400
+
+    from storage_v6_1 import edit_task_text
+    result = edit_task_text(tid, new_text, actor)
+
+    return jsonify(result)
+
+# >>> PATCH_3_APP_END <<<
+
+@app.route("/admin/task_group/add", methods=["POST"])
+def admin_task_group_add():
+    token = request.args.get("token", "").strip()
+    if token != ADMIN_TOKEN:
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    parent_id = data.get("parent_id")
+    child_id = data.get("child_id")
+    actor = data.get("actor", "admin")
+
+    if not parent_id or not child_id:
+        return {"error": "missing fields"}, 400
+
+    from storage_v6_1 import add_task_to_group
+    result = add_task_to_group(int(parent_id), int(child_id), actor)
+    return jsonify(result)
+
+@app.route("/admin/task_group/children", methods=["GET"])
+def admin_task_group_children():
+    token = request.args.get("token", "").strip()
+    if token != ADMIN_TOKEN:
+        return {"error": "unauthorized"}, 401
+
+    parent_id = request.args.get("parent_id")
+    if not parent_id:
+        return {"error": "missing parent_id"}, 400
+
+    from storage_v6_1 import get_group_children
+    kids = get_group_children(int(parent_id))
+    return jsonify({"parent_id": int(parent_id), "children": kids})
 
 @app.route("/admin/approve", methods=["POST"])
 def api_approve():
@@ -673,6 +838,31 @@ def api_revoke():
 
     return jsonify(result), 200
 
+# === CALL-ACTION TEMPLATES (ADMIN ONLY) ================================
+@app.route("/admin/call/templates", methods=["GET"])
+def admin_call_templates():
+    if not _check_admin():
+        return _auth_fail()
+
+    templates = [
+        {
+            "id": "call_supplier",
+            "label": "Call supplier",
+            "description": "Use for chasing materials, deliveries or clarifications with suppliers."
+        },
+        {
+            "id": "call_pm",
+            "label": "Call PM",
+            "description": "Use for coordination calls between subcontractor and project manager."
+        },
+        {
+            "id": "call_owner",
+            "label": "Call owner",
+            "description": "Use for high-level issues requiring owner or director attention."
+        },
+    ]
+    return jsonify({"status": "ok", "templates": templates}), 200
+# ======================================================================
 
 @app.route("/admin/order_state", methods=["POST"])
 def api_order_state():
@@ -797,6 +987,67 @@ def api_change_order():
     if not _check_admin(): return _auth_fail()
     data=request.get_json(force=True)
     return jsonify(record_change_order(data))
+
+# >>> PATCH_8_APP_START — INLINE CHANGE-ORDER EDIT (AUDIT SAFE) <<<
+
+@app.route("/admin/change_order/edit", methods=["POST"])
+def api_change_order_edit():
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+    tid = data.get("task_id")
+    fields = data.get("fields") or {}
+
+    if not tid:
+        return jsonify({"error": "missing task_id"}), 400
+
+    from storage import SessionLocal, Task, log_audit
+
+    editable = {"cost", "time_impact_days", "approval_required"}
+
+    with SessionLocal() as s:
+        t = s.get(Task, int(tid))
+        if not t:
+            return jsonify({"error": "task not found"}), 404
+
+        before = {
+            "cost": t.cost,
+            "time_impact_days": t.time_impact_days,
+            "approval_required": t.approval_required,
+        }
+
+        # apply safe edits
+        for k, v in fields.items():
+            if k not in editable:
+                continue
+            if k == "approval_required":
+                setattr(t, k, bool(v))
+            else:
+                try:
+                    setattr(t, k, float(v) if v is not None else None)
+                except:
+                    pass
+
+        s.commit(); s.refresh(t)
+
+        after = {
+            "cost": t.cost,
+            "time_impact_days": t.time_impact_days,
+            "approval_required": t.approval_required,
+        }
+
+        details = json.dumps({"before": before, "after": after}, default=str)
+        log_audit("admin", "change_order_edit", "task", t.id, details=details)
+
+        return jsonify({
+            "status": "ok",
+            "task_id": t.id,
+            "before": before,
+            "after": after
+        }), 200
+
+# >>> PATCH_8_APP_END <<<
 
 @app.route("/admin/stock/create",methods=["POST"])
 def api_stock_create():
@@ -1144,6 +1395,94 @@ def daily_pm_digest_scheduler():
         time.sleep(60)
 
 threading.Thread(target=daily_pm_digest_scheduler, daemon=True).start()
+
+
+# ============================================================
+# FUTURE VOICE CHANNEL SUPPORT (TWILIO VOICE STUBS)
+# ============================================================
+
+@app.route("/voice/inbound", methods=["POST"])
+def voice_inbound_stub():
+    """
+    Stub for future Twilio Voice inbound-call webhook.
+    No action performed; logs minimal metadata only.
+    """
+    payload = request.get_json(silent=True) or {}
+    log.info(f"VOICE_INBOUND_STUB: {json.dumps(payload)[:400]}")
+    return jsonify({"status": "stub-ok", "direction": "inbound"}), 200
+
+
+@app.route("/voice/status", methods=["POST"])
+def voice_status_stub():
+    """
+    Stub for future Twilio Voice call-status events:
+    ringing, in-progress, completed, failed.
+    No action performed; no DB writes yet.
+    """
+    payload = request.get_json(silent=True) or {}
+    log.info(f"VOICE_STATUS_STUB: {json.dumps(payload)[:400]}")
+    return jsonify({"status": "stub-ok"}), 200
+
+
+@app.route("/voice/completed", methods=["POST"])
+def voice_completed_stub():
+    """
+    Stub for future Twilio 'call completed' events.
+    Will later write to CallLog.
+    Currently does nothing except log.
+    """
+    payload = request.get_json(silent=True) or {}
+    log.info(f"VOICE_COMPLETED_STUB: {json.dumps(payload)[:400]}")
+    return jsonify({"status": "stub-ok", "saved": False}), 200
+
+# ============================================================
+# MULTI-PHASE DIGEST (TOGGLE SUPPORT)
+# ============================================================
+
+@app.route("/admin/digest/pm/phase_toggle", methods=["POST"])
+def admin_digest_pm_phase_toggle():
+    """
+    Toggle per-phase digest mode for a given project.
+    Future: stored in DB (currently ephemeral, memory only).
+    """
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+    project = (data.get("project_code") or "").strip()
+    enable = bool(data.get("enable"))
+
+    if not project:
+        return jsonify({"error": "missing project_code"}), 400
+
+    # In v6.1 this is temporary in-memory toggle
+    _PHASE_DIGEST_TOGGLE[project] = enable
+
+    return jsonify({
+        "status": "ok",
+        "project": project,
+        "enabled": enable
+    }), 200
+
+
+@app.route("/admin/digest/pm/phase_status", methods=["GET"])
+def admin_digest_pm_phase_status():
+    """
+    Inspect the current toggle value for a project.
+    """
+    if not _check_admin():
+        return _auth_fail()
+
+    project = (request.args.get("project_code") or "").strip()
+    if not project:
+        return jsonify({"error": "missing project_code"}), 400
+
+    val = _PHASE_DIGEST_TOGGLE.get(project, False)
+    return jsonify({
+        "status": "ok",
+        "project": project,
+        "enabled": val
+    }), 200
 
 # ============================================================
 # MANUAL SCHEDULER TRIGGER (SLC18 — DRY RUN)
@@ -1536,6 +1875,46 @@ def admin_report_overview_view():
     """
     return Response(body, 200, mimetype="text/html")
 # ================================================================
+
+# >>> PATCH_1_APP_START — CALL LOG ENDPOINT <<<
+
+from storage import log_call
+
+@app.route("/admin/voice/log", methods=["POST"])
+def admin_voice_log():
+    if not _check_admin():
+        return _auth_fail()
+
+    data = request.get_json(force=True) or {}
+
+    direction = (data.get("direction") or "").strip().lower()   # inbound | outbound
+    from_wa   = (data.get("from") or "").strip()
+    to_wa     = (data.get("to") or "").strip()
+    duration  = data.get("duration_seconds")
+    notes     = data.get("notes")
+
+    if direction not in ("inbound", "outbound"):
+        return jsonify({"error": "direction must be inbound|outbound"}), 400
+
+    if not from_wa or not to_wa:
+        return jsonify({"error": "missing from or to"}), 400
+
+    try:
+        duration = int(duration) if duration is not None else None
+    except:
+        return jsonify({"error": "invalid duration_seconds"}), 400
+
+    rec = log_call(
+        direction=direction,
+        from_wa=from_wa,
+        to_wa=to_wa,
+        duration_seconds=duration,
+        notes=notes,
+    )
+
+    return jsonify({"status": "ok", "call": rec}), 200
+
+# >>> PATCH_1_APP_END <<<
 
 # ---------------------------------------------------------------------
 # Run

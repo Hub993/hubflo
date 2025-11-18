@@ -1,4 +1,4 @@
-# storage_v6.py — HUBFLO Unified Storage Layer (Post-v5/v6 rebuild)
+# storage_v6_1.py — HUBFLO V6.1 working
 # Derived from verified v5 base + reinforced tethered safeguards
 # ---------------------------------------------------------------------
 import os
@@ -32,10 +32,26 @@ Base = declarative_base()
 # Models
 # ---------------------------------------------------------------------
 
+# >>> PATCH_4_STORAGE_START — MULTI-TENANCY CLIENT FIELD <<<
+
+# Every persisted object belongs to a client_id to ensure isolation of
+# all data when multiple clients share one WhatsApp number.
+# Default client_id = 1 until multi-client onboarding UI is added.
+
+DEFAULT_CLIENT_ID = 1
+
+def current_client_id() -> int:
+    # Placeholder: returns DEFAULT_CLIENT_ID for now.
+    # Future toggle will override this.
+    return DEFAULT_CLIENT_ID
+
+# >>> PATCH_4_STORAGE_END <<<
+
 # --- NEW: People & Role Model (Hierarchy Lookup) ----------------------
 class User(Base):
     __tablename__ = "users"
 
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     wa_id = Column(String(64), unique=True, index=True)  # WhatsApp ID
     name = Column(String(128))
@@ -52,9 +68,56 @@ class User(Base):
     updated_at = Column(DateTime, default=dt.datetime.utcnow,
                         onupdate=dt.datetime.utcnow)
 
+# >>> PATCH_5_STORAGE_START — CLIENT DISPLAY NAME <<<
+
+# Per-client WhatsApp display name
+class ClientWAIdentity(Base):
+    __tablename__ = "client_wa_identity"
+
+    id = Column(Integer, primary_key=True)
+    client_id = Column(String(64), index=True, nullable=False)
+    display_name_for_whatsapp = Column(String(128), nullable=False)
+
+# lookup helper
+def get_client_display_name(client_id: str) -> Optional[str]:
+    with SessionLocal() as s:
+        row = (
+            s.query(ClientWAIdentity)
+            .filter(ClientWAIdentity.client_id == client_id)
+            .first()
+        )
+        return row.display_name_for_whatsapp if row else None
+
+# setter helper
+def set_client_display_name(client_id: str, name: str) -> dict:
+    with SessionLocal() as s:
+        row = (
+            s.query(ClientWAIdentity)
+            .filter(ClientWAIdentity.client_id == client_id)
+            .first()
+        )
+        if not row:
+            row = ClientWAIdentity(
+                client_id=client_id,
+                display_name_for_whatsapp=name.strip()
+            )
+            s.add(row)
+        else:
+            row.display_name_for_whatsapp = name.strip()
+
+        s.commit()
+        s.refresh(row)
+        return {
+            "client_id": row.client_id,
+            "display_name_for_whatsapp": row.display_name_for_whatsapp
+        }
+
+# >>> PATCH_5_STORAGE_END <<<
+
 class Task(Base):
     __tablename__ = "tasks"
 
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     sender = Column(String(64), index=True)
     text = Column(Text)
@@ -90,9 +153,37 @@ class Task(Base):
 
     last_updated = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
 
+# >>> PATCH_10_STORAGE_START — TASK GROUPING <<<
+
+class TaskGroup(Base):
+    __tablename__ = "task_groups"
+
+    id = Column(Integer, primary_key=True)
+    parent_id = Column(Integer, index=True)       # FK-like reference → Task.id
+    child_id = Column(Integer, index=True)        # FK-like reference → Task.id
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+
+def add_task_to_group(parent_id: int, child_id: int, actor: Optional[str] = None) -> dict:
+    with SessionLocal() as s:
+        g = TaskGroup(parent_id=parent_id, child_id=child_id)
+        s.add(g)
+        s.commit()
+        s.refresh(g)
+        log_audit(actor, "task_group_add", "task_group", g.id,
+                  details=f"parent={parent_id}, child={child_id}")
+        return {"status": "ok", "group_id": g.id}
+
+def get_group_children(parent_id: int) -> list[int]:
+    with SessionLocal() as s:
+        rows = s.query(TaskGroup).filter(TaskGroup.parent_id == parent_id).all()
+        return [r.child_id for r in rows]
+
+# >>> PATCH_10_STORAGE_END <<<
+
 class Meeting(Base):
     __tablename__ = "meetings"
 
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     title = Column(String(200), nullable=False)
     project_code = Column(String(128), index=True)
@@ -105,10 +196,58 @@ class Meeting(Base):
     status = Column(String(24), default="scheduled", index=True)
     task_ids = Column(Text)  # comma-separated ids
 
+# >>> PATCH_1_STORAGE_START — CALL LOG MODEL <<<
+
+class CallLog(Base):
+    __tablename__ = "call_logs"
+
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
+    id = Column(Integer, primary_key=True)
+    ts = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+    direction = Column(String(16))         # inbound | outbound
+    from_wa = Column(String(64), index=True)
+    to_wa = Column(String(64), index=True)
+
+    duration_seconds = Column(Integer, nullable=True)
+    notes = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+
+# Helper: record call metadata
+def log_call(direction: str,
+             from_wa: str,
+             to_wa: str,
+             duration_seconds: Optional[int],
+             notes: Optional[str]) -> dict:
+    with SessionLocal() as s:
+        c = CallLog(
+            direction=direction,
+            from_wa=from_wa,
+            to_wa=to_wa,
+            duration_seconds=duration_seconds,
+            notes=notes,
+        )
+        s.add(c)
+        s.commit()
+        s.refresh(c)
+        return {
+            "id": c.id,
+            "ts": c.ts.isoformat() if c.ts else None,
+            "direction": c.direction,
+            "from": c.from_wa,
+            "to": c.to_wa,
+            "duration_seconds": c.duration_seconds,
+            "notes": c.notes,
+        }
+
+# >>> PATCH_1_STORAGE_END <<<
+
 # --- PM ↔ Project Assignment ----------------------------------------
 class PMProjectMap(Base):
     __tablename__ = "pm_project_map"
 
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     pm_user_id = Column(Integer, index=True)      # FK → User.id (not enforced here)
     project_code = Column(String(128), index=True)
@@ -121,6 +260,7 @@ class PMProjectMap(Base):
 class Audit(Base):
     __tablename__ = "audits"
 
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     ts = Column(DateTime, default=dt.datetime.utcnow, index=True)
     actor = Column(String(64))
@@ -135,6 +275,7 @@ class Audit(Base):
 class SystemState(Base):
     __tablename__ = "system_state"
 
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     hygiene_last_utc = Column(String(40), nullable=True)
     redmode = Column(Boolean, default=False)
@@ -267,6 +408,37 @@ def get_pms_for_project(project_code: str) -> list[dict]:
 # ---------------------------------------------------------------------
 # Core CRUD
 # ---------------------------------------------------------------------
+# >>> PATCH_4_STORAGE_QUERY_FILTERS_START — CLIENT FILTER <<<
+def _apply_client_filter(q):
+    return q.filter_by(client_id=current_client_id())
+# >>> PATCH_4_STORAGE_QUERY_FILTERS_END <<<
+
+# >>> PATCH_3_STORAGE_START — INLINE TASK EDIT (AUDIT SAFE) <<<
+
+def edit_task_text(task_id: int,
+                   new_text: str,
+                   actor: Optional[str] = None) -> dict:
+    """
+    Inline PM-safe text edit.
+    Preserves old→new pairs via Audit table.
+    """
+    with SessionLocal() as s:
+        t = s.get(Task, task_id)
+        if not t:
+            return {"error": "task not found"}
+
+        old_text = t.text or ""
+        t.text = new_text or ""
+        t.last_updated = dt.datetime.utcnow()
+        s.commit(); s.refresh(t)
+
+        details = f"old='{old_text}' → new='{new_text}'"
+        log_audit(actor, "task_edit_text", "task", t.id, details=details)
+
+        return _as_task_dict(t)
+
+# >>> PATCH_3_STORAGE_END <<<
+
 def create_task(sender: str, text: str, tag: Optional[str] = None,
                 attachment: Optional[dict] = None,
                 subcontractor_name: Optional[str] = None,
@@ -289,32 +461,77 @@ def create_task(sender: str, text: str, tag: Optional[str] = None,
         log_audit(sender, "create", "task", t.id, details=text or "")
         return _as_task_dict(t)
 
-def get_tasks(tag: Optional[str] = None, q: Optional[str] = None,
-              sender: Optional[str] = None, limit: int = 100):
+def get_tasks(limit: int = 200, client_id: Optional[str] = None):
     with SessionLocal() as s:
-        qry = s.query(Task).order_by(Task.id.desc())
-        if tag:
-            if tag.lower() == "none":
-                qry = qry.filter((Task.tag.is_(None)) | (Task.tag == ""))
-            else:
-                qry = qry.filter(Task.tag == tag)
-        if sender:
-            qry = qry.filter(Task.sender == sender)
-        if q:
-            like = f"%{q}%"
-            qry = qry.filter(Task.text.ilike(like))
-        rows = qry.limit(limit).all()
-        return [_as_task_dict(t) for t in rows]
+        # Apply client isolation FIRST
+        qry = _apply_client_filter(s.query(Task), client_id).order_by(Task.id.desc())
 
-def get_summary(limit_latest: int = 50):
+        rows = qry.limit(limit).all()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r.id,
+                "ts": r.ts.isoformat() if r.ts else None,
+                "sender": r.sender,
+                "text": r.text,
+                "tag": r.tag,
+                "subtype": r.subtype,
+                "order_state": r.order_state,
+                "cost": r.cost,
+                "time_impact_days": r.time_impact_days,
+                "approval_required": r.approval_required,
+                "status": r.status,
+                "project_code": r.project_code,
+                "subcontractor_name": r.subcontractor_name,
+                "approved_at": r.approved_at,
+                "rejected_at": r.rejected_at,
+                "completed_at": r.completed_at,
+                "started_at": r.started_at,
+                "due_date": r.due_date,
+                "overrun_days": r.overrun_days,
+                "is_rework": r.is_rework,
+                "attachment_name": r.attachment_name,
+                "attachment_mime": r.attachment_mime,
+                "attachment_url": r.attachment_url,
+                "last_updated": r.last_updated,
+            })
+        return out
+
+def get_summary():
     with SessionLocal() as s:
-        rows = s.query(Task).order_by(Task.id.desc()).limit(limit_latest).all()
-        counts = {}
-        for t in rows:
-            key = (t.tag or "none")
-            counts[key] = counts.get(key, 0) + 1
-        latest = [_as_task_dict(t) for t in rows[:10]]
-        return {"counts_by_tag": counts, "latest": latest}
+        qry = _apply_client_filter(
+            s.query(Task)
+        ).order_by(Task.id.desc())
+
+        rows = qry.limit(200).all()
+
+        out = []
+        for r in rows:
+            out.append({
+                "id": r.id,
+                "ts": r.ts.isoformat() if r.ts else None,
+                "sender": r.sender,
+                "text": r.text,
+                "tag": r.tag,
+                "subtype": r.subtype,
+                "order_state": r.order_state,
+                "cost": r.cost,
+                "time_impact_days": r.time_impact_days,
+                "approval_required": r.approval_required,
+                "status": r.status,
+                "project_code": r.project_code,
+                "subcontractor_name": r.subcontractor_name,
+                "approved_at": r.approved_at.isoformat() if r.approved_at else None,
+                "rejected_at": r.rejected_at.isoformat() if r.rejected_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "due_date": r.due_date.isoformat() if r.due_date else None,
+                "overrun_days": r.overrun_days,
+                "is_rework": r.is_rework,
+                "attachment_url": r.attachment_url,
+                "last_updated": r.last_updated.isoformat() if r.last_updated else None,
+            })
+        return out
 
 def mark_done(task_id: int, actor: Optional[str] = None):
     with SessionLocal() as s:
@@ -464,6 +681,84 @@ def record_change_order(data: dict):
         log_audit(data.get("actor"), "change_order_update", "task", t.id)
         return _as_task_dict(t)
 
+def get_phase_digest_toggle() -> dict:
+    """Returns empty toggle placeholder for future multi-phase digests."""
+    return {}
+
+# >>> PATCH_13_STORAGE_START — ADVANCED CHANGE ORDER VIEW SUPPORT <<<
+
+def get_all_change_orders() -> list[dict]:
+    """
+    Returns every task where cost or time_impact_days is set,
+    for use in advanced admin reporting.
+    """
+    with SessionLocal() as s:
+        rows = (
+            s.query(Task)
+            .filter(
+                (Task.cost != None) |
+                (Task.time_impact_days != None)
+            )
+            .order_by(Task.id.desc())
+            .all()
+        )
+
+        out = []
+        for r in rows:
+            out.append({
+                "id": r.id,
+                "sender": r.sender,
+                "project_code": r.project_code,
+                "subcontractor_name": r.subcontractor_name,
+                "text": r.text,
+                "cost": r.cost,
+                "time_impact_days": r.time_impact_days,
+                "approval_required": r.approval_required,
+                "status": r.status,
+                "ts": r.ts.isoformat() if r.ts else None
+            })
+        return out
+
+# >>> PATCH_13_STORAGE_END <<<
+
+# >>> PATCH_2_STORAGE_START — CALL REMINDER HELPER <<<
+
+def create_call_reminder(sender: str,
+                         raw_text: str,
+                         target: str) -> dict:
+    """
+    Creates a reminder task:
+    'remind me to call <target>'
+    """
+    note = f"CALL REMINDER → Call {target}"
+    return create_task(
+        sender=sender,
+        text=note,
+        tag="task",
+        subtype="assigned"
+    )
+
+# >>> PATCH_2_STORAGE_END <<<
+
+# >>> PATCH_14_STORAGE_START — CRITICAL FLAGS <<<
+
+def is_task_critical(t: Task) -> bool:
+    """
+    A task is 'critical' if it has:
+    • cost >= 1000, OR
+    • time_impact_days >= 3, OR
+    • approval_required == True
+    """
+    if t.cost and t.cost >= 1000:
+        return True
+    if t.time_impact_days and t.time_impact_days >= 3:
+        return True
+    if t.approval_required:
+        return True
+    return False
+
+# >>> PATCH_14_STORAGE_END <<<
+
 def create_stock_item(data: dict):
     """Temporary stub; replace with full implementation later."""
     return {"status": "ok", "message": "Stock item created", "data": data}
@@ -475,6 +770,53 @@ def adjust_stock(data: dict):
 def get_stock_report():
     """Temporary stub; replace with full implementation later."""
     return {"status": "ok", "report": []}
+
+# >>> PATCH_11_STORAGE_START — SUPPLIER DIRECTORY <<<
+
+class Supplier(Base):
+    __tablename__ = "suppliers"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), unique=True, nullable=False, index=True)
+    phone = Column(String(64), nullable=True)
+    email = Column(String(200), nullable=True)
+    notes = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=dt.datetime.utcnow,
+        onupdate=dt.datetime.utcnow
+    )
+
+def supplier_create(data: dict) -> dict:
+    with SessionLocal() as s:
+        sup = Supplier(
+            name=data.get("name", ""),
+            phone=data.get("phone"),
+            email=data.get("email"),
+            notes=data.get("notes"),
+        )
+        s.add(sup)
+        s.commit()
+        s.refresh(sup)
+        return {"status": "ok", "id": sup.id}
+
+def supplier_list() -> list[dict]:
+    with SessionLocal() as s:
+        rows = s.query(Supplier).order_by(Supplier.name.asc()).all()
+        return [
+            {
+                "id": r.id,
+                "name": r.name,
+                "phone": r.phone,
+                "email": r.email,
+                "notes": r.notes,
+            }
+            for r in rows
+        ]
+
+# >>> PATCH_11_STORAGE_END <<<
 
 # ---------------------------------------------------------------------
 # Project → PM lookup (stub; returns all PMs matching project_code)
