@@ -1,4 +1,4 @@
-# app_v6._1.py - Hubflo V6.1 working
+# app_v6_1.py — Hubflo V6.1 working
 # ---------------------------------------------------------------
 # Rebuilt from v5 base with all verified post-V5 improvements:
 # - Order-step checklist
@@ -11,16 +11,19 @@
 import os, json, logging, datetime as dt, requests
 from typing import Optional
 from flask import Flask, request, jsonify, Response
-from storage import (
+
+from storage_v6_1 import (
     init_db, create_task, get_tasks, get_summary,
     mark_done, approve_task, reject_task, set_order_state,
     revoke_last, subcontractor_accuracy,
     create_meeting, start_meeting, close_meeting,
     create_stock_item, adjust_stock, get_stock_report,
-    record_change_order
+    record_change_order,
+    add_task_to_group, get_group_children, edit_task_text,
+    get_all_change_orders, create_call_reminder
 )
 
-from storage import Task
+from storage_v6_1 import Task
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -57,7 +60,11 @@ init_db()
 # HUBFLO INTEGRITY PATCH — CANONICAL HEARTBEAT (v6 unified)
 # ============================================================
 from sqlalchemy import text
-from storage import SessionLocal, hygiene_pin, hygiene_guard, SystemState
+from storage_v6_1 import (
+    SessionLocal, hygiene_pin, hygiene_guard, SystemState,
+    User, PMProjectMap, get_user_role, get_pms_for_project,
+    log_call, log_audit
+)
 
 @app.route("/heartbeat", methods=["GET"])
 def heartbeat():
