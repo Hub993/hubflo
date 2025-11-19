@@ -289,6 +289,14 @@ def _repair_system_state():
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE system_state DROP COLUMN client_id"))
 
+# --- HOTFIX: ensure tasks table matches model ---
+def _repair_tasks():
+    insp = inspect(engine)
+    cols = [c['name'] for c in insp.get_columns("tasks")]
+    if "client_id" in cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE tasks DROP COLUMN client_id"))
+
 # ---------------------------------------------------------------------
 # Hygiene helpers (used by /heartbeat and tether checks)
 # ---------------------------------------------------------------------
@@ -317,6 +325,11 @@ def hygiene_guard(threshold_seconds=120) -> tuple[bool, str]:
 
 def init_db():
     Base.metadata.create_all(ENGINE)
+
+    _repair_system_state()
+    _repair_tasks()
+
+    return True
 
 # ---------------------------------------------------------------------
 # Helpers
