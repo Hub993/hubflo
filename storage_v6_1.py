@@ -6,7 +6,6 @@
 
 from storage import (
     # Core SQLAlchemy plumbing
-    engine,
     SessionLocal,
     Base,
 
