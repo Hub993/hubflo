@@ -275,11 +275,19 @@ class Audit(Base):
 class SystemState(Base):
     __tablename__ = "system_state"
 
-    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     hygiene_last_utc = Column(String(40), nullable=True)
     redmode = Column(Boolean, default=False)
     redmode_reason = Column(String(200), nullable=True)
+
+# --- HOTFIX: ensure system_state table matches model ---
+from sqlalchemy import inspect, text
+def _repair_system_state():
+    insp = inspect(engine)
+    cols = [c['name'] for c in insp.get_columns("system_state")]
+    if "client_id" in cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE system_state DROP COLUMN client_id"))
 
 # ---------------------------------------------------------------------
 # Hygiene helpers (used by /heartbeat and tether checks)
