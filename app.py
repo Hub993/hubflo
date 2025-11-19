@@ -62,7 +62,7 @@ init_db()
 from sqlalchemy import text
 from storage_v6_1 import (
     SessionLocal, hygiene_pin, hygiene_guard, SystemState,
-    User, PMProjectMap, get_user_role, get_pms_for_project,
+    get_user_role, get_pms_for_project,
     log_call, log_audit
 )
 
