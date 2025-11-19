@@ -472,7 +472,7 @@ def webhook():
                     lines = awaiting.text.lower()
                     if all(k in lines for k in ["item:", "quantity:", "supplier:", "delivery date:", "drop location:"]):
                         awaiting.status = "pending_approval"
-                        awaiting.last_updated = datetime.utcnow()
+                        awaiting.last_updated = dt.datetime.utcnow()
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "✅ All order fields complete. Awaiting PM approval.")
                         return ("", 200)
@@ -740,6 +740,152 @@ def admin_task_edit():
     return jsonify(result)
 
 # >>> PATCH_3_APP_END <<<
+
+@app.route("/admin/task/find", methods=["GET"])
+def admin_task_find():
+    if not _check_admin():
+        return _auth_fail()
+
+    tid = request.args.get("id", "").strip()
+    if not tid.isdigit():
+        return jsonify({"error": "invalid id"}), 400
+
+    with SessionLocal() as s:
+        t = s.get(Task, int(tid))
+        if not t:
+            return jsonify({"error": "not found"}), 404
+
+        return jsonify({
+            "id": t.id,
+            "sender": t.sender,
+            "text": t.text,
+            "tag": t.tag,
+            "status": t.status,
+            "project_code": t.project_code,
+            "subcontractor_name": t.subcontractor_name,
+            "ts": t.ts.isoformat() if t.ts else None,
+            "cost": t.cost,
+            "time_impact_days": t.time_impact_days,
+            "approval_required": t.approval_required,
+        }), 200
+
+@app.route("/admin/task/recent", methods=["GET"])
+def admin_task_recent():
+    if not _check_admin():
+        return _auth_fail()
+
+    limit = request.args.get("limit", "20").strip()
+    if not limit.isdigit():
+        limit = "20"
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(Task)
+            .order_by(Task.id.desc())
+            .limit(int(limit))
+            .all()
+        )
+
+        out = []
+        for t in rows:
+            out.append({
+                "id": t.id,
+                "sender": t.sender,
+                "text": t.text,
+                "tag": t.tag,
+                "status": t.status,
+                "project_code": t.project_code,
+                "subcontractor_name": t.subcontractor_name,
+                "ts": t.ts.isoformat() if t.ts else None,
+            })
+
+    return jsonify({"tasks": out, "count": len(out)}), 200
+
+# >>> PATCH_19_APP_START — SIMPLE TASK SEARCH (DEBUG SAFE) <<<
+
+@app.route("/admin/task/search", methods=["GET"])
+def admin_task_search():
+    if not _check_admin():
+        return _auth_fail()
+
+    q = (request.args.get("q") or "").strip().lower()
+    if not q:
+        return jsonify({"error": "missing q"}), 400
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(Task)
+            .filter(Task.text.ilike(f"%{q}%"))
+            .order_by(Task.id.desc())
+            .limit(50)
+            .all()
+        )
+
+    out = []
+    for t in rows:
+        out.append({
+            "id": t.id,
+            "sender": t.sender,
+            "text": t.text,
+            "tag": t.tag,
+            "status": t.status,
+            "project_code": t.project_code,
+            "subcontractor_name": t.subcontractor_name,
+            "ts": t.ts.isoformat() if t.ts else None,
+            "cost": t.cost,
+            "time_impact_days": t.time_impact_days,
+            "approval_required": t.approval_required,
+        })
+
+    return jsonify({"count": len(out), "results": out}), 200
+
+# >>> PATCH_19_APP_END <<<
+
+# >>> PATCH_20_APP_START — RAW TASK DEBUG DUMP (ADMIN ONLY) <<<
+
+@app.route("/admin/task/raw", methods=["GET"])
+def admin_task_raw():
+    if not _check_admin():
+        return _auth_fail()
+
+    tid = request.args.get("id", "").strip()
+    if not tid.isdigit():
+        return jsonify({"error": "invalid id"}), 400
+
+    with SessionLocal() as s:
+        t = s.get(Task, int(tid))
+        if not t:
+            return jsonify({"error": "not found"}), 404
+
+        # Serialize *every* field, raw
+        return jsonify({
+            "id": t.id,
+            "sender": t.sender,
+            "text": t.text,
+            "tag": t.tag,
+            "subtype": t.subtype,
+            "status": t.status,
+            "order_state": t.order_state,
+            "project_code": t.project_code,
+            "subcontractor_name": t.subcontractor_name,
+            "ts": t.ts.isoformat() if t.ts else None,
+            "started_at": t.started_at.isoformat() if t.started_at else None,
+            "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+            "approved_at": t.approved_at.isoformat() if t.approved_at else None,
+            "rejected_at": t.rejected_at.isoformat() if t.rejected_at else None,
+            "due_date": t.due_date.isoformat() if t.due_date else None,
+            "overrun_days": t.overrun_days,
+            "is_rework": t.is_rework,
+            "cost": t.cost,
+            "time_impact_days": t.time_impact_days,
+            "approval_required": t.approval_required,
+            "attachment_name": t.attachment_name,
+            "attachment_mime": t.attachment_mime,
+            "attachment_url": t.attachment_url,
+            "last_updated": t.last_updated.isoformat() if t.last_updated else None
+        }), 200
+
+# >>> PATCH_20_APP_END <<<
 
 @app.route("/admin/task_group/add", methods=["POST"])
 def admin_task_group_add():
