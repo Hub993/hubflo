@@ -2,7 +2,7 @@
 # -------------------------------------------------
 
 from storage import (
-    Base, engine, SessionLocal,
+    Base, SessionLocal,
     Task, SystemState,
 
     init_db, create_task, get_tasks, get_summary,
