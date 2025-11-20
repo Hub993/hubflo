@@ -618,56 +618,6 @@ def revoke_last(task_id: int, actor: Optional[str] = None):
         return _as_task_dict(t)
 
 # ---------------------------------------------------------------------
-# Supplier directory (simple v6.1 structure)
-# ---------------------------------------------------------------------
-
-class Supplier(Base):
-    __tablename__ = "suppliers"
-
-    id = Column(Integer, primary_key=True)
-    name = Column(String(128), nullable=False, index=True)
-    contact = Column(String(128))
-    phone = Column(String(64))
-    email = Column(String(128))
-    notes = Column(Text)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-    client_id = Column(Integer, default=current_client_id)
-
-def supplier_create(data: dict) -> dict:
-    """
-    Create supplier entry.
-    Expected fields:
-      name (required), contact, phone, email, notes
-    """
-    name = (data.get("name") or "").strip()
-    if not name:
-        return {"error": "name required"}
-
-    with SessionLocal() as s:
-        sup = Supplier(
-            name=name,
-            contact=data.get("contact"),
-            phone=data.get("phone"),
-            email=data.get("email"),
-            notes=data.get("notes"),
-            client_id=current_client_id(),
-        )
-        s.add(sup)
-        s.commit()
-        s.refresh(sup)
-
-        return {
-            "id": sup.id,
-            "name": sup.name,
-            "contact": sup.contact,
-            "phone": sup.phone,
-            "email": sup.email,
-            "notes": sup.notes,
-            "created_at": sup.created_at.isoformat(),
-            "client_id": sup.client_id,
-        }
-
-# ---------------------------------------------------------------------
 # Accuracy scoring
 # ---------------------------------------------------------------------
 def subcontractor_accuracy(subcontractor_name: str):
@@ -895,22 +845,3 @@ def supplier_list() -> list[dict]:
         ]
 
 # >>> PATCH_11_STORAGE_END <<<
-
-# ---------------------------------------------------------------------
-# Project → PM lookup (stub; returns all PMs matching project_code)
-# ---------------------------------------------------------------------
-def get_pms_for_project(project_code: str):
-    with SessionLocal() as s:
-        return [
-            {
-                "wa_id": u.wa_id,
-                "name": u.name,
-                "role": u.role,
-                "primary": True  # default until multi-PM assignment
-            }
-            for u in s.query(User).filter(
-                User.project_code == project_code,
-                User.role == "pm",
-                User.active == True
-            ).all()
-        ]
