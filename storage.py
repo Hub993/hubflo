@@ -327,8 +327,16 @@ def hygiene_guard(threshold_seconds=120) -> tuple[bool, str]:
 def init_db():
     Base.metadata.create_all(ENGINE)
 
-    _repair_system_state()
-    _repair_tasks()
+    # ---- DB REPAIR PATCHES ----
+    try:
+        _repair_system_state()
+    except Exception:
+        pass
+
+    try:
+        _repair_tasks()
+    except Exception:
+        pass
 
     return True
 
