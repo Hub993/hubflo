@@ -118,6 +118,7 @@ def set_client_display_name(client_id: str, name: str) -> dict:
 class Task(Base):
     __tablename__ = "tasks"
 
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     id = Column(Integer, primary_key=True)
     sender = Column(String(64), index=True)
     text = Column(Text)
