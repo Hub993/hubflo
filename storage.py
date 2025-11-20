@@ -494,7 +494,7 @@ def create_task(sender: str, text: str, tag: Optional[str] = None,
 def get_tasks(limit: int = 200, client_id: Optional[str] = None):
     with SessionLocal() as s:
         # Apply client isolation FIRST
-        qry = _apply_client_filter(s.query(Task), client_id).order_by(Task.id.desc())
+        qry = _apply_client_filter(s.query(Task)).order_by(Task.id.desc())
 
         rows = qry.limit(limit).all()
         out = []
