@@ -445,21 +445,11 @@ def webhook():
                                 return ("", 200)
                     # >>> PATCH_2_APP_END <<<
 
-        # === CLASSIFICATION ====================================================
-        tag = classify_tag(text or "")
-        subtype = detect_subtype(text or "")
-
-        # Self-tasks should still behave as tasks
-        if subtype == "self" and tag is None:
-            tag = "task"
-
-        # detect order lifecycle state (if any hash present)
-        order_state = None
-        if tag == "order" and text:
-            for state in ORDER_LIFECYCLE_STATES:
-                if f"#{state}" in text.lower():
-                    order_state = state
-                    break
+        # === CLASSIFICATION (V6.1 unified) =====================================
+        cls = classify_message(text or "")
+        tag = cls.get("tag")
+        subtype = cls.get("subtype")
+        order_state = cls.get("order_state")
 
         # lookup sender identity (role / subcontractor / project)
         from storage import get_user_role
