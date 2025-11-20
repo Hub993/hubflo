@@ -9,6 +9,7 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, DateTime, Text, Boolean, Float
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import inspect, text
 
 # ---------------------------------------------------------------------
 # DB bootstrap
@@ -283,18 +284,18 @@ class SystemState(Base):
 # --- HOTFIX: ensure system_state table matches model ---
 from sqlalchemy import inspect, text
 def _repair_system_state():
-    insp = inspect(engine)
+    insp = inspect(ENGINE)
     cols = [c['name'] for c in insp.get_columns("system_state")]
     if "client_id" in cols:
-        with engine.connect() as conn:
+        with ENGINE.connect() as conn:
             conn.execute(text("ALTER TABLE system_state DROP COLUMN client_id"))
 
 # --- HOTFIX: ensure tasks table matches model ---
 def _repair_tasks():
-    insp = inspect(engine)
+    insp = inspect(ENGINE)
     cols = [c['name'] for c in insp.get_columns("tasks")]
     if "client_id" in cols:
-        with engine.connect() as conn:
+        with ENGINE.connect() as conn:
             conn.execute(text("ALTER TABLE tasks DROP COLUMN client_id"))
 
 # ---------------------------------------------------------------------
