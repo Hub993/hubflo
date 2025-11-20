@@ -529,7 +529,7 @@ def get_tasks(limit: int = 200, client_id: Optional[str] = None):
 
 def get_summary():
     with SessionLocal() as s:
-        qry = s.query(Task).order_by(Task.id.desc())
+        qry = _apply_client_filter(s.query(Task)).order_by(Task.id.desc())
 
         rows = qry.limit(200).all()
 
