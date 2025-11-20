@@ -625,6 +625,15 @@ def admin_view():
     """
     return Response(body, 200, mimetype="text/html")
 
+@app.get("/admin/json")
+def admin_json():
+    token = request.args.get("token", "")
+    if token != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 403
+
+    from storage import get_summary
+    return jsonify(get_summary())
+
 @app.route("/admin/view.json")
 def admin_view_json():
     token = request.args.get("token")
