@@ -97,128 +97,78 @@ def integrity_status():
         }), 200
 # ============================================================
 
-# ---------------------------------------------------------------------
-# Tagging / classification
-# ---------------------------------------------------------------------
-ORDER_PREFIXES = ("order", "purchase", "procure", "buy")
+# >>> PATCH_CLASSIFIER_V6_1_START — NATURAL LANGUAGE REBUILD (V6.1) <<<
 
-# CHANGE verbs = scope modifications
-CHANGE_PREFIXES = (
-    "change", "variation", "revise", "amend", "adjust",
-    "extend", "enlarge", "widen", "lengthen", "raise", "lower",
-    "shift", "relocate", "move", "reposition",
-    "replace", "remove", "strip", "demolish", "knock", "add",
-    "reduce", "modify", "alter",
-)
+import re
 
-# TASK verbs = performing work / execution actions
-TASK_PREFIXES = (
-    # general site work
-    "align", "assemble", "build", "carry", "check", "clean", "clear",
-    "cut", "dig", "fix", "fix up", "float", "inspect", "install", "lay",
-    "level", "lift", "mark", "measure", "miter", "prepare", "prep",
-    "rip", "schedule", "set up", "strip", "touch up", "unload",
-    "load", "stack",
-
-    # carpentry
-    "anchor", "batten", "bolt", "bolt-up", "brace", "clad",
-    "counterbatten", "fit", "frame", "hang", "mitre", "notch",
-    "plane", "rebate", "sand", "sheet", "sheeting", "screw", "trim",
-    "weld",
-
-    # drywall / plaster / finishing
-    "caulk", "feather", "finish", "mask", "mud", "paint", "patch",
-    "prime", "screed", "skim", "tape", "plaster",
-
-    # concrete / masonry
-    "bed", "chase", "float slab", "grout", "mix", "point", "pour",
-    "rake out", "set", "stack", "trowel", "vibrate",
-
-    # roofing
-    "flash", "seal", "shingle", "weatherproof",
-
-    # electrical / plumbing routing
-    "connect", "crimp", "mount", "route", "run", "secure", "terminate",
-    "tie-in", "wire",
-
-    # earthworks / preparation
-    "backfill", "compact", "excavate", "grade", "stake",
-    "stringline", "trench",
-
-    # generic repair verbs
-    "repair",
-)
-
-HASHTAG_MAP = {
-    "#order": "order",
-    "#change": "change",
-    "#task": "task",
-    "#urgent": "urgent",
-}
-
-def classify_tag(text: str) -> Optional[str]:
-    if not text:
-        return None
-    t = text.strip().lower()
-
-    # explicit hashtags win
-    for h, tag in HASHTAG_MAP.items():
-        if h in t:
-            return tag
-
-    # classic "order ..." shape
-    for p in ORDER_PREFIXES:
-        if t.startswith(p + " "):
-            return "order"
-
-    # override: "pour" is always treated as task (site work, not procurement)
-    if t.startswith("pour "):
-        return "task"
-
-    # change verbs
-    for p in CHANGE_PREFIXES:
-        if t.startswith(p + " "):
-            return "change"
-
-    # task verbs
-    for p in TASK_PREFIXES:
-        if t.startswith(p + " "):
-            return "task"
-
-    # heuristic: numeric + material-ish unit → treat as order
-    if any(u in t for u in ["m ", "meter", "metre", "roll", "cable", "conduit"]) and any(
-        ch.isdigit() for ch in t
-    ):
-        return "order"
-
-    # urgency hints
-    if any(w in t for w in ["urgent", "asap", "immediately"]):
-        return "urgent"
-
-    return None
-
-def detect_subtype(text: str) -> str:
+def classify_message(text: str) -> dict:
     """
-    Detect whether a task is 'self' (speaker taking it on) or 'assigned'.
+    Natural-language classifier restored to V6 behaviour.
+    No hashtags, no rigid keywords, free-flow chat only.
+    Returns:
+        { "tag": "...", "subtype": "...", "order_state": "..." }
     """
-    if not text:
-        return "assigned"
 
-    t = text.lower().replace("’", "'")
+    t = text.lower().strip()
 
-    # self-commitment patterns
-    self_markers = (
-        "i will ",
-        "i'll ",
-        "i can ",
-        "let me ",
-        "i'm going to ",
-        "i shall ",
-    )
-    if any(marker in t for marker in self_markers):
-        return "self"
+    # -----------------------------
+    # ORDER DETECTION (free-language)
+    # -----------------------------
+    order_phrases = [
+        r"\bget me\b",
+        r"\bgrab\b",
+        r"\border\b",
+        r"\bwe need\b",
+        r"\bbring\b",
+        r"\bdrop\b",
+        r"\bdeliver\b",
+        r"\bsupplier\b",
+        r"\bquantity\b",
+        r"\bdelivery\b",
+        r"\bdrop location\b"
+    ]
+    if any(re.search(p, t) for p in order_phrases):
+        return {
+            "tag": "order",
+            "subtype": "assigned",
+            "order_state": "requested"
+        }
 
-    return "assigned"
+    # -----------------------------
+    # CHANGE ORDER
+    # -----------------------------
+    if "change the order" in t or "change order" in t:
+        return {
+            "tag": "change",
+            "subtype": "assigned",
+            "order_state": "change_requested"
+        }
+
+    # -----------------------------
+    # APPROVE / REJECT
+    # -----------------------------
+    if "approve" in t:
+        return {"tag": "task", "subtype": "assigned", "order_state": "approve"}
+
+    if "reject" in t:
+        return {"tag": "task", "subtype": "assigned", "order_state": "reject"}
+
+    # -----------------------------
+    # URGENT
+    # -----------------------------
+    if "urgent" in t or "asap" in t:
+        return {"tag": "urgent", "subtype": "assigned", "order_state": None}
+
+    # -----------------------------
+    # DEFAULT = TASK
+    # Self-tasks when "I will / I'm going to"
+    # -----------------------------
+    if t.startswith("i will") or t.startswith("i'm going to"):
+        return {"tag": "task", "subtype": "self", "order_state": None}
+
+    return {"tag": "task", "subtype": "assigned", "order_state": None}
+
+# >>> PATCH_CLASSIFIER_V6_1_END <<<
 
 # ---------------------------------------------------------------------
 # WhatsApp send utility
