@@ -405,12 +405,16 @@ def webhook():
                     ddate    = fields.get("Delivery Date")
                     drop     = fields.get("Drop Location")
 
-                    # ITEM
+                    # >>> PATCH_8A_ITEM_START — clean item capture <<<
                     if lower.startswith("[await:item]"):
-                        awaiting.text = f"[await:quantity] Item: {text}"
+                        awaiting.text = (
+                            f"[await:quantity] "
+                            f"Item: {text}"
+                        )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Quantity?")
                         return ("", 200)
+                    # >>> PATCH_8A_ITEM_END <<<
 
                     # QUANTITY
                     if lower.startswith("[await:quantity]"):
