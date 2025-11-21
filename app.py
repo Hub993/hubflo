@@ -477,6 +477,17 @@ def webhook():
                                 return ("", 200)
                     # >>> PATCH_2_APP_END <<<
 
+                    # >>> PATCH_PREVENT_MIXIN_START — stop approve/reject/change from entering await chain <<<
+                    if text:
+                        lt = text.lower().strip()
+                        forbidden = ("approve", "reject", "change the order", "change that order", "change order")
+
+                        if any(w in lt for w in forbidden):
+                            # DO NOT let these enter the await chain
+                            # Skip await handler entirely
+                            awaiting = None
+                    # >>> PATCH_PREVENT_MIXIN_END <<<
+
         # === CLASSIFICATION (V6.1 unified) =====================================
 
         # PATCH: bind sender globally for classifier patches
