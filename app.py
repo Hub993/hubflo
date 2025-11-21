@@ -527,6 +527,26 @@ def webhook():
                 pass
             return ("", 200)
 
+        # Disable sandbox fallback whenever an await chain already exists
+        with SessionLocal() as s:
+            active_await = (
+                s.query(Task)
+                 .filter(
+                     Task.sender == sender,
+                     Task.status == "open",
+                     Task.tag == "order",
+                     Task.text.like("[await:%]%")
+                 )
+                 .first()
+            )
+
+        if active_await:
+            # Skip sandbox fallback entirely
+            pass
+        else:
+            # sandbox fallback stays available
+            SANDBOX_OK = True
+
         # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
         if tag == "order" and "[await:" not in (text or "").lower():
             with SessionLocal() as s:
