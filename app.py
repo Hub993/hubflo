@@ -109,7 +109,58 @@ def classify_message(text: str) -> dict:
         { "tag": "...", "subtype": "...", "order_state": "..." }
     """
 
-    t = text.lower().strip()
+    global SENDER_GLOBAL
+    t = (text or "").lower().strip()
+
+    # -----------------------------
+    # CHANGE ORDER (requires an existing open order)
+    # -----------------------------
+    if (
+        "change the order" in t
+        or "change that order" in t
+        or "change order" in t
+        or "change it to" in t
+        or "change it" in t
+    ):
+        open_order = None
+        try:
+            from storage_v6_1 import SessionLocal, Task
+            with SessionLocal() as s:
+                open_order = (
+                    s.query(Task)
+                    .filter(
+                        Task.sender == SENDER_GLOBAL,
+                        Task.status == "open",
+                        Task.tag == "order"
+                    )
+                    .order_by(Task.id.desc())
+                    .first()
+                )
+        except Exception:
+            open_order = None
+
+        if open_order:
+            return {
+                "tag": "change",
+                "subtype": "assigned",
+                "order_state": "change_requested"
+            }
+        else:
+            # No existing order → treat as a normal task
+            return {
+                "tag": "task",
+                "subtype": "assigned",
+                "order_state": None
+            }
+
+    # -----------------------------
+    # APPROVE / REJECT (for an order)
+    # -----------------------------
+    if "approve" in t:
+        return {"tag": "task", "subtype": "assigned", "order_state": "approve"}
+
+    if "reject" in t:
+        return {"tag": "task", "subtype": "assigned", "order_state": "reject"}
 
     # -----------------------------
     # ORDER DETECTION (free-language)
@@ -125,33 +176,14 @@ def classify_message(text: str) -> dict:
         r"\bsupplier\b",
         r"\bquantity\b",
         r"\bdelivery\b",
-        r"\bdrop location\b"
+        r"\bdrop location\b",
     ]
     if any(re.search(p, t) for p in order_phrases):
         return {
             "tag": "order",
             "subtype": "assigned",
-            "order_state": "requested"
+            "order_state": "requested",
         }
-
-    # -----------------------------
-    # CHANGE ORDER
-    # -----------------------------
-    if "change the order" in t or "change order" in t:
-        return {
-            "tag": "change",
-            "subtype": "assigned",
-            "order_state": "change_requested"
-        }
-
-    # -----------------------------
-    # APPROVE / REJECT
-    # -----------------------------
-    if "approve" in t:
-        return {"tag": "task", "subtype": "assigned", "order_state": "approve"}
-
-    if "reject" in t:
-        return {"tag": "task", "subtype": "assigned", "order_state": "reject"}
 
     # -----------------------------
     # URGENT
@@ -446,6 +478,11 @@ def webhook():
                     # >>> PATCH_2_APP_END <<<
 
         # === CLASSIFICATION (V6.1 unified) =====================================
+
+        # PATCH: bind sender globally for classifier patches
+        global SENDER_GLOBAL
+        SENDER_GLOBAL = sender
+
         cls = classify_message(text or "")
         tag = cls.get("tag")
         subtype = cls.get("subtype")
