@@ -405,11 +405,10 @@ def webhook():
                         send_whatsapp_text(phone_id, sender, "Quantity?")
                         return ("", 200)
 
-                    # === HARD QUANTITY CAPTURE (replaces prior block) ============
-                    if lower.startswith("[await:quantity]"):
-                        # Normalize quantity text: keep only numeric prefix + phrase
+                    # === HARD QUANTITY CAPTURE (fixed) ============================
+                    if awaiting.text.lower().startswith("[await:quantity]"):
+                        # Normalize quantity text: keep only numeric prefix
                         qtext = text.strip()
-                        # simple numeric extract
                         import re
                         m = re.search(r"\d+", qtext)
                         if m:
