@@ -369,8 +369,12 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
-        # === AWAIT FOLLOW-UP CAPTURE ==========================================
-        if text:
+        # === AWAIT FOLLOW-UP CAPTURE (HARDENED v6.1) ==========================
+        if text and not any(w in text.lower() for w in (
+            "approve", "reject",
+            "change the order", "change that order", "change order",
+            "change it", "change it to"
+        )):
             with SessionLocal() as s:
                 awaiting = (
                     s.query(Task)
@@ -385,109 +389,82 @@ def webhook():
                 )
 
                 if awaiting:
-                    state = awaiting.text.split("]",1)[0].replace("[","").strip().lower()
+                    mode = awaiting.text.lower()
 
-                    # Hard block: never allow approve/reject/change into await flow
-                    low_in = text.lower()
-                    if any(k in low_in for k in ["approve", "reject", "change the order", "change that order", "change order", "change it", "change it to"]):
+                    # HARD RESET: extract nothing from old fields
+                    item = None
+                    qty = None
+                    supplier = None
+                    ddate = None
+                    drop = None
+
+                    # === ITEM ==================================================
+                    if mode.startswith("[await:item]"):
+                        awaiting.text = f"[await:quantity] Item: {text}"
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Quantity?")
                         return ("", 200)
 
-                    # Normalize body (remove await prefix)
-                    body = awaiting.text
-                    if body.startswith("[await:"):
-                        body = body.split("]",1)[1].strip()
-
-                    # Parse existing fields
-                    lines = [l.strip() for l in body.splitlines() if l.strip()]
-                    fields = {}
-                    for l in lines:
-                        if ":" in l:
-                            k, v = l.split(":", 1)
-                            fields[k.strip()] = v.strip()
-
-                    item     = fields.get("Item")
-                    qty      = fields.get("Quantity")
-                    supplier = fields.get("Supplier")
-                    ddate    = fields.get("Delivery Date")
-                    drop     = fields.get("Drop Location")
-
-                    # --- helpers to extract clean values ---
-                    def clean_item(msg):     return msg
-                    def clean_qty(msg):
-                        m = re.search(r"\b(\d+)\b", msg)
-                        return m.group(1) if m else msg
-                    def clean_supplier(msg):
-                        return msg.replace("from ", "").replace("use ", "").strip()
-                    def clean_ddate(msg):    return msg.strip()
-                    def clean_drop(msg):     return msg.strip()
-
-                    # --- update helper (update only one field) ---
-                    def update_field(key, value):
-                        new = []
-                        found = False
-                        for ln in body.splitlines():
-                            if ln.lower().startswith(key.lower() + ":"):
-                                new.append(f"{key}: {value}")
-                                found = True
-                            else:
-                                new.append(ln)
-                        if not found:
-                            new.append(f"{key}: {value}")
-                        awaiting.text = f"[await:{next_state}] " + "\n".join(new)
-
-                    # ITEM
-                    if state == "await:item":
-                        next_state = "quantity"
+                    # === QUANTITY ==============================================
+                    if mode.startswith("[await:quantity]"):
+                        # recover item from previous step
+                        prev = awaiting.text.split("Item:",1)[1].strip()
+                        item = prev
                         awaiting.text = (
-                            f"[await:quantity] "
-                            f"Item: {clean_item(text)}"
+                            f"[await:supplier] Item: {item}\n"
+                            f"Quantity: {text}"
                         )
                         s.commit()
+                        send_whatsapp_text(phone_id, sender, "Supplier?")
                         return ("", 200)
 
-                    # QUANTITY
-                    if state == "await:quantity":
-                        next_state = "supplier"
+                    # === SUPPLIER ==============================================
+                    if mode.startswith("[await:supplier]"):
+                        parts = awaiting.text.splitlines()
+                        item = parts[0].split("Item:",1)[1].strip() if len(parts)>0 else ""
+                        qty  = parts[1].split("Quantity:",1)[1].strip() if len(parts)>1 else ""
                         awaiting.text = (
-                            f"[await:supplier] Item: {item or ''}\n"
-                            f"Quantity: {clean_qty(text)}"
+                            f"[await:delivery_date] Item: {item}\n"
+                            f"Quantity: {qty}\n"
+                            f"Supplier: {text}"
                         )
                         s.commit()
+                        send_whatsapp_text(phone_id, sender, "Delivery date?")
                         return ("", 200)
 
-                    # SUPPLIER
-                    if state == "await:supplier":
-                        next_state = "delivery_date"
+                    # === DELIVERY DATE =========================================
+                    if mode.startswith("[await:delivery_date]"):
+                        parts = awaiting.text.splitlines()
+                        item     = parts[0].split("Item:",1)[1].strip()
+                        qty      = parts[1].split("Quantity:",1)[1].strip()
+                        supplier = parts[2].split("Supplier:",1)[1].strip()
                         awaiting.text = (
-                            f"[await:delivery_date] Item: {item or ''}\n"
-                            f"Quantity: {qty or ''}\n"
-                            f"Supplier: {clean_supplier(text)}"
+                            f"[await:drop_location] Item: {item}\n"
+                            f"Quantity: {qty}\n"
+                            f"Supplier: {supplier}\n"
+                            f"Delivery Date: {text}"
                         )
                         s.commit()
+                        send_whatsapp_text(phone_id, sender, "Drop location?")
                         return ("", 200)
 
-                    # DELIVERY DATE
-                    if state == "await:delivery_date":
-                        next_state = "drop_location"
-                        awaiting.text = (
-                            f"[await:drop_location] Item: {item or ''}\n"
-                            f"Quantity: {qty or ''}\n"
-                            f"Supplier: {supplier or ''}\n"
-                            f"Delivery Date: {clean_ddate(text)}"
-                        )
-                        s.commit()
-                        return ("", 200)
+                    # === DROP LOCATION =========================================
+                    if mode.startswith("[await:drop_location]"):
+                        parts = awaiting.text.splitlines()
+                        item     = parts[0].split("Item:",1)[1].strip()
+                        qty      = parts[1].split("Quantity:",1)[1].strip()
+                        supplier = parts[2].split("Supplier:",1)[1].strip()
+                        ddate    = parts[3].split("Delivery Date:",1)[1].strip()
 
-                    # DROP LOCATION
-                    if state == "await:drop_location":
                         awaiting.text = (
-                            f"Item: {item or ''}\n"
-                            f"Quantity: {qty or ''}\n"
-                            f"Supplier: {supplier or ''}\n"
-                            f"Delivery Date: {ddate or ''}\n"
-                            f"Drop Location: {clean_drop(text)}"
+                            f"Item: {item}\n"
+                            f"Quantity: {qty}\n"
+                            f"Supplier: {supplier}\n"
+                            f"Delivery Date: {ddate}\n"
+                            f"Drop Location: {text}"
                         )
                         s.commit()
+                        send_whatsapp_text(phone_id, sender, "✅ Order recorded.")
                         return ("", 200)
 
         # === CLASSIFICATION (V6.1 unified) =====================================
