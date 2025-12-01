@@ -392,7 +392,7 @@ def webhook():
                     raw_txt = text.strip()
                     await_lower = awaiting.text.lower()
 
-                    # --- Extract existing fields --------------------------------
+                    # --- Extract existing fields -------------------------------
                     body = awaiting.text
                     if body.startswith("[await:"):
                         body = body.split("]", 1)[1].strip()
