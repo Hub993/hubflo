@@ -370,7 +370,7 @@ def webhook():
             text = meta.get("caption")
 
         # === AWAIT FOLLOW-UP CAPTURE ==========================================
-        if text and not any(w in text.lower() for w in ("approve","reject","change the order","change that order","change order","change it","change it to")):
+        if text:
             with SessionLocal() as s:
                 awaiting = (
                     s.query(Task)
@@ -385,18 +385,24 @@ def webhook():
                 )
 
                 if awaiting:
-                    lower = awaiting.text.lower()
+                    state = awaiting.text.split("]",1)[0].replace("[","").strip().lower()
 
-                    # normalize body (remove await prefix)
+                    # Hard block: never allow approve/reject/change into await flow
+                    low_in = text.lower()
+                    if any(k in low_in for k in ["approve", "reject", "change the order", "change that order", "change order", "change it", "change it to"]):
+                        return ("", 200)
+
+                    # Normalize body (remove await prefix)
                     body = awaiting.text
                     if body.startswith("[await:"):
                         body = body.split("]",1)[1].strip()
 
+                    # Parse existing fields
                     lines = [l.strip() for l in body.splitlines() if l.strip()]
                     fields = {}
                     for l in lines:
                         if ":" in l:
-                            k,v = l.split(":",1)
+                            k, v = l.split(":", 1)
                             fields[k.strip()] = v.strip()
 
                     item     = fields.get("Item")
@@ -405,81 +411,84 @@ def webhook():
                     ddate    = fields.get("Delivery Date")
                     drop     = fields.get("Drop Location")
 
-                    # >>> PATCH_8A_ITEM_START — clean item capture <<<
-                    if lower.startswith("[await:item]"):
+                    # --- helpers to extract clean values ---
+                    def clean_item(msg):     return msg
+                    def clean_qty(msg):
+                        m = re.search(r"\b(\d+)\b", msg)
+                        return m.group(1) if m else msg
+                    def clean_supplier(msg):
+                        return msg.replace("from ", "").replace("use ", "").strip()
+                    def clean_ddate(msg):    return msg.strip()
+                    def clean_drop(msg):     return msg.strip()
+
+                    # --- update helper (update only one field) ---
+                    def update_field(key, value):
+                        new = []
+                        found = False
+                        for ln in body.splitlines():
+                            if ln.lower().startswith(key.lower() + ":"):
+                                new.append(f"{key}: {value}")
+                                found = True
+                            else:
+                                new.append(ln)
+                        if not found:
+                            new.append(f"{key}: {value}")
+                        awaiting.text = f"[await:{next_state}] " + "\n".join(new)
+
+                    # ITEM
+                    if state == "await:item":
+                        next_state = "quantity"
                         awaiting.text = (
                             f"[await:quantity] "
-                            f"Item: {text}"
+                            f"Item: {clean_item(text)}"
                         )
                         s.commit()
-                        send_whatsapp_text(phone_id, sender, "Quantity?")
                         return ("", 200)
-                    # >>> PATCH_8A_ITEM_END <<<
 
                     # QUANTITY
-                    if lower.startswith("[await:quantity]"):
-                        awaiting.text = f"[await:supplier] Item: {item or ''}\nQuantity: {text}"
+                    if state == "await:quantity":
+                        next_state = "supplier"
+                        awaiting.text = (
+                            f"[await:supplier] Item: {item or ''}\n"
+                            f"Quantity: {clean_qty(text)}"
+                        )
                         s.commit()
-                        send_whatsapp_text(phone_id, sender, "Supplier?")
                         return ("", 200)
 
                     # SUPPLIER
-                    if lower.startswith("[await:supplier]"):
+                    if state == "await:supplier":
+                        next_state = "delivery_date"
                         awaiting.text = (
                             f"[await:delivery_date] Item: {item or ''}\n"
                             f"Quantity: {qty or ''}\n"
-                            f"Supplier: {text}"
+                            f"Supplier: {clean_supplier(text)}"
                         )
                         s.commit()
-                        send_whatsapp_text(phone_id, sender, "Delivery date?")
                         return ("", 200)
 
                     # DELIVERY DATE
-                    if lower.startswith("[await:delivery_date]"):
+                    if state == "await:delivery_date":
+                        next_state = "drop_location"
                         awaiting.text = (
                             f"[await:drop_location] Item: {item or ''}\n"
                             f"Quantity: {qty or ''}\n"
                             f"Supplier: {supplier or ''}\n"
-                            f"Delivery Date: {text}"
+                            f"Delivery Date: {clean_ddate(text)}"
                         )
                         s.commit()
-                        send_whatsapp_text(phone_id, sender, "Drop location on site?")
                         return ("", 200)
 
                     # DROP LOCATION
-                    if lower.startswith("[await:drop_location]"):
+                    if state == "await:drop_location":
                         awaiting.text = (
                             f"Item: {item or ''}\n"
                             f"Quantity: {qty or ''}\n"
                             f"Supplier: {supplier or ''}\n"
                             f"Delivery Date: {ddate or ''}\n"
-                            f"Drop Location: {text}"
+                            f"Drop Location: {clean_drop(text)}"
                         )
                         s.commit()
-                        send_whatsapp_text(phone_id, sender, "✅ Order details recorded.")
                         return ("", 200)
-
-                    # --- Auto-finalize full order chain (optional improvement) ---
-                    lines = awaiting.text.lower()
-                    if all(k in lines for k in ["item:", "quantity:", "supplier:", "delivery date:", "drop location:"]):
-                        awaiting.status = "pending_approval"
-                        awaiting.last_updated = dt.datetime.utcnow()
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "✅ All order fields complete. Awaiting PM approval.")
-                        return ("", 200)
-
-                    # >>> PATCH_2_APP_START — REMIND-ME CALL PARSER <<<
-                    from storage_v6_1 import create_call_reminder
-
-                    if text:
-                        lower_t = text.lower().strip()
-
-                        if lower_t.startswith("remind me to call "):
-                            target = lower_t.replace("remind me to call", "", 1).strip()
-                            if target:
-                                create_call_reminder(sender, text, target)
-                                return ("", 200)
-                    # >>> PATCH_2_APP_END <<<
 
         # === CLASSIFICATION (V6.1 unified) =====================================
 
