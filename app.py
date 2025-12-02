@@ -613,6 +613,71 @@ def _stock_auto_process_on_approval(tid: int, actor: str | None):
             # sandbox fallback stays available
             SANDBOX_OK = True
 
+        # ============================================
+        # STOCK COMMAND ROUTER (V6.1)
+        # ============================================
+        if text:
+            low = text.lower().strip()
+
+            # --- CREATE/UPDATE STOCK ITEM -------------------------------
+            # "stock item cement", "add stock item timber", etc.
+            if low.startswith("stock item ") or low.startswith("add stock item "):
+                name = text.split(" ", 2)[-1].strip()
+                from storage import create_stock_item
+                out = create_stock_item({"name": name})
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"Stock item saved: {out.get('name')} (ID {out.get('id')})"
+                )
+                return ("", 200)
+
+            # --- ADJUST STOCK (IN or OUT) -------------------------------
+            # “stock +10 cement”, “stock -5 cement”
+            if low.startswith("stock "):
+                parts = text.split(" ", 2)
+                if len(parts) >= 3:
+                    delta_raw = parts[1]
+                    name = parts[2]
+                    try:
+                        delta = float(delta_raw)
+                        from storage import adjust_stock
+                        out = adjust_stock({"name": name, "delta": delta})
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            f"Stock updated: {out.get('name')} → {out.get('current_qty')}"
+                        )
+                        return ("", 200)
+                    except Exception:
+                        pass
+
+            # --- STOCK REPORT ------------------------------------------
+            # “stock report”, “stock status”
+            if low in ("stock report", "stock status"):
+                from storage import get_stock_report
+                rep = get_stock_report()
+                items = rep.get("items") or []
+                if not items:
+                    send_whatsapp_text(phone_id, sender, "No stock items recorded.")
+                    return ("", 200)
+
+                lines = []
+                for it in items:
+                    msg = it.get("message") or ""
+                    nm = it.get("name") or ""
+                    qty = it.get("current_qty")
+                    cover = it.get("days_cover")
+                    line = f"{nm}: {qty} units"
+                    if cover is not None:
+                        line += f" — {cover:.1f} days cover"
+                    if msg:
+                        line += f" ⚠ {msg}"
+                    lines.append(line)
+
+                send_whatsapp_text(phone_id, sender, "\n".join(lines))
+                return ("", 200)
+
         # === SANDBOX ORDER FALLBACK (no interactive buttons) ===================
         if tag == "order" and "[await:" not in (text or "").lower():
             with SessionLocal() as s:
