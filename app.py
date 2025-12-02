@@ -369,7 +369,7 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
-        # === AWAIT FOLLOW-UP CAPTURE (v6.1 CLEAN) =============================
+        # === AWAIT FOLLOW-UP CAPTURE ==========================================
         if text and not any(w in text.lower() for w in (
             "approve", "reject",
             "change the order", "change that order",
@@ -392,11 +392,8 @@ def webhook():
                     raw_txt = text.strip()
                     await_lower = awaiting.text.lower()
 
-                    # --- Extract existing structured fields (if any) -----------
-                    body = awaiting.text
-                    if body.startswith("[await:"):
-                        body = body.split("]", 1)[1].strip()
-
+                    # --- parse existing structured fields -----------------------
+                    body = awaiting.text.split("]", 1)[1].strip()
                     lines = [l.strip() for l in body.splitlines() if l.strip()]
                     fields = {}
                     for l in lines:
@@ -412,10 +409,9 @@ def webhook():
 
                     # --- ITEM ---------------------------------------------------
                     if await_lower.startswith("[await:item]"):
-                        item = raw_txt
                         awaiting.text = (
-                            "[await:quantity] "
-                            f"Item: {item}"
+                            "[await:quantity]\n"
+                            f"Item: {raw_txt}"
                         )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Quantity?")
@@ -423,11 +419,10 @@ def webhook():
 
                     # --- QUANTITY -----------------------------------------------
                     if await_lower.startswith("[await:quantity]"):
-                        qty = raw_txt
                         awaiting.text = (
-                            "[await:supplier] "
+                            "[await:supplier]\n"
                             f"Item: {item}\n"
-                            f"Quantity: {qty}"
+                            f"Quantity: {raw_txt}"
                         )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Supplier?")
@@ -435,12 +430,11 @@ def webhook():
 
                     # --- SUPPLIER -----------------------------------------------
                     if await_lower.startswith("[await:supplier]"):
-                        supplier = raw_txt
                         awaiting.text = (
-                            "[await:delivery_date] "
+                            "[await:delivery_date]\n"
                             f"Item: {item}\n"
                             f"Quantity: {qty}\n"
-                            f"Supplier: {supplier}"
+                            f"Supplier: {raw_txt}"
                         )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Delivery date?")
@@ -448,27 +442,25 @@ def webhook():
 
                     # --- DELIVERY DATE ------------------------------------------
                     if await_lower.startswith("[await:delivery_date]"):
-                        ddate = raw_txt
                         awaiting.text = (
-                            "[await:drop_location] "
+                            "[await:drop_location]\n"
                             f"Item: {item}\n"
                             f"Quantity: {qty}\n"
                             f"Supplier: {supplier}\n"
-                            f"Delivery Date: {ddate}"
+                            f"Delivery Date: {raw_txt}"
                         )
                         s.commit()
                         send_whatsapp_text(phone_id, sender, "Drop location on site?")
                         return ("", 200)
 
-                    # --- DROP LOCATION (FINALISE) -------------------------------
+                    # --- DROP LOCATION ------------------------------------------
                     if await_lower.startswith("[await:drop_location]"):
-                        drop_loc = raw_txt
                         awaiting.text = (
                             f"Item: {item}\n"
                             f"Quantity: {qty}\n"
                             f"Supplier: {supplier}\n"
                             f"Delivery Date: {ddate}\n"
-                            f"Drop Location: {drop_loc}"
+                            f"Drop Location: {raw_txt}"
                         )
                         awaiting.status = "pending_approval"
                         awaiting.last_updated = dt.datetime.utcnow()
@@ -476,7 +468,7 @@ def webhook():
                         send_whatsapp_text(phone_id, sender, "✅ Order details captured. Awaiting PM approval.")
                         return ("", 200)
 
-        # === END AWAIT FOLLOW-UP (v6.1 CLEAN) ==================================
+        # === END AWAIT FOLLOW-UP ==============================================
 
         # === CLASSIFICATION (V6.1 unified) =====================================
 
