@@ -378,6 +378,89 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
+        # === STOCK COMMANDS (WhatsApp-driven) ================================
+        if text:
+            raw = (text or "").strip()
+            lower = raw.lower()
+
+            # We only handle messages that clearly start with "stock "
+            if lower.startswith("stock "):
+                parts = raw.split()
+                if len(parts) < 2:
+                    # malformed → just ignore and let normal flow continue
+                    pass
+                else:
+                    cmd = parts[1].lower()
+
+                    # 1) "stock item cement"
+                    if cmd == "item" and len(parts) >= 3:
+                        name = " ".join(parts[2:]).strip()
+                        from storage_v6_1 import create_stock_item
+                        create_stock_item({"name": name})
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            f"✅ Stock item saved: {name}"
+                        )
+                        return ("", 200)
+
+                    # 2) "stock +10 cement" / "stock -3 cement"
+                    if (cmd.startswith("+") or cmd.startswith("-")) and len(parts) >= 3:
+                        try:
+                            delta = float(cmd)
+                        except ValueError:
+                            send_whatsapp_text(
+                                phone_id,
+                                sender,
+                                "⚠️ Couldn't read stock change amount."
+                            )
+                            return ("", 200)
+
+                        name = " ".join(parts[2:]).strip()
+                        from storage_v6_1 import adjust_stock
+                        res = adjust_stock({"name": name, "delta": delta})
+
+                        if res.get("status") == "ok":
+                            current = res.get("current_qty")
+                            send_whatsapp_text(
+                                phone_id,
+                                sender,
+                                f"✅ Stock updated: {name} now {current} on hand."
+                            )
+                        else:
+                            send_whatsapp_text(
+                                phone_id,
+                                sender,
+                                f"⚠️ Stock error: {res.get('message')}"
+                            )
+                        return ("", 200)
+
+                    # 3) "stock report"
+                    if cmd == "report":
+                        from storage_v6_1 import get_stock_report
+                        report = get_stock_report()
+                        items = report.get("items") or []
+
+                        if not items:
+                            send_whatsapp_text(
+                                phone_id,
+                                sender,
+                                "ℹ️ No stock recorded yet."
+                            )
+                            return ("", 200)
+
+                        # Short, WhatsApp-safe summary (top 10)
+                        lines = ["📦 Stock report (top 10):"]
+                        for it in items[:10]:
+                            name = it.get("name") or "?"
+                            qty = it.get("current_qty") or 0
+                            unit = it.get("unit") or ""
+                            lines.append(f"- {name}: {qty} {unit}".strip())
+                        send_whatsapp_text(phone_id, sender, "\n".join(lines))
+                        return ("", 200)
+                # If it's "stock ..." but none of the above matched,
+                # we just fall through into normal handling.
+
         # === AWAIT FOLLOW-UP CAPTURE — HARDENED REBUILD (V6.1-REV3) ============
         if text:
             lower_txt = text.lower().strip()
