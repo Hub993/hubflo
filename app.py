@@ -481,6 +481,72 @@ def webhook():
                             return ("", 200)
         # === END AWAIT FOLLOW-UP CAPTURE — HARDENED REBUILD =====================
 
+# ---------------------------------------------------------------------
+# STOCK INTEGRATION (V6.1)
+# Auto-create / auto-adjust after PM approval
+# ---------------------------------------------------------------------
+try:
+    from storage import create_stock_item, adjust_stock
+except Exception:
+    create_stock_item = None
+    adjust_stock = None
+
+def _extract_order_fields(task_text: str) -> dict:
+    """
+    Parse the finalised order text into fields.
+    """
+    out = {"Item": "", "Quantity": "", "Supplier": "", "Delivery Date": "", "Drop Location": ""}
+    if not task_text:
+        return out
+
+    for line in task_text.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            if k in out:
+                out[k] = v
+    return out
+
+
+def _stock_auto_process_on_approval(tid: int, actor: str | None):
+    """
+    Called ONLY when PM approves an order.
+    - Ensures stock item exists
+    - Adjusts stock level by ordered quantity
+    """
+    if not adjust_stock or not create_stock_item:
+        return
+
+    with SessionLocal() as s:
+        t = s.get(Task, tid)
+        if not t:
+            return
+
+        fields = _extract_order_fields(t.text)
+
+        item = fields.get("Item", "")
+        qty = fields.get("Quantity", "")
+
+        if not item or not qty:
+            return
+
+        # 1. Create stock item if unseen
+        try:
+            create_stock_item({"name": item})
+        except Exception:
+            pass
+
+        # 2. Adjust stock
+        try:
+            adjust_stock({
+                "item": item,
+                "delta": -abs(int(qty)),
+                "actor": actor or "system"
+            })
+        except Exception:
+            pass
+
         # === CLASSIFICATION (V6.1 unified) =====================================
 
         # PATCH: bind sender globally for classifier patches
