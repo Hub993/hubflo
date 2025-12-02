@@ -378,105 +378,108 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
-        # === AWAIT FOLLOW-UP CAPTURE — CLEAN REBUILD (V6.1-REV2) ================
-        if text and not any(w in text.lower() for w in (
-                "approve", "reject",
-                "change the order", "change that order",
-                "change order", "change it", "change it to"
-        )):
-            with SessionLocal() as s:
-                awaiting = (
-                    s.query(Task)
-                    .filter(
-                        Task.sender == sender,
-                        Task.status == "open",
-                        Task.tag == "order",
-                        Task.text.like("[await:%]%")
+        # === AWAIT FOLLOW-UP CAPTURE — HARDENED REBUILD (V6.1-REV3) ============
+        if text:
+            lower_txt = text.lower().strip()
+
+            if not any(w in lower_txt for w in (
+                    "approve", "reject",
+                    "change the order", "change that order",
+                    "change order", "change it", "change it to"
+            )):
+                with SessionLocal() as s:
+                    awaiting = (
+                        s.query(Task)
+                        .filter(
+                            Task.sender == sender,
+                            Task.status == "open",
+                            Task.tag == "order",
+                            Task.text.like("[await:%]%")
+                        )
+                        .order_by(Task.id.desc())
+                        .first()
                     )
-                    .order_by(Task.id.desc())
-                    .first()
-                )
 
-                if awaiting:
-                    raw_txt = text.strip()
-                    await_lower = awaiting.text.lower()
+                    if awaiting:
+                        raw_txt = text.strip()
+                        await_lower = awaiting.text.lower()
 
-                    # parse existing fields
-                    body = awaiting.text.split("]", 1)[1].strip()
-                    lines = [l.strip() for l in body.splitlines() if l.strip()]
-                    fields = {}
-                    for l in lines:
-                        if ":" in l:
-                            k, v = l.split(":", 1)
-                            fields[k.strip()] = v.strip()
+                        # parse existing fields
+                        body = awaiting.text.split("]", 1)[1].strip()
+                        lines = [l.strip() for l in body.splitlines() if l.strip()]
+                        fields = {}
+                        for l in lines:
+                            if ":" in l:
+                                k, v = l.split(":", 1)
+                                fields[k.strip()] = v.strip()
 
-                    item     = fields.get("Item", "")
-                    qty      = fields.get("Quantity", "")
-                    supplier = fields.get("Supplier", "")
-                    ddate    = fields.get("Delivery Date", "")
-                    drop_loc = fields.get("Drop Location", "")
+                        item     = fields.get("Item", "")
+                        qty      = fields.get("Quantity", "")
+                        supplier = fields.get("Supplier", "")
+                        ddate    = fields.get("Delivery Date", "")
+                        drop_loc = fields.get("Drop Location", "")
 
-                    # ITEM
-                    if await_lower.startswith("[await:item]"):
-                        awaiting.text = (
-                            "[await:quantity]\n"
-                            f"Item: {raw_txt}"
-                        )
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Quantity?")
-                        return ("", 200)
+                        # --- ITEM ------------------------------------------------
+                        if await_lower.startswith("[await:item]"):
+                            awaiting.text = (
+                                "[await:quantity]\n"
+                                f"Item: {raw_txt}"
+                            )
+                            s.commit()
+                            send_whatsapp_text(phone_id, sender, "Quantity?")
+                            return ("", 200)
 
-                    # QUANTITY
-                    if await_lower.startswith("[await:quantity]"):
-                        awaiting.text = (
-                            "[await:supplier]\n"
-                            f"Item: {item}\n"
-                            f"Quantity: {raw_txt}"
-                        )
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Supplier?")
-                        return ("", 200)
+                        # --- QUANTITY --------------------------------------------
+                        if await_lower.startswith("[await:quantity]"):
+                            awaiting.text = (
+                                "[await:supplier]\n"
+                                f"Item: {item}\n"
+                                f"Quantity: {raw_txt}"
+                            )
+                            s.commit()
+                            send_whatsapp_text(phone_id, sender, "Supplier?")
+                            return ("", 200)
 
-                    # SUPPLIER
-                    if await_lower.startswith("[await:supplier]"):
-                        awaiting.text = (
-                            "[await:delivery_date]\n"
-                            f"Item: {item}\n"
-                            f"Quantity: {qty}\n"
-                            f"Supplier: {raw_txt}"
-                        )
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Delivery date?")
-                        return ("", 200)
+                        # --- SUPPLIER --------------------------------------------
+                        if await_lower.startswith("[await:supplier]"):
+                            awaiting.text = (
+                                "[await:delivery_date]\n"
+                                f"Item: {item}\n"
+                                f"Quantity: {qty}\n"
+                                f"Supplier: {raw_txt}"
+                            )
+                            s.commit()
+                            send_whatsapp_text(phone_id, sender, "Delivery date?")
+                            return ("", 200)
 
-                    # DELIVERY DATE
-                    if await_lower.startswith("[await:delivery_date]"):
-                        awaiting.text = (
-                            "[await:drop_location]\n"
-                            f"Item: {item}\n"
-                            f"Quantity: {qty}\n"
-                            f"Supplier: {supplier}\n"
-                            f"Delivery Date: {raw_txt}"
-                        )
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Drop location on site?")
-                        return ("", 200)
+                        # --- DELIVERY DATE ---------------------------------------
+                        if await_lower.startswith("[await:delivery_date]"):
+                            awaiting.text = (
+                                "[await:drop_location]\n"
+                                f"Item: {item}\n"
+                                f"Quantity: {qty}\n"
+                                f"Supplier: {supplier}\n"
+                                f"Delivery Date: {raw_txt}"
+                            )
+                            s.commit()
+                            send_whatsapp_text(phone_id, sender, "Drop location on site?")
+                            return ("", 200)
 
-                    # DROP LOCATION → FINALISE
-                    if await_lower.startswith("[await:drop_location]"):
-                        awaiting.text = (
-                            f"Item: {item}\n"
-                            f"Quantity: {qty}\n"
-                            f"Supplier: {supplier}\n"
-                            f"Delivery Date: {ddate}\n"
-                            f"Drop Location: {raw_txt}"
-                        )
-                        awaiting.status = "pending_approval"
-                        awaiting.last_updated = dt.datetime.utcnow()
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "✅ Order details captured. Awaiting PM approval.")
-                        return ("", 200)
-        # === END AWAIT FOLLOW-UP CAPTURE — CLEAN REBUILD =========================
+                        # --- DROP LOCATION → FINALISE ----------------------------
+                        if await_lower.startswith("[await:drop_location]"):
+                            awaiting.text = (
+                                f"Item: {item}\n"
+                                f"Quantity: {qty}\n"
+                                f"Supplier: {supplier}\n"
+                                f"Delivery Date: {ddate}\n"
+                                f"Drop Location: {raw_txt}"
+                            )
+                            awaiting.status = "pending_approval"
+                            awaiting.last_updated = dt.datetime.utcnow()
+                            s.commit()
+                            send_whatsapp_text(phone_id, sender, "✅ Order details captured. Awaiting PM approval.")
+                            return ("", 200)
+        # === END AWAIT FOLLOW-UP CAPTURE — HARDENED REBUILD =====================
 
         # === CLASSIFICATION (V6.1 unified) =====================================
 
