@@ -97,13 +97,13 @@ def integrity_status():
         }), 200
 # ============================================================
 
-# >>> PATCH_CLASSIFIER_V6_1_START — NATURAL LANGUAGE REBUILD (V6.1) <<<
+# >>> PATCH_CLASSIFIER_V6_1_START — NATURAL LANGUAGE REBUILD (V6.1-REV2) <<<
 
 import re
 
 def classify_message(text: str) -> dict:
     """
-    Natural-language classifier restored to V6 behaviour.
+    Natural-language classifier restored to V6.1-REV2 behaviour.
     No hashtags, no rigid keywords, free-flow chat only.
     Returns:
         { "tag": "...", "subtype": "...", "order_state": "..." }
@@ -111,6 +111,15 @@ def classify_message(text: str) -> dict:
 
     global SENDER_GLOBAL
     t = (text or "").lower().strip()
+
+    # -----------------------------
+    # EXPLICIT "NOT AN ORDER" / UPDATE GUARD
+    # -----------------------------
+    # e.g. "This is just an update not an order"
+    if "not an order" in t or "just an update" in t:
+        if t.startswith("i will") or t.startswith("i'm going to"):
+            return {"tag": "task", "subtype": "self", "order_state": None}
+        return {"tag": "task", "subtype": "assigned", "order_state": None}
 
     # -----------------------------
     # CHANGE ORDER (requires an existing open order)
