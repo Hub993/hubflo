@@ -564,6 +564,110 @@ def webhook():
                             return ("", 200)
         # === END AWAIT FOLLOW-UP CAPTURE — HARDENED REBUILD =====================
 
+        # === STOCK COMMANDS (V6.1 — WhatsApp driven) ==========================
+        if text:
+            raw = text.strip()
+            lower = raw.lower()
+
+            # 1) Define / upsert a stock item name
+            #    "Stock item cement"
+            if lower.startswith("stock item "):
+                name = raw.split(" ", 2)[2].strip()
+                if name:
+                    create_stock_item({"name": name})
+                    # Optional: log as a task for traceability
+                    create_task(
+                        sender=sender,
+                        text=f"[stock:item] {name}",
+                        tag="stock",
+                        project_code=None,
+                        subcontractor_name=None,
+                        order_state=None,
+                        attachment=None,
+                        subtype="assigned",
+                    )
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        f"✅ Stock item saved: {name}",
+                    )
+                return ("", 200)
+
+            # 2) Adjust quantity
+            #    "Stock +10 cement"  or  "Stock -3 cement"
+            if lower.startswith("stock "):
+                parts = raw.split()
+                # minimum: ["Stock","+10","cement"]
+                if len(parts) >= 3 and (parts[1].startswith("+") or parts[1].startswith("-")):
+                    delta_str = parts[1]
+                    name = " ".join(parts[2:]).strip()
+                    try:
+                        delta = float(delta_str)
+                    except ValueError:
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            "⚠ Could not read quantity. Use e.g. 'Stock +10 cement'.",
+                        )
+                        return ("", 200)
+
+                    if name:
+                        adjust_stock({"name": name, "delta": delta})
+                        create_task(
+                            sender=sender,
+                            text=f"[stock:adjust] {delta_str} {name}",
+                            tag="stock",
+                            project_code=None,
+                            subcontractor_name=None,
+                            order_state=None,
+                            attachment=None,
+                            subtype="assigned",
+                        )
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            f"✅ Stock updated: {name} ({delta_str})",
+                        )
+                    else:
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            "⚠ Missing item name. Use e.g. 'Stock +10 cement'.",
+                        )
+                    return ("", 200)
+
+            # 3) Simple stock report
+            #    "Stock report"
+            if lower == "stock report":
+                report = get_stock_report()
+                items = report.get("items") or []
+
+                if not items:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "📊 Stock report: no items recorded yet.",
+                    )
+                    return ("", 200)
+
+                lines = ["📊 Stock report (top items):"]
+                for item in items[:5]:
+                    name = item.get("name") or "Unnamed"
+                    qty = item.get("current_qty") or 0
+                    msg = item.get("message") or ""
+                    line = f"- {name}: {qty}"
+                    if msg:
+                        line += f" • {msg}"
+                    lines.append(line)
+
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    "\n".join(lines),
+                )
+                return ("", 200)
+        # === END STOCK COMMANDS ===============================================
+
 # ---------------------------------------------------------------------
 # STOCK INTEGRATION (V6.1)
 # Auto-create / auto-adjust after PM approval
