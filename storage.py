@@ -787,17 +787,272 @@ def is_task_critical(t: Task) -> bool:
 
 # >>> PATCH_14_STORAGE_END <<<
 
-def create_stock_item(data: dict):
-    """Temporary stub; replace with full implementation later."""
-    return {"status": "ok", "message": "Stock item created", "data": data}
+# >>> PATCH_15_STORAGE_START — STOCK TRACKING & CONSUMPTION <<<
 
-def adjust_stock(data: dict):
-    """Temporary stub; replace with full implementation later."""
-    return {"status": "ok", "message": "Stock adjusted", "data": data}
+class StockItem(Base):
+    __tablename__ = "stock_items"
 
-def get_stock_report():
-    """Temporary stub; replace with full implementation later."""
-    return {"status": "ok", "report": []}
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False, index=True)
+    project_code = Column(String(128), index=True, nullable=True)
+    supplier_name = Column(String(200), nullable=True)
+    unit = Column(String(32), nullable=True)  # bags, lengths, etc.
+
+    # Running balance
+    current_qty = Column(Float, default=0.0)
+
+    # How many days of cover we prefer to keep (for suggestions)
+    min_days_cover = Column(Float, nullable=True)  # e.g. 7 days
+
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=dt.datetime.utcnow,
+        onupdate=dt.datetime.utcnow,
+    )
+
+
+class StockMovement(Base):
+    __tablename__ = "stock_movements"
+
+    id = Column(Integer, primary_key=True)
+    stock_item_id = Column(Integer, index=True)      # FK-like → StockItem.id
+    ts = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+    # Positive = received, Negative = consumed
+    qty_change = Column(Float, nullable=False)
+
+    # Optional link back to the originating task/order
+    related_task_id = Column(Integer, nullable=True)
+
+
+def _get_or_create_stock_item(
+    s,
+    name: str,
+    project_code: Optional[str] = None,
+    supplier_name: Optional[str] = None,
+    unit: Optional[str] = None,
+) -> StockItem:
+    name_norm = (name or "").strip()
+    if not name_norm:
+        raise ValueError("stock name required")
+
+    q = s.query(StockItem).filter(StockItem.name == name_norm)
+    if project_code:
+        q = q.filter(StockItem.project_code == project_code)
+
+    item = q.first()
+    if not item:
+        item = StockItem(
+            name=name_norm,
+            project_code=project_code,
+            supplier_name=supplier_name,
+            unit=unit,
+            current_qty=0.0,
+        )
+        s.add(item)
+        s.flush()  # ensure item.id is available
+
+    # Update optional descriptors if provided
+    if supplier_name:
+        item.supplier_name = supplier_name
+    if unit:
+        item.unit = unit
+
+    return item
+
+
+def create_stock_item(data: dict) -> dict:
+    """
+    Create or upsert a stock item (no quantity change yet).
+    data keys:
+      - name (required)
+      - project_code (optional)
+      - supplier_name (optional)
+      - unit (optional)
+      - min_days_cover (optional, float)
+    """
+    with SessionLocal() as s:
+        name = data.get("name", "")
+        project_code = data.get("project_code")
+        supplier_name = data.get("supplier_name")
+        unit = data.get("unit")
+        min_days_cover = data.get("min_days_cover")
+
+        item = _get_or_create_stock_item(
+            s,
+            name=name,
+            project_code=project_code,
+            supplier_name=supplier_name,
+            unit=unit,
+        )
+
+        if min_days_cover is not None:
+            try:
+                item.min_days_cover = float(min_days_cover)
+            except (TypeError, ValueError):
+                item.min_days_cover = None
+
+        s.commit()
+        s.refresh(item)
+
+        return {
+            "status": "ok",
+            "id": item.id,
+            "name": item.name,
+            "project_code": item.project_code,
+            "supplier_name": item.supplier_name,
+            "unit": item.unit,
+            "current_qty": item.current_qty,
+            "min_days_cover": item.min_days_cover,
+        }
+
+
+def adjust_stock(data: dict) -> dict:
+    """
+    Adjust stock and record a movement.
+
+    data keys:
+      - name (required)
+      - delta (required, positive=in, negative=out)
+      - project_code (optional)
+      - supplier_name (optional)
+      - unit (optional)
+      - related_task_id (optional, int)
+    """
+    with SessionLocal() as s:
+        name = data.get("name", "")
+        delta_raw = data.get("delta")
+
+        try:
+            delta = float(delta_raw)
+        except (TypeError, ValueError):
+            return {"status": "error", "message": "invalid or missing delta"}
+
+        project_code = data.get("project_code")
+        supplier_name = data.get("supplier_name")
+        unit = data.get("unit")
+        related_task_id = data.get("related_task_id")
+
+        try:
+            item = _get_or_create_stock_item(
+                s,
+                name=name,
+                project_code=project_code,
+                supplier_name=supplier_name,
+                unit=unit,
+            )
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+
+        # Update running balance
+        item.current_qty = (item.current_qty or 0.0) + delta
+
+        mov = StockMovement(
+            stock_item_id=item.id,
+            qty_change=delta,
+            related_task_id=related_task_id,
+        )
+        s.add(mov)
+
+        s.commit()
+        s.refresh(item)
+
+        return {
+            "status": "ok",
+            "item_id": item.id,
+            "name": item.name,
+            "project_code": item.project_code,
+            "current_qty": item.current_qty,
+        }
+
+
+def _stock_usage_metrics(
+    s,
+    item: StockItem,
+    window_days: int = 30,
+) -> dict:
+    """
+    Compute simple usage metrics for a single item over the last N days.
+    We only look at negative movements (consumption).
+    """
+    now = dt.datetime.utcnow()
+    since = now - dt.timedelta(days=window_days)
+
+    moves = (
+        s.query(StockMovement)
+        .filter(
+            StockMovement.stock_item_id == item.id,
+            StockMovement.ts >= since,
+            StockMovement.qty_change < 0,  # consumption only
+        )
+        .all()
+    )
+
+    total_used = sum(-m.qty_change for m in moves)  # make positive
+    avg_daily_use = 0.0
+    if window_days > 0 and total_used > 0:
+        avg_daily_use = total_used / float(window_days)
+
+    days_cover = None
+    if avg_daily_use > 0:
+        days_cover = (item.current_qty or 0.0) / avg_daily_use
+
+    min_cover = item.min_days_cover or 7.0  # default 7 days if unset
+    reorder_suggested = False
+    if days_cover is not None and days_cover < min_cover:
+        reorder_suggested = True
+
+    return {
+        "avg_daily_use": avg_daily_use,
+        "days_cover": days_cover,
+        "min_days_cover": min_cover,
+        "reorder_suggested": reorder_suggested,
+    }
+
+
+def get_stock_report(project_code: Optional[str] = None) -> dict:
+    """
+    Returns a report of all stock items and basic consumption/suggestion
+    metrics. If project_code is provided, only items for that project
+    are included.
+    """
+    with SessionLocal() as s:
+        q = s.query(StockItem)
+        if project_code:
+            q = q.filter(StockItem.project_code == project_code)
+
+        items = q.order_by(StockItem.name.asc()).all()
+        rows = []
+
+        for item in items:
+            metrics = _stock_usage_metrics(s, item)
+            msg = None
+            if metrics["reorder_suggested"]:
+                msg = (
+                    f"Low cover: approx {metrics['days_cover']:.1f} days "
+                    f"remaining (target {metrics['min_days_cover']:.1f} days)."
+                )
+
+            rows.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "project_code": item.project_code,
+                    "supplier_name": item.supplier_name,
+                    "unit": item.unit,
+                    "current_qty": item.current_qty,
+                    "avg_daily_use": metrics["avg_daily_use"],
+                    "days_cover": metrics["days_cover"],
+                    "min_days_cover": metrics["min_days_cover"],
+                    "reorder_suggested": metrics["reorder_suggested"],
+                    "message": msg,
+                }
+            )
+
+        return {"status": "ok", "items": rows}
+
+# >>> PATCH_15_STORAGE_END <<<
 
 # >>> PATCH_11_STORAGE_START — SUPPLIER DIRECTORY <<<
 
