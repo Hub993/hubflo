@@ -2449,6 +2449,147 @@ def admin_report_overview():
         "status": "ok"
     }), 200
 
+@app.route("/admin/test_seed", methods=["GET"])
+def admin_test_seed():
+    """
+    One-off test data seeder for sandbox.
+    Hit:
+      /admin/test_seed?token=YOUR_ADMIN_TOKEN
+    and it will insert a few example projects, subs and tasks.
+    """
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage import SessionLocal, User  # reuse existing storage binding
+
+    created_users = 0
+    created_tasks = 0
+
+    with SessionLocal() as s:
+        # --- Ensure a PM linked to YOUR number ---------------------------
+        pm_wa = "13522098414"  # your sandbox WA
+        pm = (
+            s.query(User)
+            .filter(User.wa_id == pm_wa, User.active == True)
+            .first()
+        )
+        if not pm:
+            pm = User(
+                wa_id=pm_wa,
+                name="Nev (PM)",
+                role="pm",
+                subcontractor_name=None,
+                project_code=None,
+                phone=pm_wa,
+                active=True,
+            )
+            s.add(pm)
+            created_users += 1
+
+        # --- Ensure a few subs -------------------------------------------
+        def get_or_create_sub(wa_id, name, company, project_code):
+            nonlocal created_users
+            u = (
+                s.query(User)
+                .filter(User.wa_id == wa_id, User.active == True)
+                .first()
+            )
+            if not u:
+                u = User(
+                    wa_id=wa_id,
+                    name=name,
+                    role="sub",
+                    subcontractor_name=company,
+                    project_code=project_code,
+                    phone=wa_id,
+                    active=True,
+                )
+                s.add(u)
+                created_users += 1
+            return u
+
+        sub_paint = get_or_create_sub(
+            "278200000001", "Alex Painter", "BrightCo Painting", "OCALA-01"
+        )
+        sub_plumb = get_or_create_sub(
+            "278200000002", "Sam Plumber", "XCX Plumbing", "OCALA-01"
+        )
+        sub_misc = get_or_create_sub(
+            "278200000003", "Mike Builder", "General Build Co", "OCALA-02"
+        )
+
+        # --- Create example tasks ----------------------------------------
+        from storage_v6_1 import Task  # use same Task model as rest of app
+        import datetime as dt
+
+        now = dt.datetime.utcnow()
+
+        tasks = []
+
+        # Painting jobs on different sites
+        tasks.append(Task(
+            sender=sub_paint.wa_id,
+            text="Paint all interior walls in units 1–4",
+            tag="task",
+            status="open",
+            project_code="OCALA-01",
+            subcontractor_name=sub_paint.subcontractor_name,
+            ts=now,
+        ))
+        tasks.append(Task(
+            sender=sub_paint.wa_id,
+            text="Repaint exterior of block B (north elevation)",
+            tag="task",
+            status="open",
+            project_code="OCALA-02",
+            subcontractor_name=sub_paint.subcontractor_name,
+            ts=now,
+        ))
+
+        # Plumbing jobs, including an overrun
+        tasks.append(Task(
+            sender=sub_plumb.wa_id,
+            text="Fix leaking pipe in unit 3 bathroom",
+            tag="task",
+            status="open",
+            project_code="OCALA-01",
+            subcontractor_name=sub_plumb.subcontractor_name,
+            ts=now,
+            overrun_days=0.0,
+        ))
+        tasks.append(Task(
+            sender=sub_plumb.wa_id,
+            text="Replace main water line for block A (overrun)",
+            tag="task",
+            status="open",
+            project_code="OCALA-01",
+            subcontractor_name=sub_plumb.subcontractor_name,
+            ts=now,
+            overrun_days=4.0,   # treated as overrun
+        ))
+
+        # A general urgent task
+        tasks.append(Task(
+            sender=sub_misc.wa_id,
+            text="Urgent: secure loose roof sheeting over unit 5",
+            tag="urgent",
+            status="open",
+            project_code="OCALA-02",
+            subcontractor_name=sub_misc.subcontractor_name,
+            ts=now,
+        ))
+
+        for t in tasks:
+            s.add(t)
+        created_tasks = len(tasks)
+
+        s.commit()
+
+    return jsonify({
+        "status": "ok",
+        "created_users": created_users,
+        "created_tasks": created_tasks
+    }), 200
 
 # === ADMIN OVERVIEW DASHBOARD (HTML VIEW) ============================
 @app.route("/admin/report/overview/view", methods=["GET"])
