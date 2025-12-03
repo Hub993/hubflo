@@ -734,6 +734,91 @@ def _stock_auto_process_on_approval(tid: int, actor: str | None):
         except Exception:
             pass
 
+# === COLLOQUIAL COMMANDS — V6.1 UNIFIED ===============================
+
+txt = (text or "").strip().lower()
+
+# --- STOCK: ADD / CONSUME -------------------------------------------------
+# patterns:
+#   "add 10 cement"
+#   "cement +10"
+#   "use 3 cement" / "cement -3"
+#   "receive 20 bricks"
+#   "add stock cement"
+import re
+
+stock_add = re.match(r"^(add|receive)\s+(\d+)\s+(.+)$", txt)
+stock_plus = re.match(r"^(.+?)\s*\+\s*(\d+)$", txt)
+stock_minus = re.match(r"^(.+?)\s*-\s*(\d+)$", txt)
+stock_use = re.match(r"^(use)\s+(\d+)\s+(.+)$", txt)
+
+if stock_add:
+    qty = float(stock_add.group(2))
+    name = stock_add.group(3).strip()
+    adjust_stock({"name": name, "delta": qty})
+    return ("", 200)
+
+if stock_plus:
+    name = stock_plus.group(1).strip()
+    qty = float(stock_plus.group(2))
+    adjust_stock({"name": name, "delta": qty})
+    return ("", 200)
+
+if stock_minus:
+    name = stock_minus.group(1).strip()
+    qty = float(stock_minus.group(2))
+    adjust_stock({"name": name, "delta": -qty})
+    return ("", 200)
+
+if stock_use:
+    qty = float(stock_use.group(2))
+    name = stock_use.group(3).strip()
+    adjust_stock({"name": name, "delta": -qty})
+    return ("", 200)
+
+# --- STOCK REPORT ----------------------------------------------------------
+# patterns:
+#   "stock report"
+#   "cement left?"
+#   "how much cement?"
+
+if txt == "stock report":
+    rep = get_stock_report()
+    return (json.dumps(rep), 200)
+
+left = re.match(r"^how much (.+)\??$", txt) or \
+       re.match(r"^(.+?) left\??$", txt)
+
+if left:
+    name = left.group(1).strip()
+    rep = get_stock_report()
+    out = [i for i in rep["items"] if i["name"] == name]
+    return (json.dumps(out[0] if out else {}), 200)
+
+# --- CALL REMINDER ---------------------------------------------------------
+# patterns:
+#   "remind me to call john"
+#   "remind me to call john tomorrow"
+#   "remind me to call dave at 3"
+
+m = re.match(r"^remind me to call (.+)$", txt)
+if m:
+    target = m.group(1).strip()
+    create_call_reminder(sender, text, target)
+    return ("", 200)
+
+# --- CHANGE ORDER SEARCH ---------------------------------------------------
+# patterns:
+#   "get all change orders"
+#   "show change orders"
+#   "change orders"
+
+if txt in ("get all change orders", "show change orders", "change orders"):
+    out = get_all_change_orders()
+    return (json.dumps(out), 200)
+
+# --------------------------------------------------------------------------
+
         # === CLASSIFICATION (V6.1 unified) =====================================
 
         # PATCH: bind sender globally for classifier patches
