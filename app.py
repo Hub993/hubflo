@@ -890,7 +890,7 @@ def webhook():
                             )
                             return ("", 200)
                         payload = {
-                            "material": material,
+                            "name": material,
                             "unit": unit,
                             "opening_qty": qty_val,
                             "actor": sender,
