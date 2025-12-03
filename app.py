@@ -896,13 +896,6 @@ def webhook():
                         return ("", 200)
 
         # -------------------------
-        # SEARCH COMMANDS
-        # -------------------------
-        if text and is_search_request(text):
-            run_search(sender, text)
-            return ("", 200)
-
-        # -------------------------
         # NEW STOCK ITEM FLOW
         # -------------------------
         if text and is_new_stock_item_request(text):
@@ -977,6 +970,13 @@ def webhook():
                     f"Stock updated: {delta:+} {stock_cmd['unit']} of {stock_cmd['material']}.",
                 )
                 return ("", 200)
+
+        # -------------------------
+        # SEARCH COMMANDS
+        # -------------------------
+        if text and is_search_request(text):
+            run_search(sender, text)
+            return ("", 200)
 
         # -------------------------
         # FALLBACK: CLASSIFIER → TASK/ORDER
