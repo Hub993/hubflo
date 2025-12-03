@@ -655,6 +655,21 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
+        # ------------------------------------------------------------------
+        # SAFETY OVERRIDE FOR CORRUPTED AWAIT TASKS (TEMPORARY)
+        # ------------------------------------------------------------------
+        with DBSession() as s:
+            bad = (
+                s.query(Task)
+                .filter(Task.id == 97, Task.status == "open")
+                .first()
+            )
+            if bad:
+                bad.status = "done"
+                bad.text = f"[autoclosed:{dt.datetime.utcnow().isoformat()}]"
+                bad.last_updated = dt.datetime.utcnow()
+                s.commit()
+
         # -------------------------
         # AWAIT CHAINS (ORDERS + STOCK)
         # -------------------------
