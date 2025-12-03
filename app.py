@@ -291,7 +291,6 @@ def webhook():
     raw = request.get_json(silent=True) or {}
     try:
         entry = (raw.get("entry") or [])[0]
-        log.info("WEBHOOK_INBOUND: %s", json.dumps(raw)[:500])
         changes = (entry.get("changes") or [])[0]
         value = changes.get("value") or {}
         msgs = value.get("messages") or []
@@ -304,56 +303,324 @@ def webhook():
     if contacts:
         sender = contacts[0].get("wa_id") or sender
 
+    from storage import (
+        SessionLocal as DBSession,
+        User,
+        Task,
+        PMProjectMap,
+        get_user_role,
+        get_pms_for_project,
+    )
+
+    # -------------------------
+    # SEARCH HANDLING
+    # -------------------------
+    def is_search_request(text: str) -> bool:
+        t = (text or "").lower()
+        phrases = [
+            "search ",
+            "search for",
+            "find all",
+            "find ",
+            "list all",
+            "show all",
+            "show me all",
+            "give me all",
+            "overrun jobs",
+            "overrun work",
+            "overdue jobs",
+        ]
+        return any(p in t for p in phrases)
+
+    def run_search(sender_wa: str, text: str):
+        t = (text or "").lower()
+        with DBSession() as s:
+            u = (
+                s.query(User)
+                .filter(User.wa_id == sender_wa, User.active == True)
+                .first()
+            )
+            if not u:
+                send_whatsapp_text(
+                    phone_id,
+                    sender_wa,
+                    "Search is not available yet — your number is not linked.",
+                )
+                return
+
+            role = (u.role or "").lower().strip()
+            q = s.query(Task)
+
+            # Role-scoped base query
+            if role == "sub":
+                # Sub can only see their own work
+                q = q.filter(Task.sender == sender_wa)
+            elif role == "pm":
+                # PM scoped to mapped projects
+                proj_rows = (
+                    s.query(PMProjectMap.project_code)
+                    .filter(PMProjectMap.pm_user_id == u.id)
+                    .all()
+                )
+                projects = [r.project_code for r in proj_rows]
+                if not projects:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender_wa,
+                        "No projects are mapped to you yet.",
+                    )
+                    return
+                q = q.filter(Task.project_code.in_(projects))
+            else:
+                # Director / Ops etc. — respect explicit mappings only
+                proj_rows = (
+                    s.query(PMProjectMap.project_code)
+                    .filter(PMProjectMap.pm_user_id == u.id)
+                    .all()
+                )
+                projects = [r.project_code for r in proj_rows]
+                if not projects:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender_wa,
+                        "WhatsApp search is not enabled for your role yet.",
+                    )
+                    return
+                q = q.filter(Task.project_code.in_(projects))
+
+            # Detect explicit subcontractor scoping in the query
+            target_sub = None
+            if " for " in t:
+                subs = (
+                    s.query(Task.subcontractor_name)
+                    .filter(Task.subcontractor_name != None)
+                    .distinct()
+                    .all()
+                )
+                for row in subs:
+                    name = (row.subcontractor_name or "").strip()
+                    if not name:
+                        continue
+                    if name.lower() in t:
+                        target_sub = name
+                        break
+
+            # Subs cannot search other subs — escalate to PM
+            if role == "sub" and target_sub:
+                own = (u.subcontractor_name or "").strip().lower()
+                if own and target_sub.lower() != own:
+                    if u.project_code:
+                        pm_rows = (
+                            s.query(User)
+                            .join(PMProjectMap, PMProjectMap.pm_user_id == User.id)
+                            .filter(
+                                PMProjectMap.project_code == u.project_code,
+                                User.role == "pm",
+                                User.active == True,
+                            )
+                            .all()
+                        )
+                        for pm in pm_rows:
+                            send_whatsapp_text(
+                                phone_id,
+                                pm.wa_id,
+                                f"⚠ Search escalation from {u.name or u.wa_id}: '{text}'",
+                            )
+                    send_whatsapp_text(
+                        phone_id,
+                        sender_wa,
+                        "That search is outside your scope. I've flagged it to the PM.",
+                    )
+                    return
+
+            # Overrun / late filters
+            if "overrun" in t or "over run" in t or "overdue" in t or "late" in t:
+                q = q.filter(Task.overrun_days > 0)
+
+            # Trade / domain hints
+            if "paint" in t or "painting" in t:
+                q = q.filter(Task.text.ilike("%paint%"))
+            if "plumb" in t:
+                q = q.filter(Task.subcontractor_name.ilike("%plumb%"))
+            if "electric" in t:
+                q = q.filter(Task.subcontractor_name.ilike("%elect%"))
+
+            # Simple keyword text search
+            keywords = []
+            for token in ["for", "on", "about"]:
+                if f"{token} " in t:
+                    tail = t.split(token, 1)[1]
+                    for w in tail.split():
+                        w = w.strip(",. ")
+                        if len(w) >= 4:
+                            keywords.append(w)
+                    break
+            if keywords:
+                q = q.filter(Task.text.ilike(f"%{keywords[0]}%"))
+
+            rows = (
+                q.order_by(Task.id.desc())
+                .limit(25)
+                .all()
+            )
+
+            if not rows:
+                send_whatsapp_text(
+                    phone_id,
+                    sender_wa,
+                    "No matching tasks found for that search.",
+                )
+                return
+
+            lines = ["🔎 Search results:"]
+            for tsk in rows:
+                meta_bits = []
+                if tsk.project_code:
+                    meta_bits.append(tsk.project_code)
+                if tsk.subcontractor_name:
+                    meta_bits.append(tsk.subcontractor_name)
+                meta = " | ".join(meta_bits)
+                prefix = f"({tsk.id})"
+                snippet = (tsk.text or "").strip()
+                if len(snippet) > 80:
+                    snippet = snippet[:77] + "..."
+                line = f"- {prefix} {meta} {snippet}".strip()
+                lines.append(line)
+            message = "\n".join(lines)
+            send_whatsapp_text(phone_id, sender_wa, message)
+
+    # -------------------------
+    # STOCK HANDLING
+    # -------------------------
+    def is_new_stock_item_request(text: str) -> bool:
+        t = (text or "").lower()
+        return "add new stock item" in t
+
+    def parse_new_stock_item(text: str) -> str:
+        t = (text or "").lower()
+        if ":" in t:
+            return t.split("add new stock item", 1)[1].split(":", 1)[1].strip()
+        return t.split("add new stock item", 1)[1].strip()
+
+    def parse_stock_command(text: str):
+        t = (text or "").lower()
+        if "stock" not in t:
+            return None
+
+        verbs_add = ["add", "added", "received", "put", "delivered", "stocked"]
+        verbs_remove = ["take", "took", "use", "used", "deduct", "remove", "issue", "pull"]
+        kind = None
+        for v in verbs_add:
+            if f"{v} " in t:
+                kind = "add"
+                break
+        if not kind:
+            for v in verbs_remove:
+                if f"{v} " in t:
+                    kind = "remove"
+                    break
+        if not kind:
+            return None
+
+        m = re.search(
+            r"(\d+)\s+(\w+)?\s*(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
+            t,
+        )
+        if not m:
+            # We know it's a stock op but unit/qty are unclear
+            return {
+                "kind": kind,
+                "material": t,
+                "qty": None,
+                "unit": None,
+                "needs_prompt": True,
+            }
+
+        qty = int(m.group(1))
+        unit = m.group(2)
+        material = m.group(3).strip()
+
+        needs_prompt = False
+        if not unit or unit.lower() in ("of", "to", "into", "from", "out"):
+            unit = None
+            needs_prompt = True
+
+        return {
+            "kind": kind,
+            "material": material,
+            "qty": qty,
+            "unit": unit,
+            "needs_prompt": needs_prompt,
+        }
+
+    from storage_v6_1 import create_task
+    from storage_v6_1 import adjust_stock, create_stock_item
+
+    # -------------------------
+    # MAIN MESSAGE LOOP
+    # -------------------------
     for m in msgs:
         sender = m.get("from") or sender
         mtype = m.get("type")
         text = None
         attachment = None
 
-        # === INTERACTIVE BUTTON HANDLING (ORDER CHECKLIST) ===================
+        # -------------------------
+        # ORDER CHECKLIST BUTTONS
+        # -------------------------
         if mtype == "interactive":
             br = (m.get("interactive") or {}).get("button_reply") or {}
             bid = br.get("id", "") or ""
 
+            from storage_v6_1 import SessionLocal as S2, Task as T2
+
             if bid.startswith("order_item:"):
                 tid = int(bid.split(":", 1)[1])
-                with SessionLocal() as s:
-                    t = s.get(Task, tid)
+                with S2() as s:
+                    t = s.get(T2, tid)
                     if t:
-                        t.text = f"[await:item]\n{t.text or ''}".strip()
+                        t.text = f"[await:item]\n{t.text or ''}"
                         s.commit()
-                send_whatsapp_text(phone_id, sender, "What item should we order?")
+                send_whatsapp_text(phone_id, sender, "Great — what item should we order?")
                 return ("", 200)
 
             if bid.startswith("order_quantity:"):
                 tid = int(bid.split(":", 1)[1])
-                with SessionLocal() as s:
-                    t = s.get(Task, tid)
-                    if t and "[await:item]" in (t.text or "").lower():
-                        # keep existing lines, move to quantity
-                        body = (t.text or "").split("]", 1)[-1].strip()
+                with S2() as s:
+                    t = s.get(T2, tid)
+                    if t:
+                        if "\n" in (t.text or ""):
+                            body = t.text.split("\n", 1)[1]
+                        else:
+                            body = t.text or ""
                         t.text = f"[await:quantity]\n{body}"
                         s.commit()
-                send_whatsapp_text(phone_id, sender, "What quantity do we need?")
+                send_whatsapp_text(phone_id, sender, "Okay — what quantity do we need?")
                 return ("", 200)
 
             if bid.startswith("order_supplier:"):
                 tid = int(bid.split(":", 1)[1])
-                with SessionLocal() as s:
-                    t = s.get(Task, tid)
+                with S2() as s:
+                    t = s.get(T2, tid)
                     if t:
-                        body = (t.text or "").split("]", 1)[-1].strip()
+                        if "\n" in (t.text or ""):
+                            body = t.text.split("\n", 1)[1]
+                        else:
+                            body = t.text or ""
                         t.text = f"[await:supplier]\n{body}"
                         s.commit()
-                send_whatsapp_text(phone_id, sender, "Who should we source this from?")
+                send_whatsapp_text(phone_id, sender, "Got it — who should we source this from?")
                 return ("", 200)
 
             if bid.startswith("order_delivery_date:"):
                 tid = int(bid.split(":", 1)[1])
-                with SessionLocal() as s:
-                    t = s.get(Task, tid)
+                with S2() as s:
+                    t = s.get(T2, tid)
                     if t:
-                        body = (t.text or "").split("]", 1)[-1].strip()
+                        if "\n" in (t.text or ""):
+                            body = t.text.split("\n", 1)[1]
+                        else:
+                            body = t.text or ""
                         t.text = f"[await:delivery_date]\n{body}"
                         s.commit()
                 send_whatsapp_text(phone_id, sender, "When must this be delivered?")
@@ -361,16 +628,21 @@ def webhook():
 
             if bid.startswith("order_drop_location:"):
                 tid = int(bid.split(":", 1)[1])
-                with SessionLocal() as s:
-                    t = s.get(Task, tid)
+                with S2() as s:
+                    t = s.get(T2, tid)
                     if t:
-                        body = (t.text or "").split("]", 1)[-1].strip()
+                        if "\n" in (t.text or ""):
+                            body = t.text.split("\n", 1)[1]
+                        else:
+                            body = t.text or ""
                         t.text = f"[await:drop_location]\n{body}"
                         s.commit()
                 send_whatsapp_text(phone_id, sender, "Where should this be dropped on site?")
                 return ("", 200)
 
-        # === MEDIA & TEXT =====================================================
+        # -------------------------
+        # BASIC MESSAGE PAYLOAD
+        # -------------------------
         if mtype == "text":
             text = (m.get("text") or {}).get("body")
 
@@ -383,353 +655,371 @@ def webhook():
             attachment = {"url": url, "mime": mime, "name": name}
             text = meta.get("caption")
 
-        if not text and not attachment:
-            continue
-
-        # =====================================================================
-        # 1) AWAIT FOLLOW-UP CAPTURE (ORDERS) — ALWAYS FIRST
-        #    (So "10 bags of cement" goes into the order, NOT into stock.)
-        # =====================================================================
-        if text:
-            lower_txt = text.lower().strip()
-
-            # do NOT treat these as await replies
-            if not any(w in lower_txt for w in (
-                "approve", "reject",
-                "change the order", "change that order",
-                "change order", "change it", "change it to"
-            )):
-                with SessionLocal() as s:
-                    awaiting = (
-                        s.query(Task)
-                        .filter(
-                            Task.sender == sender,
-                            Task.status == "open",
-                            Task.tag == "order",
-                            Task.text.like("[await:%]%")
-                        )
-                        .order_by(Task.id.desc())
-                        .first()
+        # -------------------------
+        # AWAIT CHAINS (ORDERS + STOCK)
+        # -------------------------
+        if text and not any(w in text.lower() for w in (
+            "approve",
+            "reject",
+            "change the order",
+            "change that order",
+            "change order",
+            "change it",
+            "change it to",
+        )):
+            with DBSession() as s:
+                awaiting = (
+                    s.query(Task)
+                    .filter(
+                        Task.sender == sender,
+                        Task.status == "open",
+                        Task.text.ilike("[await:%]%"),
                     )
+                    .order_by(Task.id.desc())
+                    .first()
+                )
 
-                    if awaiting:
-                        raw_txt = text.strip()
-                        await_lower = (awaiting.text or "").lower()
+                if awaiting:
+                    raw_txt = text.strip()
+                    await_lower = (awaiting.text or "").lower()
 
-                        # parse existing fields
-                        body = (awaiting.text or "").split("]", 1)[-1].strip()
-                        lines = [l.strip() for l in body.splitlines() if l.strip()]
+                    # ---- Order: item ----
+                    if await_lower.startswith("[await:item]"):
+                        awaiting.text = (
+                            "[await:quantity]\n"
+                            f"Item: {raw_txt}"
+                        )
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Quantity?")
+                        return ("", 200)
+
+                    # ---- Order: quantity ----
+                    if await_lower.startswith("[await:quantity]"):
+                        body = (
+                            awaiting.text.split("\n", 1)[1]
+                            if "\n" in (awaiting.text or "")
+                            else ""
+                        )
+                        awaiting.text = (
+                            "[await:supplier]\n"
+                            f"{body}\n"
+                            f"Quantity: {raw_txt}"
+                        ).strip()
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Supplier?")
+                        return ("", 200)
+
+                    # ---- Order: supplier ----
+                    if await_lower.startswith("[await:supplier]"):
+                        lines = [
+                            l.strip()
+                            for l in awaiting.text.splitlines()
+                            if not l.lower().startswith("[await:")
+                        ]
                         fields = {}
                         for l in lines:
                             if ":" in l:
                                 k, v = l.split(":", 1)
                                 fields[k.strip()] = v.strip()
+                        item = fields.get("Item", "")
+                        qty = fields.get("Quantity", "")
+                        awaiting.text = (
+                            "[await:delivery_date]\n"
+                            f"Item: {item}\n"
+                            f"Quantity: {qty}\n"
+                            f"Supplier: {raw_txt}"
+                        )
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Delivery date?")
+                        return ("", 200)
 
-                        item     = fields.get("Item", "")
-                        qty      = fields.get("Quantity", "")
+                    # ---- Order: delivery date ----
+                    if await_lower.startswith("[await:delivery_date]"):
+                        lines = [
+                            l.strip()
+                            for l in awaiting.text.splitlines()
+                            if not l.lower().startswith("[await:")
+                        ]
+                        fields = {}
+                        for l in lines:
+                            if ":" in l:
+                                k, v = l.split(":", 1)
+                                fields[k.strip()] = v.strip()
+                        item = fields.get("Item", "")
+                        qty = fields.get("Quantity", "")
                         supplier = fields.get("Supplier", "")
-                        ddate    = fields.get("Delivery Date", "")
-                        drop_loc = fields.get("Drop Location", "")
+                        awaiting.text = (
+                            "[await:drop_location]\n"
+                            f"Item: {item}\n"
+                            f"Quantity: {qty}\n"
+                            f"Supplier: {supplier}\n"
+                            f"Delivery Date: {raw_txt}"
+                        )
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "Drop location on site?")
+                        return ("", 200)
 
-                        # --- ITEM ------------------------------------------------
-                        if await_lower.startswith("[await:item]"):
-                            awaiting.text = (
-                                "[await:quantity]\n"
-                                f"Item: {raw_txt}"
-                            )
-                            s.commit()
-                            send_whatsapp_text(phone_id, sender, "Quantity?")
-                            return ("", 200)
+                    # ---- Order: drop location (finalise) ----
+                    if await_lower.startswith("[await:drop_location]"):
+                        lines = [
+                            l.strip()
+                            for l in awaiting.text.splitlines()
+                            if not l.lower().startswith("[await:")
+                        ]
+                        fields = {}
+                        for l in lines:
+                            if ":" in l:
+                                k, v = l.split(":", 1)
+                                fields[k.strip()] = v.strip()
+                        item = fields.get("Item", "")
+                        qty = fields.get("Quantity", "")
+                        supplier = fields.get("Supplier", "")
+                        ddate = fields.get("Delivery Date", "")
+                        awaiting.text = (
+                            f"Item: {item}\n"
+                            f"Quantity: {qty}\n"
+                            f"Supplier: {supplier}\n"
+                            f"Delivery Date: {ddate}\n"
+                            f"Drop Location: {raw_txt}"
+                        )
+                        awaiting.status = "pending_approval"
+                        awaiting.last_updated = dt.datetime.utcnow()
+                        s.commit()
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            "✅ Order details captured. Awaiting PM approval.",
+                        )
+                        return ("", 200)
 
-                        # --- QUANTITY --------------------------------------------
-                        if await_lower.startswith("[await:quantity]"):
-                            awaiting.text = (
-                                "[await:supplier]\n"
-                                f"Item: {item}\n"
-                                f"Quantity: {raw_txt}"
-                            )
-                            s.commit()
-                            send_whatsapp_text(phone_id, sender, "Supplier?")
-                            return ("", 200)
+                    # ---- Stock: unit follow-up ----
+                    if await_lower.startswith("[await:stock_unit]"):
+                        meta_str = awaiting.text.split("\n", 1)[0].split(" ", 1)[-1]
+                        meta = {}
+                        for chunk in meta_str.split(";"):
+                            if "=" in chunk:
+                                k, v = chunk.split("=", 1)
+                                meta[k.strip()] = v.strip()
+                        kind = meta.get("kind", "add")
+                        qty = meta.get("qty")
+                        material = meta.get("material", "stock item")
+                        try:
+                            qty_val = int(qty) if qty is not None else None
+                        except Exception:
+                            qty_val = None
 
-                        # --- SUPPLIER --------------------------------------------
-                        if await_lower.startswith("[await:supplier]"):
-                            awaiting.text = (
-                                "[await:delivery_date]\n"
-                                f"Item: {item}\n"
-                                f"Quantity: {qty}\n"
-                                f"Supplier: {raw_txt}"
-                            )
-                            s.commit()
-                            send_whatsapp_text(phone_id, sender, "Delivery date?")
-                            return ("", 200)
-
-                        # --- DELIVERY DATE ---------------------------------------
-                        if await_lower.startswith("[await:delivery_date]"):
-                            awaiting.text = (
-                                "[await:drop_location]\n"
-                                f"Item: {item}\n"
-                                f"Quantity: {qty}\n"
-                                f"Supplier: {supplier}\n"
-                                f"Delivery Date: {raw_txt}"
-                            )
-                            s.commit()
-                            send_whatsapp_text(phone_id, sender, "Drop location on site?")
-                            return ("", 200)
-
-                        # --- DROP LOCATION → FINALISE ----------------------------
-                        if await_lower.startswith("[await:drop_location]"):
-                            awaiting.text = (
-                                f"Item: {item}\n"
-                                f"Quantity: {qty}\n"
-                                f"Supplier: {supplier}\n"
-                                f"Delivery Date: {ddate}\n"
-                                f"Drop Location: {raw_txt}"
-                            )
-                            awaiting.status = "pending_approval"
+                        unit = raw_txt.strip().lower()
+                        if not qty_val:
+                            # Cannot safely adjust stock; just log the note
+                            awaiting.text = f"STOCK NOTE: {kind} {unit} {material} (qty missing)"
+                            awaiting.status = "done"
                             awaiting.last_updated = dt.datetime.utcnow()
                             s.commit()
-                            send_whatsapp_text(phone_id, sender, "✅ Order details captured. Awaiting PM approval.")
+                            send_whatsapp_text(
+                                phone_id,
+                                sender,
+                                "Noted, but quantity was missing so stock was not adjusted.",
+                            )
                             return ("", 200)
 
-        # =====================================================================
-        # 2) STOCK & COLLOQUIAL SHORTCUT COMMANDS
-        #    (Explicit stock cues only — no accidental stock writes.)
-        # =====================================================================
-        if text:
-            raw_txt = (text or "").strip()
-            lower = raw_txt.lower()
-
-            # use storage_v6_1 stock helpers already imported at top
-            # 2.1 STRUCTURED "stock ..." COMMANDS
-            if lower.startswith("stock "):
-                parts = raw_txt.split()
-                if len(parts) >= 2:
-                    cmd = parts[1].lower()
-
-                    # "stock item cement"
-                    if cmd == "item" and len(parts) >= 3:
-                        name = " ".join(parts[2:]).strip()
-                        create_stock_item({"name": name})
-                        # optional trace task
-                        create_task(
-                            sender=sender,
-                            text=f"[stock:item] {name}",
-                            tag="stock",
-                            project_code=None,
-                            subcontractor_name=None,
-                            order_state=None,
-                            attachment=None,
-                            subtype="assigned",
+                        delta = qty_val if kind == "add" else -qty_val
+                        payload = {
+                            "material": material,
+                            "unit": unit,
+                            "delta": delta,
+                            "actor": sender,
+                            "source": "whatsapp",
+                        }
+                        adjust_stock(payload)
+                        awaiting.text = f"STOCK {kind}: {qty_val} {unit} {material}"
+                        awaiting.status = "done"
+                        awaiting.last_updated = dt.datetime.utcnow()
+                        s.commit()
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            f"Stock updated: {delta:+} {unit} of {material}.",
                         )
-                        send_whatsapp_text(phone_id, sender, f"✅ Stock item saved: {name}")
                         return ("", 200)
 
-                    # "stock +10 bags of cement" / "stock -3 pallets of bricks"
-                    if (cmd.startswith("+") or cmd.startswith("-")) and len(parts) >= 3:
+                    # ---- New stock item: unit ----
+                    if await_lower.startswith("[await:new_stock_unit]"):
+                        material = (
+                            awaiting.text.split("material=", 1)[1].strip()
+                            if "material=" in (awaiting.text or "")
+                            else "stock item"
+                        )
+                        unit = raw_txt.strip().lower()
+                        awaiting.text = f"[await:new_stock_qty] material={material};unit={unit}"
+                        s.commit()
+                        send_whatsapp_text(phone_id, sender, "What opening quantity?")
+                        return ("", 200)
+
+                    # ---- New stock item: opening quantity ----
+                    if await_lower.startswith("[await:new_stock_qty]"):
+                        meta_str = awaiting.text.split(" ", 1)[-1]
+                        meta = {}
+                        for chunk in meta_str.split(";"):
+                            if "=" in chunk:
+                                k, v = chunk.split("=", 1)
+                                meta[k.strip()] = v.strip()
+                        material = meta.get("material", "stock item")
+                        unit = meta.get("unit", "units")
                         try:
-                            delta = float(cmd)
-                        except ValueError:
-                            send_whatsapp_text(phone_id, sender, "⚠️ Couldn't read stock change amount.")
-                            return ("", 200)
-
-                        name = " ".join(parts[2:]).strip()
-                        res = adjust_stock({"name": name, "delta": delta})
-                        current = res.get("current_qty")
-                        if res.get("status") == "ok":
-                            create_task(
-                                sender=sender,
-                                text=f"[stock:adjust] {delta:+g} {name}",
-                                tag="stock",
-                                project_code=None,
-                                subcontractor_name=None,
-                                order_state=None,
-                                attachment=None,
-                                subtype="assigned",
-                            )
+                            qty_val = int(raw_txt.strip())
+                        except Exception:
                             send_whatsapp_text(
                                 phone_id,
                                 sender,
-                                f"✅ Stock updated: {name} now {current} on hand."
+                                "Please send a whole number for the opening quantity.",
                             )
-                        else:
-                            send_whatsapp_text(
-                                phone_id,
-                                sender,
-                                f"⚠️ Stock error: {res.get('message')}"
-                            )
-                        return ("", 200)
-
-                    # "stock report"
-                    if cmd == "report":
-                        report = get_stock_report()
-                        items = report.get("items") or []
-                        if not items:
-                            send_whatsapp_text(phone_id, sender, "ℹ️ No stock recorded yet.")
                             return ("", 200)
-
-                        lines = ["📦 Stock report (top 10):"]
-                        for it in items[:10]:
-                            name = it.get("name") or "?"
-                            qty = it.get("current_qty") or 0
-                            unit = it.get("unit") or ""
-                            lines.append(f"- {name}: {qty} {unit}".strip())
-                        send_whatsapp_text(phone_id, sender, "\n".join(lines))
+                        payload = {
+                            "material": material,
+                            "unit": unit,
+                            "opening_qty": qty_val,
+                            "actor": sender,
+                            "source": "whatsapp",
+                        }
+                        create_stock_item(payload)
+                        awaiting.text = (
+                            f"NEW STOCK ITEM: {material} ({qty_val} {unit})"
+                        )
+                        awaiting.status = "done"
+                        awaiting.last_updated = dt.datetime.utcnow()
+                        s.commit()
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            f"New stock item created: {material} ({qty_val} {unit}).",
+                        )
                         return ("", 200)
 
-                # fall through if malformed, let normal flow handle it
+        # -------------------------
+        # SEARCH COMMANDS
+        # -------------------------
+        if text and is_search_request(text):
+            run_search(sender, text)
+            return ("", 200)
 
-            # 2.2 EXPLICIT COLLOQUIAL STOCK WITH "STOCK/INVENTORY" CUES
-            # e.g. "add to stock 10 bags of cement"
-            import re
-
-            m_add = re.match(r"^(add|put|receive)\s+(?:into\s+|to\s+)?(stock|inventory)\s+(\d+(?:\.\d+)?)\s+(.+)$", lower)
-            if m_add:
-                qty = float(m_add.group(3))
-                name = raw_txt.split(m_add.group(3), 1)[-1].strip()
-                adjust_stock({"name": name, "delta": qty})
-                create_stock_item({"name": name})
-                create_task(
-                    sender=sender,
-                    text=f"[stock:in] +{qty:g} {name}",
-                    tag="stock",
-                    project_code=None,
-                    subcontractor_name=None,
-                    order_state=None,
-                    attachment=None,
-                    subtype="assigned",
-                )
-                send_whatsapp_text(phone_id, sender, f"Stock updated: {name} (+{qty:g})")
-                return ("", 200)
-
-            # e.g. "take from stock 3 bags of cement", "deduct from inventory ..."
-            m_take = re.match(r"^(take|remove|deduct)\s+from\s+(stock|inventory)\s+(\d+(?:\.\d+)?)\s+(.+)$", lower)
-            if m_take:
-                qty = float(m_take.group(3))
-                name = raw_txt.split(m_take.group(3), 1)[-1].strip()
-                adjust_stock({"name": name, "delta": -qty})
-                create_task(
-                    sender=sender,
-                    text=f"[stock:out] -{qty:g} {name}",
-                    tag="stock",
-                    project_code=None,
-                    subcontractor_name=None,
-                    order_state=None,
-                    attachment=None,
-                    subtype="assigned",
-                )
-                send_whatsapp_text(phone_id, sender, f"Stock updated: {name} (-{qty:g})")
-                return ("", 200)
-
-            # 2.3 READ-ONLY STOCK QUERIES (SAFE)
-            # "how much cement left?" OR "how much cement in stock?"
-            m_left = (
-                re.match(r"^how much (.+?) (?:left|in stock)\??$", lower)
-                or re.match(r"^how much (.+?)\??$", lower)
-                or re.match(r"^(.+?) left in stock\??$", lower)
+        # -------------------------
+        # NEW STOCK ITEM FLOW
+        # -------------------------
+        if text and is_new_stock_item_request(text):
+            material = parse_new_stock_item(text)
+            create_task(
+                sender=sender,
+                text=f"[await:new_stock_unit] material={material}",
+                tag="stock",
+                project_code=None,
+                subcontractor_name=None,
+                order_state=None,
+                attachment=None,
+                subtype="assigned",
             )
-            if m_left:
-                name_query = m_left.group(1).strip()
-                report = get_stock_report()
-                items = report.get("items") or []
-                hit = next(
-                    (i for i in items if (i.get("name") or "").lower() == name_query.lower()),
-                    None
-                )
-                if not hit:
-                    send_whatsapp_text(phone_id, sender, f"No stock record for '{name_query}'.")
-                    return ("", 200)
+            send_whatsapp_text(
+                phone_id,
+                sender,
+                f"Adding new stock item '{material}'. What unit? "
+                f"(e.g. bags, pallets, drums, crates, other)",
+            )
+            return ("", 200)
 
-                qty = hit.get("current_qty") or 0
-                unit = hit.get("unit") or ""
+        # -------------------------
+        # DIRECT STOCK COMMANDS
+        # -------------------------
+        if text:
+            stock_cmd = parse_stock_command(text)
+        else:
+            stock_cmd = None
+
+        if stock_cmd:
+            if stock_cmd.get("needs_prompt") or not stock_cmd.get("unit"):
+                meta = (
+                    f"kind={stock_cmd['kind']};"
+                    f"qty={stock_cmd.get('qty')};"
+                    f"material={stock_cmd['material']}"
+                )
+                create_task(
+                    sender=sender,
+                    text=f"[await:stock_unit] {meta}",
+                    tag="stock",
+                    project_code=None,
+                    subcontractor_name=None,
+                    order_state=None,
+                    attachment=None,
+                    subtype="assigned",
+                )
                 send_whatsapp_text(
                     phone_id,
                     sender,
-                    f"{hit.get('name')}: {qty} {unit}".strip()
+                    "Which unit? Bags / pallets / drums / buckets / crates / other",
+                )
+                return ("", 200)
+            else:
+                qty_val = stock_cmd.get("qty") or 0
+                try:
+                    qty_val = int(qty_val)
+                except Exception:
+                    qty_val = 0
+                delta = qty_val if stock_cmd["kind"] == "add" else -qty_val
+                payload = {
+                    "material": stock_cmd["material"],
+                    "unit": stock_cmd["unit"],
+                    "delta": delta,
+                    "actor": sender,
+                    "source": "whatsapp",
+                }
+                adjust_stock(payload)
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"Stock updated: {delta:+} {stock_cmd['unit']} of {stock_cmd['material']}.",
                 )
                 return ("", 200)
 
-            # 2.4 CALL REMINDERS — COLLOQUIAL
-            m_call = re.match(r"^remind me to call (.+)$", lower)
-            if m_call:
-                target = m_call.group(1).strip()
-                create_call_reminder(sender, raw_txt, target)
-                send_whatsapp_text(phone_id, sender, f"I'll remind you to call {target}.")
-                return ("", 200)
-
-            # 2.5 CHANGE ORDER SEARCH SHORTCUT
-            if lower in ("get all change orders", "show change orders", "change orders"):
-                changes = get_all_change_orders() or []
-                if not changes:
-                    send_whatsapp_text(phone_id, sender, "No change orders recorded yet.")
-                    return ("", 200)
-
-                lines = ["Change orders:"]
-                for c in changes[:10]:
-                    cid = c.get("id")
-                    snippet = (c.get("text") or "")[:60]
-                    lines.append(f"- #{cid}: {snippet}")
-                send_whatsapp_text(phone_id, sender, "\n".join(lines))
-                return ("", 200)
-
-        # =====================================================================
-        # 3) CLASSIFICATION (TASK / ORDER / URGENT / CHANGE) + TASK CREATION
-        # =====================================================================
-
-        # bind sender globally for classifier patches
+        # -------------------------
+        # FALLBACK: CLASSIFIER → TASK/ORDER
+        # -------------------------
         global SENDER_GLOBAL
         SENDER_GLOBAL = sender
-
         cls = classify_message(text or "")
         tag = cls.get("tag")
         subtype = cls.get("subtype")
         order_state = cls.get("order_state")
 
-        # lookup sender identity (role / subcontractor / project)
-        from storage import get_user_role
-        user = get_user_role(sender) or {}
+        user_info = get_user_role(sender) or {}
+        project_code = user_info.get("project_code") or None
+        subcontractor_name = user_info.get("subcontractor_name") or None
 
-        # PM routing lookup (project-based)
-        from storage import get_pms_for_project
-        pms = []
-        proj = user.get("project_code") or None
-        if proj:
-            pms = get_pms_for_project(proj) or []
-
-        # create task (always)
         row = create_task(
             sender=sender,
             text=text or "",
             tag=tag,
-            project_code=user.get("project_code") or None,
-            subcontractor_name=user.get("subcontractor_name") or None,
+            project_code=project_code,
+            subcontractor_name=subcontractor_name,
             order_state=order_state,
             attachment=attachment,
-            subtype=subtype
+            subtype=subtype,
         )
 
-        # routing context available (future digests / escalation)
-        # pms = [{"wa_id","name","role","primary"}, ...]
+        # Orders: button checklist or await-chain text fallback
+        if tag == "order":
+            if os.environ.get("ENABLE_BUTTONS") == "1":
+                try:
+                    send_order_checklist(phone_id, sender, row["id"])
+                except Exception:
+                    pass
+                return ("", 200)
+            else:
+                with DBSession() as s:
+                    t = s.get(Task, row["id"])
+                    if t and not (t.text or "").lower().startswith("[await:item]"):
+                        t.text = f"[await:item]\n{t.text}"
+                        s.commit()
+                send_whatsapp_text(phone_id, sender, "Item?")
+                return ("", 200)
 
-        # === ORDER CHECKLIST BUTTONS (PROD) ===================================
-        if tag == "order" and os.environ.get("ENABLE_BUTTONS") == "1":
-            try:
-                send_order_checklist(phone_id, sender, row["id"])
-            except Exception:
-                pass
-            return ("", 200)
-
-        # === SANDBOX ORDER FALLBACK (NO BUTTONS) ==============================
-        if tag == "order" and "[await:" not in (text or "").lower():
-            with SessionLocal() as s:
-                t = s.get(Task, row["id"])
-                if t and not (t.text or "").lower().startswith("[await:item]"):
-                    t.text = f"[await:item]\n{t.text}"
-                    s.commit()
-            send_whatsapp_text(phone_id, sender, "Item?")
-            return ("", 200)
-
-    # --- FALLBACK RETURN (ensures webhook always returns 200) ---
     return ("", 200)
 
 # ---------------------------------------------------------------------
