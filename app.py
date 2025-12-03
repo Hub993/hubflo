@@ -734,90 +734,144 @@ def _stock_auto_process_on_approval(tid: int, actor: str | None):
         except Exception:
             pass
 
-# === COLLOQUIAL COMMANDS — V6.1 UNIFIED ===============================
+        # >>> PATCH_COLLOQUIAL_V6_1_UNIFIED_START <<<
+        if text:
+            raw_text = (text or "").strip()
+            txt = raw_text.lower()
 
-txt = (text or "").strip().lower()
+            # ---------------------------------------------
+            # COLLOQUIAL STOCK (no "stock " prefix)
+            # Examples:
+            #   "add 10 cement"
+            #   "receive 20 bricks"
+            #   "use 3 cement"
+            #   "cement +10"
+            #   "cement -3"
+            #   "how much cement?"
+            #   "cement left?"
+            # ---------------------------------------------
+            import re
+            from storage_v6_1 import adjust_stock, get_stock_report, create_call_reminder, get_all_change_orders
 
-# --- STOCK: ADD / CONSUME -------------------------------------------------
-# patterns:
-#   "add 10 cement"
-#   "cement +10"
-#   "use 3 cement" / "cement -3"
-#   "receive 20 bricks"
-#   "add stock cement"
-import re
+            # 1) "add 10 cement" / "receive 20 bricks"
+            m_add = re.match(r"^(add|receive)\s+(\d+(?:\.\d+)?)\s+(.+)$", txt)
+            if m_add:
+                qty = float(m_add.group(2))
+                name = m_add.group(3).strip()
+                adjust_stock({"name": name, "delta": qty})
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"✅ Stock updated: {name} (+{qty})"
+                )
+                return ("", 200)
 
-stock_add = re.match(r"^(add|receive)\s+(\d+)\s+(.+)$", txt)
-stock_plus = re.match(r"^(.+?)\s*\+\s*(\d+)$", txt)
-stock_minus = re.match(r"^(.+?)\s*-\s*(\d+)$", txt)
-stock_use = re.match(r"^(use)\s+(\d+)\s+(.+)$", txt)
+            # 2) "use 3 cement"
+            m_use = re.match(r"^use\s+(\d+(?:\.\d+)?)\s+(.+)$", txt)
+            if m_use:
+                qty = float(m_use.group(1))
+                name = m_use.group(2).strip()
+                adjust_stock({"name": name, "delta": -qty})
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"✅ Stock updated: {name} (-{qty})"
+                )
+                return ("", 200)
 
-if stock_add:
-    qty = float(stock_add.group(2))
-    name = stock_add.group(3).strip()
-    adjust_stock({"name": name, "delta": qty})
-    return ("", 200)
+            # 3) "cement +10" / "cement -3"
+            m_plus = re.match(r"^(.+?)\s*\+\s*(\d+(?:\.\d+)?)$", txt)
+            m_minus = re.match(r"^(.+?)\s*-\s*(\d+(?:\.\d+)?)$", txt)
 
-if stock_plus:
-    name = stock_plus.group(1).strip()
-    qty = float(stock_plus.group(2))
-    adjust_stock({"name": name, "delta": qty})
-    return ("", 200)
+            if m_plus:
+                name = m_plus.group(1).strip()
+                qty = float(m_plus.group(2))
+                adjust_stock({"name": name, "delta": qty})
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"✅ Stock updated: {name} (+{qty})"
+                )
+                return ("", 200)
 
-if stock_minus:
-    name = stock_minus.group(1).strip()
-    qty = float(stock_minus.group(2))
-    adjust_stock({"name": name, "delta": -qty})
-    return ("", 200)
+            if m_minus:
+                name = m_minus.group(1).strip()
+                qty = float(m_minus.group(2))
+                adjust_stock({"name": name, "delta": -qty})
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"✅ Stock updated: {name} (-{qty})"
+                )
+                return ("", 200)
 
-if stock_use:
-    qty = float(stock_use.group(2))
-    name = stock_use.group(3).strip()
-    adjust_stock({"name": name, "delta": -qty})
-    return ("", 200)
+            # 4) "how much cement?" / "cement left?"
+            m_left = (
+                re.match(r"^how much (.+)\??$", txt)
+                or re.match(r"^(.+?) left\??$", txt)
+            )
+            if m_left:
+                name = m_left.group(1).strip()
+                rep = get_stock_report()
+                items = rep.get("items") or []
+                hit = next((i for i in items if (i.get("name") or "").lower() == name.lower()), None)
+                if not hit:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        f"ℹ️ No stock record found for '{name}'."
+                    )
+                    return ("", 200)
+                qty = hit.get("current_qty") or 0
+                unit = hit.get("unit") or ""
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"📦 {hit.get('name')}: {qty} {unit}".strip()
+                )
+                return ("", 200)
 
-# --- STOCK REPORT ----------------------------------------------------------
-# patterns:
-#   "stock report"
-#   "cement left?"
-#   "how much cement?"
+            # ---------------------------------------------
+            # CALL REMINDER (colloquial)
+            # "remind me to call john tomorrow at 3"
+            # ---------------------------------------------
+            m_call = re.match(r"^remind me to call (.+)$", txt)
+            if m_call:
+                target = m_call.group(1).strip()
+                create_call_reminder(sender, raw_text, target)
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"⏰ I'll remind you to call {target}."
+                )
+                return ("", 200)
 
-if txt == "stock report":
-    rep = get_stock_report()
-    return (json.dumps(rep), 200)
+            # ---------------------------------------------
+            # CHANGE ORDER SEARCH (simple global list)
+            # "get all change orders" / "show change orders" / "change orders"
+            # ---------------------------------------------
+            if txt in ("get all change orders", "show change orders", "change orders"):
+                changes = get_all_change_orders() or []
+                if not changes:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "ℹ️ No change orders recorded yet."
+                    )
+                    return ("", 200)
 
-left = re.match(r"^how much (.+)\??$", txt) or \
-       re.match(r"^(.+?) left\??$", txt)
-
-if left:
-    name = left.group(1).strip()
-    rep = get_stock_report()
-    out = [i for i in rep["items"] if i["name"] == name]
-    return (json.dumps(out[0] if out else {}), 200)
-
-# --- CALL REMINDER ---------------------------------------------------------
-# patterns:
-#   "remind me to call john"
-#   "remind me to call john tomorrow"
-#   "remind me to call dave at 3"
-
-m = re.match(r"^remind me to call (.+)$", txt)
-if m:
-    target = m.group(1).strip()
-    create_call_reminder(sender, text, target)
-    return ("", 200)
-
-# --- CHANGE ORDER SEARCH ---------------------------------------------------
-# patterns:
-#   "get all change orders"
-#   "show change orders"
-#   "change orders"
-
-if txt in ("get all change orders", "show change orders", "change orders"):
-    out = get_all_change_orders()
-    return (json.dumps(out), 200)
-
-# --------------------------------------------------------------------------
+                lines = ["📑 Change orders (top 10):"]
+                for c in changes[:10]:
+                    cid = c.get("id")
+                    text_snip = (c.get("text") or "")[:60]
+                    lines.append(f"- #{cid}: {text_snip}")
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    "\n".join(lines)
+                )
+                return ("", 200)
+        # >>> PATCH_COLLOQUIAL_V6_1_UNIFIED_END <<<
 
         # === CLASSIFICATION (V6.1 unified) =====================================
 
