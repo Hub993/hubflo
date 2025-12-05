@@ -492,42 +492,45 @@ def webhook():
     # -------------------------
     # STOCK HANDLING
     # -------------------------
-    def is_new_stock_item_request(text: str) -> bool:
-        t = (text or "").lower()
-        return "add new stock item" in t
-
-    def parse_new_stock_item(text: str) -> str:
-        t = (text or "").lower()
-        if ":" in t:
-            return t.split("add new stock item", 1)[1].split(":", 1)[1].strip()
-        return t.split("add new stock item", 1)[1].strip()
-
     def parse_stock_command(text: str):
+        """
+        Robust parser for direct stock adjustment commands.
+        Handles:
+          - "use 10 lengths of 40mm pvc pipe from stock"
+          - "add 5 bags of cement to stock"
+          - multi-word materials
+          - optional 'of' after unit
+        """
         t = (text or "").lower()
+
         if "stock" not in t:
             return None
 
-        verbs_add = ["add", "added", "received", "put", "delivered", "stocked"]
+        verbs_add = ["add", "added", "receive", "received", "put", "delivered", "stocked"]
         verbs_remove = ["take", "took", "use", "used", "deduct", "remove", "issue", "pull"]
+
         kind = None
         for v in verbs_add:
-            if f"{v} " in t:
+            if t.startswith(v + " ") or f"{v} " in t:
                 kind = "add"
                 break
         if not kind:
             for v in verbs_remove:
-                if f"{v} " in t:
+                if t.startswith(v + " ") or f"{v} " in t:
                     kind = "remove"
                     break
         if not kind:
             return None
 
+        # Match:
+        #   <qty> <unit> of <material> from|to stock
+        #   <qty> <unit> <material> from|to stock
         m = re.search(
-            r"(\d+)\s+(\w+)?\s*(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
-            t,
+            r"(\d+)\s+([a-zA-Z]+)\s+(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
+            t
         )
         if not m:
-            # We know it's a stock op but unit/qty are unclear
+            # insufficient structure → fall back to await:stock_unit
             return {
                 "kind": kind,
                 "material": t,
@@ -537,20 +540,15 @@ def webhook():
             }
 
         qty = int(m.group(1))
-        unit = m.group(2)
+        unit = m.group(2).strip().lower()
         material = m.group(3).strip()
-
-        needs_prompt = False
-        if not unit or unit.lower() in ("of", "to", "into", "from", "out"):
-            unit = None
-            needs_prompt = True
 
         return {
             "kind": kind,
             "material": material,
             "qty": qty,
             "unit": unit,
-            "needs_prompt": needs_prompt,
+            "needs_prompt": False,
         }
 
     from storage_v6_1 import create_task
