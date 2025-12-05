@@ -492,6 +492,7 @@ def webhook():
     # -------------------------
     # STOCK HANDLING
     # -------------------------
+
     def is_new_stock_item_request(text: str) -> bool:
         t = (text or "").lower()
         return (
@@ -518,12 +519,19 @@ def webhook():
 
     def parse_stock_command(text: str):
         """
-        Robust parser for direct stock adjustment commands.
-        Handles:
-          - "use 10 lengths of 40mm pvc pipe from stock"
+        Unified parser for all direct stock adjustments.
+        Handles natural-language patterns used by PMs/subs:
           - "add 5 bags of cement to stock"
-          - multi-word materials
-          - optional 'of' after unit
+          - "add 12 of river sand to stock"
+          - "remove buckets of primer from stock"
+        Returns:
+          {
+            "kind": "add"|"remove",
+            "qty": int|None,
+            "unit": str|None,
+            "material": str,
+            "needs_prompt": bool
+          }
         """
         t = (text or "").lower()
 
@@ -546,33 +554,63 @@ def webhook():
         if not kind:
             return None
 
-        # Match:
-        #   <qty> <unit> of <material> from|to stock
-        #   <qty> <unit> <material> from|to stock
+        import re
+
+        # Pattern #1 — full structure: qty + unit + material
         m = re.search(
             r"(\d+)\s+([a-zA-Z]+)\s+(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
             t
         )
-        if not m:
-            # insufficient structure → fall back to await:stock_unit
+        if m:
+            qty = int(m.group(1))
+            unit = m.group(2).strip().lower()
+            material = m.group(3).strip()
             return {
                 "kind": kind,
-                "material": t,
-                "qty": None,
+                "qty": qty,
+                "unit": unit,
+                "material": material,
+                "needs_prompt": False,
+            }
+
+        # Pattern #2 — has qty but missing unit
+        m2 = re.search(
+            r"(\d+)\s+(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
+            t
+        )
+        if m2:
+            qty = int(m2.group(1))
+            material = m2.group(2).strip()
+            return {
+                "kind": kind,
+                "qty": qty,
                 "unit": None,
+                "material": material,
                 "needs_prompt": True,
             }
 
-        qty = int(m.group(1))
-        unit = m.group(2).strip().lower()
-        material = m.group(3).strip()
+        # Pattern #3 — remove/add WITHOUT qty → prompt for qty + unit
+        m3 = re.search(
+            r"(?:add|remove|use|take|issue|pull|deduct)\s+(.+?)\s+(?:to|into|from|out of)\s+stock",
+            t
+        )
+        if m3:
+            material = m3.group(1).strip()
+            return {
+                "kind": kind,
+                "qty": None,
+                "unit": None,
+                "material": material,
+                "needs_prompt": True,
+            }
 
+        # Fallback — cannot extract structure → always prompt
         return {
             "kind": kind,
-            "material": material,
-            "qty": qty,
-            "unit": unit,
-            "needs_prompt": False,
+            "qty": None,
+            "unit": None,
+            "material": t,
+            "needs_prompt": True,
         }
 
     from storage_v6_1 import create_task
