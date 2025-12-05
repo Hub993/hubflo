@@ -492,6 +492,30 @@ def webhook():
     # -------------------------
     # STOCK HANDLING
     # -------------------------
+    def is_new_stock_item_request(text: str) -> bool:
+        t = (text or "").lower()
+        return (
+            "new stock item" in t
+            or "add new stock item" in t
+            or t.startswith("new stock")
+        )
+
+    def parse_new_stock_item(text: str) -> str:
+        """
+        Extract the material name from commands like:
+        - "add new stock item: 40mm pvc pipe"
+        - "new stock item 40mm pvc pipe"
+        """
+        t = (text or "").lower()
+        if ":" in t:
+            return t.split(":", 1)[1].strip()
+        parts = t.split()
+        try:
+            idx = parts.index("item")
+            return " ".join(parts[idx + 1 :]).strip()
+        except ValueError:
+            return t
+
     def parse_stock_command(text: str):
         """
         Robust parser for direct stock adjustment commands.
