@@ -734,6 +734,64 @@ def webhook():
             send_whatsapp_text(phone_id, sender, "Item?")
             return ("", 200)
 
+        # =========================================================
+        # HARD-PATCH: CLEAN ORDER-INTENT CREATION (FINAL ROOT FIX)
+        # Ensures:
+        #  1) every "get me / order / need / buy" creates NEW order
+        #  2) row begins cleanly: [await:item]\n<original message>
+        #  3) prevents contamination from previous await chains
+        #  4) guarantees correct chain (item → qty → supplier → date → drop)
+        # =========================================================
+
+        order_phrases = [
+            "get me",
+            "order ",
+            "please get",
+            "please order",
+            "we need",
+            "i need",
+            "need ",
+            "buy ",
+            "procure",
+            "purchase",
+            "bring ",
+            "deliver ",
+        ]
+
+        if any(p in t_lower for p in order_phrases):
+
+            # Kill any stale awaiting remnants
+            with DBSession() as s:
+                broken = (
+                    s.query(Task)
+                    .filter(
+                        Task.sender == sender,
+                        Task.status == "open",
+                        Task.text.ilike("[await:%]%"),
+                    )
+                    .all()
+                )
+                for b in broken:
+                    b.status = "done"
+                    b.last_updated = dt.datetime.utcnow()
+                s.commit()
+
+            safe_text = text.strip()
+
+            row = create_task(
+                sender=sender,
+                text=f"[await:item]\n{safe_text}",
+                tag="order",
+                project_code=project_code,
+                subcontractor_name=subcontractor_name,
+                order_state="requested",
+                attachment=attachment,
+                subtype="assigned",
+            )
+
+            send_whatsapp_text(phone_id, sender, "Item?")
+            return ("", 200)
+
         # -------------------------
         # AWAIT CHAINS (ORDERS + STOCK)
         # -------------------------
