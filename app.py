@@ -492,125 +492,65 @@ def webhook():
     # -------------------------
     # STOCK HANDLING
     # -------------------------
-
     def is_new_stock_item_request(text: str) -> bool:
         t = (text or "").lower()
-        return (
-            "new stock item" in t
-            or "add new stock item" in t
-            or t.startswith("new stock")
-        )
+        return "add new stock item" in t
 
     def parse_new_stock_item(text: str) -> str:
-        """
-        Extract the material name from commands like:
-        - "add new stock item: 40mm pvc pipe"
-        - "new stock item 40mm pvc pipe"
-        """
         t = (text or "").lower()
         if ":" in t:
-            return t.split(":", 1)[1].strip()
-        parts = t.split()
-        try:
-            idx = parts.index("item")
-            return " ".join(parts[idx + 1 :]).strip()
-        except ValueError:
-            return t
+            return t.split("add new stock item", 1)[1].split(":", 1)[1].strip()
+        return t.split("add new stock item", 1)[1].strip()
 
     def parse_stock_command(text: str):
-        """
-        Unified parser for all direct stock adjustments.
-        Handles natural-language patterns used by PMs/subs:
-          - "add 5 bags of cement to stock"
-          - "add 12 of river sand to stock"
-          - "remove buckets of primer from stock"
-        Returns:
-          {
-            "kind": "add"|"remove",
-            "qty": int|None,
-            "unit": str|None,
-            "material": str,
-            "needs_prompt": bool
-          }
-        """
         t = (text or "").lower()
-
         if "stock" not in t:
             return None
 
-        verbs_add = ["add", "added", "receive", "received", "put", "delivered", "stocked"]
+        verbs_add = ["add", "added", "received", "put", "delivered", "stocked"]
         verbs_remove = ["take", "took", "use", "used", "deduct", "remove", "issue", "pull"]
-
         kind = None
         for v in verbs_add:
-            if t.startswith(v + " ") or f"{v} " in t:
+            if f"{v} " in t:
                 kind = "add"
                 break
         if not kind:
             for v in verbs_remove:
-                if t.startswith(v + " ") or f"{v} " in t:
+                if f"{v} " in t:
                     kind = "remove"
                     break
         if not kind:
             return None
 
-        import re
-
-        # Pattern #1 — full structure: qty + unit + material
         m = re.search(
-            r"(\d+)\s+([a-zA-Z]+)\s+(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
-            t
+            r"(\d+)\s+(\w+)?\s*(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
+            t,
         )
-        if m:
-            qty = int(m.group(1))
-            unit = m.group(2).strip().lower()
-            material = m.group(3).strip()
+        if not m:
+            # We know it's a stock op but unit/qty are unclear
             return {
                 "kind": kind,
-                "qty": qty,
-                "unit": unit,
-                "material": material,
-                "needs_prompt": False,
-            }
-
-        # Pattern #2 — has qty but missing unit
-        m2 = re.search(
-            r"(\d+)\s+(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
-            t
-        )
-        if m2:
-            qty = int(m2.group(1))
-            material = m2.group(2).strip()
-            return {
-                "kind": kind,
-                "qty": qty,
-                "unit": None,
-                "material": material,
-                "needs_prompt": True,
-            }
-
-        # Pattern #3 — remove/add WITHOUT qty → prompt for qty + unit
-        m3 = re.search(
-            r"(?:add|remove|use|take|issue|pull|deduct)\s+(.+?)\s+(?:to|into|from|out of)\s+stock",
-            t
-        )
-        if m3:
-            material = m3.group(1).strip()
-            return {
-                "kind": kind,
+                "material": t,
                 "qty": None,
                 "unit": None,
-                "material": material,
                 "needs_prompt": True,
             }
 
-        # Fallback — cannot extract structure → always prompt
+        qty = int(m.group(1))
+        unit = m.group(2)
+        material = m.group(3).strip()
+
+        needs_prompt = False
+        if not unit or unit.lower() in ("of", "to", "into", "from", "out"):
+            unit = None
+            needs_prompt = True
+
         return {
             "kind": kind,
-            "qty": None,
-            "unit": None,
-            "material": t,
-            "needs_prompt": True,
+            "material": material,
+            "qty": qty,
+            "unit": unit,
+            "needs_prompt": needs_prompt,
         }
 
     from storage_v6_1 import create_task
@@ -873,7 +813,7 @@ def webhook():
                         meta = {}
                         for chunk in meta_str.split(";"):
                             if "=" in chunk:
-                                k, v = chunk.split("=", 1)
+                                k, v = chunk.split(":", 1) if ":" in chunk else chunk.split("=", 1)
                                 meta[k.strip()] = v.strip()
                         kind = meta.get("kind", "add")
                         qty = meta.get("qty")
@@ -936,7 +876,7 @@ def webhook():
                         meta = {}
                         for chunk in meta_str.split(";"):
                             if "=" in chunk:
-                                k, v = chunk.split("=", 1)
+                                k, v = chunk.split(":", 1) if ":" in chunk else chunk.split("=", 1)
                                 meta[k.strip()] = v.strip()
                         material = meta.get("material", "stock item")
                         unit = meta.get("unit", "units")
@@ -2762,4 +2702,3 @@ def admin_voice_log():
 if __name__=="__main__":
     port=int(os.environ.get("PORT","10000"))
     app.run(host="0.0.0.0",port=port,debug=False)
-
