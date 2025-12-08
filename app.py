@@ -303,6 +303,19 @@ def webhook():
     if contacts:
         sender = contacts[0].get("wa_id") or sender
 
+    # SAFE DEFAULTS FOR ROLE FIELDS (GUARD AGAINST UNBOUND)
+    project_code = None
+    subcontractor_name = None
+
+    from storage import (
+        SessionLocal as DBSession,
+        User,
+        Task,
+        PMProjectMap,
+        get_user_role,
+        get_pms_for_project,
+    )
+
     from storage import (
         SessionLocal as DBSession,
         User,
