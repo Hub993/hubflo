@@ -600,6 +600,87 @@ def webhook():
             continue
         t_lower = text.lower().strip()
 
+        # ---------------------------------------------------------
+        # HARD-PRIORITY: AWAIT CHAIN MUST RUN BEFORE ANYTHING ELSE
+        # ---------------------------------------------------------
+        with DBSession() as s:
+            awaiting = (
+                s.query(Task)
+                .filter(
+                    Task.sender == sender,
+                    Task.status == "open",
+                    Task.text.ilike("[await:%]%"),
+                )
+                .order_by(Task.id.desc())
+                .first()
+            )
+
+            if awaiting:
+                raw_txt = text.strip()
+                await_lower = (awaiting.text or "").lower()
+
+                # ---- Order: item ----
+                if await_lower.startswith("[await:item]"):
+                    awaiting.text = "[await:quantity]\nItem: " + raw_txt
+                    s.commit()
+                    send_whatsapp_text(phone_id, sender, "Quantity?")
+                    return ("", 200)
+
+                # ---- Order: quantity ----
+                if await_lower.startswith("[await:quantity]"):
+                    body = awaiting.text.split("\n",1)[1] if "\n" in awaiting.text else ""
+                    awaiting.text = ("[await:supplier]\n" + body +
+                                     "\nQuantity: " + raw_txt).strip()
+                    s.commit()
+                    send_whatsapp_text(phone_id, sender, "Supplier?")
+                    return ("", 200)
+
+                # ---- Order: supplier ----
+                if await_lower.startswith("[await:supplier]"):
+                    lines = [l for l in awaiting.text.splitlines() if ":" in l]
+                    fields = dict(l.split(":",1) for l in lines)
+                    awaiting.text = (
+                        "[await:delivery_date]\n"
+                        f"Item: {fields.get('Item','')}\n"
+                        f"Quantity: {fields.get('Quantity','')}\n"
+                        f"Supplier: {raw_txt}"
+                    )
+                    s.commit()
+                    send_whatsapp_text(phone_id, sender, "Delivery date?")
+                    return ("", 200)
+
+                # ---- Order: delivery date ----
+                if await_lower.startswith("[await:delivery_date]"):
+                    lines = [l for l in awaiting.text.splitlines() if ":" in l]
+                    fields = dict(l.split(":",1) for l in lines)
+                    awaiting.text = (
+                        "[await:drop_location]\n"
+                        f"Item: {fields.get('Item','')}\n"
+                        f"Quantity: {fields.get('Quantity','')}\n"
+                        f"Supplier: {fields.get('Supplier','')}\n"
+                        f"Delivery Date: {raw_txt}"
+                    )
+                    s.commit()
+                    send_whatsapp_text(phone_id, sender, "Drop location?")
+                    return ("", 200)
+
+                # ---- Order: drop location ----
+                if await_lower.startswith("[await:drop_location]"):
+                    lines = [l for l in awaiting.text.splitlines() if ":" in l]
+                    fields = dict(l.split(":",1) for l in lines)
+                    awaiting.text = (
+                        f"Item: {fields.get('Item','')}\n"
+                        f"Quantity: {fields.get('Quantity','')}\n"
+                        f"Supplier: {fields.get('Supplier','')}\n"
+                        f"Delivery Date: {fields.get('Delivery Date','')}\n"
+                        f"Drop Location: {raw_txt}"
+                    )
+                    awaiting.status = "pending_approval"
+                    awaiting.last_updated = dt.datetime.utcnow()
+                    s.commit()
+                    send_whatsapp_text(phone_id, sender, "✅ Order captured. Awaiting PM approval.")
+                    return ("", 200)
+
         # -------------------------
         # CHANGE-ORDER FIRST (absolute priority)
         # -------------------------
