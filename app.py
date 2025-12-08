@@ -689,7 +689,6 @@ def webhook():
             "change that order",
             "change order",
             "change it to",
-            "change it ",
         ]):
             row = create_task(
                 sender=sender,
