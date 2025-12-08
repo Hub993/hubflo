@@ -671,6 +671,39 @@ def webhook():
                 s.commit()
 
         # -------------------------
+        # ORDER INTENT DETECTOR (PREVENTS STOCK + ORDER MERGE)
+        # -------------------------
+        if text:
+            t = text.lower().strip()
+            order_phrases = [
+                "get me",
+                "order",
+                "please get",
+                "please order",
+                "we need",
+                "i need",
+                "need ",
+                "buy ",
+                "procure",
+                "purchase",
+                "bring ",
+                "deliver ",
+            ]
+            if any(p in t for p in order_phrases):
+                row = create_task(
+                    sender=sender,
+                    text=f"[await:item]\n{text}",
+                    tag="order",
+                    project_code=project_code,
+                    subcontractor_name=subcontractor_name,
+                    order_state="requested",
+                    attachment=attachment,
+                    subtype="assigned",
+                )
+                send_whatsapp_text(phone_id, sender, "Item?")
+                return ("", 200)
+
+        # -------------------------
         # AWAIT CHAINS (ORDERS + STOCK)
         # -------------------------
         if text and not any(w in text.lower() for w in (
