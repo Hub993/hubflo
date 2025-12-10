@@ -677,8 +677,6 @@ def webhook():
             send_whatsapp_text(phone_id, sender, f"Stock updated: {delta:+} {unit} of {material}.")
             return True
 
-        return False if
-
         # SEARCH
         if text and is_search_request(text):
             run_search(sender, text)
