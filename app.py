@@ -482,389 +482,202 @@ def webhook():
             send_whatsapp_text(phone_id, sender_wa, "\n".join(lines))
 
     # -------------------------
-    # STOCK HANDLING
+    # STOCK HANDLING (REBUILT — OPTION B)
     # -------------------------
+
     def is_new_stock_item_request(text: str) -> bool:
-        return "add new stock item" in (text or "").lower()
+        """Detects explicit new-stock-item creation commands."""
+        t = (text or "").lower().strip()
+        return t.startswith("add new stock item") or "add new stock item:" in t
+
 
     def parse_new_stock_item(text: str) -> str:
+        """Extracts material name from 'add new stock item: X' commands."""
         t = (text or "").lower()
         if ":" in t:
             return t.split("add new stock item", 1)[1].split(":", 1)[1].strip()
         return t.split("add new stock item", 1)[1].strip()
 
+
     def parse_stock_command(text: str):
-        t = (text or "").lower()
-        if "stock" not in t:
+        """
+        REBUILT STOCK PARSER — prevents cross-contamination and enforces strict token rules.
+        Returns a dict or None.
+        """
+        if not text:
             return None
 
-        verbs_add = ["add", "added", "received", "put", "delivered", "stocked"]
-        verbs_remove = ["take", "took", "use", "used", "deduct", "remove", "issue", "pull"]
+        t = text.lower().strip()
+
+        # Must contain 'stock' but NOT be an await chain or new stock item creation.
+        if "stock" not in t:
+            return None
+        if "add new stock item" in t:
+            return None
+
+        # Operation keywords
+        verbs_add = ["add ", "added ", "received ", "put ", "delivered ", "stocked "]
+        verbs_remove = ["take ", "took ", "use ", "used ", "deduct ", "remove ", "issue ", "pull "]
+
         kind = None
         for v in verbs_add:
-            if f"{v} " in t:
+            if t.startswith(v) or f" {v}" in t:
                 kind = "add"
                 break
         if not kind:
             for v in verbs_remove:
-                if f"{v} " in t:
+                if t.startswith(v) or f" {v}" in t:
                     kind = "remove"
                     break
         if not kind:
             return None
 
+        # Regex for strict quantity + unit + material extraction
         m = re.search(
-            r"(\d+)\s+(\w+)?\s*(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
-            t,
+            r"(add|take|took|use|used|put|deduct|remove|issue|pull|received|delivered|stocked)\s+"
+            r"(\d+)\s+(\w+)\s+of\s+(.+?)\s+(to|into|from|out of)\s+stock",
+            t
         )
-        if not m:
+
+        if m:
+            qty = int(m.group(2))
+            unit = m.group(3).strip().lower()
+            material = m.group(4).strip()
             return {
                 "kind": kind,
-                "material": t,
-                "qty": None,
-                "unit": None,
-                "needs_prompt": True,
+                "qty": qty,
+                "unit": unit,
+                "material": material,
+                "needs_prompt": False,
             }
 
-        qty = int(m.group(1))
-        unit = m.group(2)
-        material = m.group(3).strip()
-
-        needs_prompt = False
-        if not unit or unit.lower() in ("of", "to", "into", "from", "out"):
-            unit = None
-            needs_prompt = True
-
+        # If regex fails → incomplete, require prompting
         return {
             "kind": kind,
-            "material": material,
-            "qty": qty,
-            "unit": unit,
-            "needs_prompt": needs_prompt,
+            "qty": None,
+            "unit": None,
+            "material": t,
+            "needs_prompt": True,
         }
 
+
     # -------------------------
-    # MAIN MESSAGE LOOP
+    # NEW STOCK ITEM FLOW
     # -------------------------
-    for m in msgs:
-        sender = m.get("from") or sender
-        mtype = m.get("type")
-        text = None
-        attachment = None
+    def start_new_stock_item(sender, material):
+        """
+        Creates a clean await-chain for new stock item creation.
+        """
+        create_task(
+            sender=sender,
+            text=f"[await:new_stock_unit] material={material}",
+            tag="stock",
+            project_code=None,
+            subcontractor_name=None,
+            order_state=None,
+            attachment=None,
+            subtype="assigned",
+        )
 
-        # ORDER BUTTONS
-        if mtype == "interactive":
-            br = (m.get("interactive") or {}).get("button_reply") or {}
-            bid = br.get("id", "") or ""
 
-            from storage_v6_1 import SessionLocal as S2, Task as T2
+    # -------------------------
+    # STOCK AWAIT LOGIC (REBUILT)
+    # -------------------------
 
-            def _mark(tid, flag, prompt):
-                with S2() as s:
-                    t = s.get(T2, tid)
-                    if t:
-                        body = t.text.split("\n", 1)[1] if "\n" in (t.text or "") else t.text or ""
-                        t.text = f"[await:{flag}]\n{body}"
-                        s.commit()
-                send_whatsapp_text(phone_id, sender, prompt)
-                return ("", 200)
+    def handle_stock_await(awaiting, raw_txt, sender, phone_id):
+        """Handles all stock-related await stages cleanly and safely."""
 
-            if bid.startswith("order_item:"):
-                tid = int(bid.split(":", 1)[1])
-                with S2() as s:
-                    t = s.get(T2, tid)
-                    if t:
-                        t.text = f"[await:item]\n{t.text or ''}"
-                        s.commit()
-                send_whatsapp_text(phone_id, sender, "Great — what item should we order?")
-                return ("", 200)
+        value = raw_txt.strip().lower()
 
-            if bid.startswith("order_quantity:"):
-                return _mark(int(bid.split(":", 1)[1]), "quantity", "Okay — what quantity do we need?")
+        # ---------- AWAIT NEW STOCK UNIT ----------
+        if awaiting.text.startswith("[await:new_stock_unit]"):
+            material = awaiting.text.split("material=", 1)[1].strip()
+            unit = value
+            awaiting.text = f"[await:new_stock_qty] material={material};unit={unit}"
+            awaiting.last_updated = dt.datetime.utcnow()
+            awaiting.status = "open"
+            s.commit()
+            send_whatsapp_text(phone_id, sender, "What opening quantity?")
+            return True
 
-            if bid.startswith("order_supplier:"):
-                return _mark(int(bid.split(":", 1)[1]), "supplier", "Got it — who should we source this from?")
+        # ---------- AWAIT NEW STOCK QUANTITY ----------
+        if awaiting.text.startswith("[await:new_stock_qty]"):
+            meta = awaiting.text.split(" ", 1)[1]
+            info = {}
+            for chunk in meta.split(";"):
+                if "=" in chunk:
+                    k, v = chunk.split("=", 1)
+                    info[k.strip()] = v.strip()
 
-            if bid.startswith("order_delivery_date:"):
-                return _mark(int(bid.split(":", 1)[1]), "delivery_date", "When must this be delivered?")
+            material = info.get("material", "stock item")
+            unit = info.get("unit", "units")
 
-            if bid.startswith("order_drop_location:"):
-                return _mark(int(bid.split(":", 1)[1]), "drop_location", "Where should this be dropped on site?")
+            try:
+                qty_val = int(value)
+            except:
+                send_whatsapp_text(phone_id, sender, "Please send a whole number for the opening quantity.")
+                return True
 
-        # MESSAGE TYPES
-        if mtype == "text":
-            text = (m.get("text") or {}).get("body")
-        elif mtype in ("image", "document", "audio", "video"):
-            meta = m.get(mtype, {}) or {}
-            mid = meta.get("id")
-            attachment = {
-                "url": f"whatsapp_media://{mtype}/{mid}" if mid else None,
-                "mime": meta.get("mime_type"),
-                "name": meta.get("filename"),
-            }
-            text = meta.get("caption")
+            create_stock_item({
+                "name": material,
+                "unit": unit,
+                "opening_qty": qty_val,
+                "actor": sender,
+                "source": "whatsapp",
+            })
 
-        # TEMP AUTO-FIX
-        with DBSession() as s:
-            bad = (
-                s.query(Task)
-                .filter(Task.id == 97, Task.status == "open")
-                .first()
-            )
-            if bad:
-                bad.status = "done"
-                bad.text = f"[autoclosed:{dt.datetime.utcnow().isoformat()}]"
-                bad.last_updated = dt.datetime.utcnow()
+            awaiting.text = f"NEW STOCK ITEM: {material} ({qty_val} {unit})"
+            awaiting.status = "done"
+            awaiting.last_updated = dt.datetime.utcnow()
+            s.commit()
+            send_whatsapp_text(phone_id, sender, f"New stock item created: {material} ({qty_val} {unit}).")
+            return True
+
+        # ---------- AWAIT STOCK UNIT ----------
+        if awaiting.text.startswith("[await:stock_unit]"):
+            meta = awaiting.text.split(" ", 1)[1]
+            info = {}
+            for chunk in meta.split(";"):
+                if "=" in chunk:
+                    k, v = chunk.split("=", 1)
+                    info[k.strip()] = v.strip()
+
+            kind = info.get("kind", "add")
+            material = info.get("material", "stock item")
+
+            try:
+                qty_val = int(info.get("qty"))
+            except:
+                qty_val = None
+
+            unit = value
+
+            if not qty_val:
+                awaiting.text = f"STOCK NOTE: {kind} {unit} {material} (qty missing)"
+                awaiting.status = "done"
+                awaiting.last_updated = dt.datetime.utcnow()
                 s.commit()
+                send_whatsapp_text(phone_id, sender, "Noted, but quantity was missing so stock was not adjusted.")
+                return True
 
-        # AWAIT CHAINS
-        if text and not any(w in text.lower() for w in (
-            "approve",
-            "reject",
-            "change the order",
-            "change that order",
-            "change order",
-            "change it",
-            "change it to",
-        )):
-            with DBSession() as s:
-                awaiting = (
-                    s.query(Task)
-                    .filter(
-                        Task.sender == sender,
-                        Task.status == "open",
-                        Task.text.ilike("[await:%]%"),
-                    )
-                    .order_by(Task.id.desc())
-                    .first()
-                )
-                if awaiting:
-                    raw_txt = text.strip()
-                    await_lower = (awaiting.text or "").lower()
+            delta = qty_val if kind == "add" else -qty_val
 
-                    def _fields_from(task):
-                        lines = [
-                            l.strip()
-                            for l in task.text.splitlines()
-                            if not l.lower().startswith("[await:")
-                        ]
-                        out = {}
-                        for l in lines:
-                            if ":" in l:
-                                k, v = l.split(":", 1)
-                                out[k.strip()] = v.strip()
-                        return out
+            adjust_stock({
+                "material": material,
+                "unit": unit,
+                "delta": delta,
+                "actor": sender,
+                "source": "whatsapp",
+            })
 
-                    if await_lower.startswith("[await:item]"):
-                        awaiting.text = "[await:quantity]\n" f"Item: {raw_txt}"
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Quantity?")
-                        return ("", 200)
+            awaiting.text = f"STOCK {kind}: {qty_val} {unit} {material}"
+            awaiting.status = "done"
+            awaiting.last_updated = dt.datetime.utcnow()
+            s.commit()
+            send_whatsapp_text(phone_id, sender, f"Stock updated: {delta:+} {unit} of {material}.")
+            return True
 
-                    if await_lower.startswith("[await:quantity]"):
-                        body = awaiting.text.split("\n", 1)[1] if "\n" in (awaiting.text or "") else ""
-                        awaiting.text = "[await:supplier]\n" f"{body}\nQuantity: {raw_txt}".strip()
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Supplier?")
-                        return ("", 200)
-
-                    if await_lower.startswith("[await:supplier]"):
-                        f = _fields_from(awaiting)
-                        awaiting.text = (
-                            "[await:delivery_date]\n"
-                            f"Item: {f.get('Item','')}\n"
-                            f"Quantity: {f.get('Quantity','')}\n"
-                            f"Supplier: {raw_txt}"
-                        )
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Delivery date?")
-                        return ("", 200)
-
-                    if await_lower.startswith("[await:delivery_date]"):
-                        f = _fields_from(awaiting)
-                        awaiting.text = (
-                            "[await:drop_location]\n"
-                            f"Item: {f.get('Item','')}\n"
-                            f"Quantity: {f.get('Quantity','')}\n"
-                            f"Supplier: {f.get('Supplier','')}\n"
-                            f"Delivery Date: {raw_txt}"
-                        )
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "Drop location on site?")
-                        return ("", 200)
-
-                    if await_lower.startswith("[await:drop_location]"):
-                        f = _fields_from(awaiting)
-                        awaiting.text = (
-                            f"Item: {f.get('Item','')}\n"
-                            f"Quantity: {f.get('Quantity','')}\n"
-                            f"Supplier: {f.get('Supplier','')}\n"
-                            f"Delivery Date: {f.get('Delivery Date','')}\n"
-                            f"Drop Location: {raw_txt}"
-                        )
-                        awaiting.status = "pending_approval"
-                        awaiting.last_updated = dt.datetime.utcnow()
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "✅ Order details captured. Awaiting PM approval.")
-                        return ("", 200)
-
-                    if await_lower.startswith("[await:stock_unit]"):
-                        meta_str = awaiting.text.split("\n", 1)[0].split(" ", 1)[-1]
-                        meta = {}
-                        for chunk in meta_str.split(";"):
-                            if "=" in chunk:
-                                k, v = chunk.split(":", 1) if ":" in chunk else chunk.split("=", 1)
-                                meta[k.strip()] = v.strip()
-
-                        kind = meta.get("kind", "add")
-                        qty = meta.get("qty")
-                        material = meta.get("material", "stock item")
-                        try:
-                            qty_val = int(qty)
-                        except Exception:
-                            qty_val = None
-
-                        unit = raw_txt.strip().lower()
-                        if not qty_val:
-                            awaiting.text = f"STOCK NOTE: {kind} {unit} {material} (qty missing)"
-                            awaiting.status = "done"
-                            awaiting.last_updated = dt.datetime.utcnow()
-                            s.commit()
-                            send_whatsapp_text(
-                                phone_id,
-                                sender,
-                                "Noted, but quantity was missing so stock was not adjusted.",
-                            )
-                            return ("", 200)
-
-                        delta = qty_val if kind == "add" else -qty_val
-                        adjust_stock({
-                            "material": material,
-                            "unit": unit,
-                            "delta": delta,
-                            "actor": sender,
-                            "source": "whatsapp",
-                        })
-                        awaiting.text = f"STOCK {kind}: {qty_val} {unit} {material}"
-                        awaiting.status = "done"
-                        awaiting.last_updated = dt.datetime.utcnow()
-                        s.commit()
-                        send_whatsapp_text(
-                            phone_id,
-                            sender,
-                            f"Stock updated: {delta:+} {unit} of {material}.",
-                        )
-                        return ("", 200)
-
-                    if await_lower.startswith("[await:new_stock_unit]"):
-                        material = (
-                            awaiting.text.split("material=", 1)[1].strip()
-                            if "material=" in awaiting.text
-                            else "stock item"
-                        )
-                        unit = raw_txt.strip().lower()
-                        awaiting.text = f"[await:new_stock_qty] material={material};unit={unit}"
-                        s.commit()
-                        send_whatsapp_text(phone_id, sender, "What opening quantity?")
-                        return ("", 200)
-
-                    if await_lower.startswith("[await:new_stock_qty]"):
-                        meta_str = awaiting.text.split(" ", 1)[-1]
-                        meta = {}
-                        for chunk in meta_str.split(";"):
-                            if "=" in chunk:
-                                k, v = chunk.split("=", 1)
-                                meta[k.strip()] = v.strip()
-                        material = meta.get("material", "stock item")
-                        unit = meta.get("unit", "units")
-                        try:
-                            qty_val = int(raw_txt.strip())
-                        except Exception:
-                            send_whatsapp_text(phone_id, sender, "Please send a whole number for the opening quantity.")
-                            return ("", 200)
-
-                        create_stock_item({
-                            "name": material,
-                            "unit": unit,
-                            "opening_qty": qty_val,
-                            "actor": sender,
-                            "source": "whatsapp",
-                        })
-                        awaiting.text = f"NEW STOCK ITEM: {material} ({qty_val} {unit})"
-                        awaiting.status = "done"
-                        awaiting.last_updated = dt.datetime.utcnow()
-                        s.commit()
-                        send_whatsapp_text(
-                            phone_id,
-                            sender,
-                            f"New stock item created: {material} ({qty_val} {unit}).",
-                        )
-                        return ("", 200)
-
-        # NEW STOCK ITEM FLOW
-        if text and is_new_stock_item_request(text):
-            material = parse_new_stock_item(text)
-            create_task(
-                sender=sender,
-                text=f"[await:new_stock_unit] material={material}",
-                tag="stock",
-                project_code=None,
-                subcontractor_name=None,
-                order_state=None,
-                attachment=None,
-                subtype="assigned",
-            )
-            send_whatsapp_text(
-                phone_id,
-                sender,
-                f"Adding new stock item '{material}'. What unit? (bags, pallets, drums, crates, etc.)",
-            )
-            return ("", 200)
-
-        # DIRECT STOCK COMMANDS
-        stock_cmd = parse_stock_command(text) if text else None
-        if stock_cmd:
-            if stock_cmd.get("needs_prompt") or not stock_cmd.get("unit"):
-                meta = (
-                    f"kind={stock_cmd['kind']};"
-                    f"qty={stock_cmd.get('qty')};"
-                    f"material={stock_cmd['material']}"
-                )
-                create_task(
-                    sender=sender,
-                    text=f"[await:stock_unit] {meta}",
-                    tag="stock",
-                    project_code=None,
-                    subcontractor_name=None,
-                    order_state=None,
-                    attachment=None,
-                    subtype="assigned",
-                )
-                send_whatsapp_text(
-                    phone_id,
-                    sender,
-                    "Which unit? Bags / pallets / drums / buckets / crates / other",
-                )
-                return ("", 200)
-            else:
-                try:
-                    qty_val = int(stock_cmd.get("qty") or 0)
-                except Exception:
-                    qty_val = 0
-                delta = qty_val if stock_cmd["kind"] == "add" else -qty_val
-                adjust_stock({
-                    "material": stock_cmd["material"],
-                    "unit": stock_cmd["unit"],
-                    "delta": delta,
-                    "actor": sender,
-                    "source": "whatsapp",
-                })
-                send_whatsapp_text(
-                    phone_id,
-                    sender,
-                    f"Stock updated: {delta:+} {stock_cmd['unit']} of {stock_cmd['material']}.",
-                )
-                return ("", 200)
+        return False if
 
         # SEARCH
         if text and is_search_request(text):
