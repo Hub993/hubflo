@@ -762,6 +762,38 @@ def webhook():
                         )
                         return ("", 200)
 
+                    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+                    # PATCH INSERT START — missing [await:new_stock_unit]
+                    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+                    if await_lower.startswith("[await:new_stock_unit]"):
+                        # extract material
+                        material = (
+                            awaiting.text.split("material=", 1)[1].strip()
+                            if "material=" in awaiting.text
+                            else "stock item"
+                        )
+                        unit = raw_txt.strip().lower()  # user reply
+
+                        # advance to next stage
+                        awaiting.text = (
+                            f"[await:new_stock_qty] material={material};unit={unit}"
+                        )
+                        awaiting.last_updated = dt.datetime.utcnow()
+                        awaiting.status = "open"
+                        s.commit()
+
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            "What opening quantity?"
+                        )
+                        return ("", 200)
+
+                    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                    # PATCH INSERT END
+                    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
                     if await_lower.startswith("[await:new_stock_qty]"):
                         meta_str = awaiting.text.split(" ", 1)[-1]
                         meta = {}
