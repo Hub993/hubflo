@@ -467,6 +467,7 @@ def webhook():
                 return
 
             lines = ["🔎 Search results:"]
+
             for tsk in rows:
                 meta_bits = []
                 if tsk.project_code:
@@ -500,6 +501,7 @@ def webhook():
 
         verbs_add = ["add", "added", "received", "put", "delivered", "stocked"]
         verbs_remove = ["take", "took", "use", "used", "deduct", "remove", "issue", "pull"]
+
         kind = None
         for v in verbs_add:
             if f"{v} " in t:
@@ -514,9 +516,10 @@ def webhook():
             return None
 
         m = re.search(
-            r"(\d+)\s+(\w+)?\s*(?:of\s+)?(.+?)\s+(?:to|into|from|out of)\s+stock",
-            t,
+            r"(\d+)\s*([a-zA-Z]+)?\s*(?:of\s+)?(.+?)\s+(?:to|into|in to|in|from|out of)\s+stock",
+            t
         )
+
         if not m:
             return {
                 "kind": kind,
@@ -528,10 +531,10 @@ def webhook():
 
         qty = int(m.group(1))
         unit = m.group(2)
-        material = m.group(3).strip()
+        material = (m.group(3) or "").strip()
 
         needs_prompt = False
-        if not unit or unit.lower() in ("of", "to", "into", "from", "out"):
+        if not unit or unit.lower() in ("of", "to", "into", "from", "out", "in"):
             unit = None
             needs_prompt = True
 
