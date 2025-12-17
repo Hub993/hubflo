@@ -675,8 +675,15 @@ def webhook():
         s.commit()
         send_whatsapp_text(phone_id, sender, "What opening quantity?")
 
+    # -----------------------------------------------------------------
+    # PATCH: STOCK QTY GUARD — resolve_await_new_stock_qty
+    # Marker: [await:new_stock_qty]
+    # Scope: guard non-numeric input, preserve state, stop retry cascade
+    # -----------------------------------------------------------------
+
     def resolve_await_new_stock_qty(awaiting, raw_txt, sender, s):
-        """[await:new_stock_qty] → choose quantity, create item."""
+        """[await:new_stock_qty] → choose quantity, create item (guarded)."""
+
         meta_str = awaiting.text.split(" ", 1)[-1]
         meta = {}
         for chunk in meta_str.split(";"):
@@ -687,10 +694,24 @@ def webhook():
         material = meta.get("material", "stock item")
         unit = meta.get("unit", "units")
 
-        try:
-            qty_val = int(raw_txt.strip())
-        except Exception:
-            send_whatsapp_text(phone_id, sender, "Send a whole number for the quantity.")
+        raw = (raw_txt or "").strip()
+
+        # HARD GUARD — only accept whole-number input
+        if not raw.isdigit():
+            send_whatsapp_text(
+                phone_id,
+                sender,
+                "Send a whole number for the quantity."
+            )
+            return
+
+        qty_val = int(raw)
+        if qty_val <= 0:
+            send_whatsapp_text(
+                phone_id,
+                sender,
+                "Quantity must be greater than zero."
+            )
             return
 
         create_stock_item({
@@ -711,6 +732,10 @@ def webhook():
             sender,
             f"New stock item created: {material} ({qty_val} {unit})."
         )
+
+    # -----------------------------------------------------------------
+    # END PATCH — resolve_await_new_stock_qty
+    # -----------------------------------------------------------------
 
     # -----------------------------------------------------------------
     # END OF BLOCK 3 — NEXT: AWAIT-CHAIN FOR ORDERS (BLOCK 4)
