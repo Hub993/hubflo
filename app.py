@@ -41,7 +41,7 @@ D360_KEY = (
     or ""
 ).strip()
 DEFAULT_PHONE_ID = os.environ.get("BOUND_NUMBER", "").strip()
-WHATSAPP_BASE = "https://waba.360dialog.io/v1/messages"
+WHATSAPP_BASE = os.environ.get("D360_SEND_URL","").strip()
 
 ORDER_LIFECYCLE_STATES = [
     "quoted","pending_approval","approved",
