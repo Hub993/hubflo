@@ -10,6 +10,7 @@
 
 import os, json, logging, datetime as dt, requests
 from typing import Optional
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, Response
 
 from storage_v6_1 import (
@@ -20,7 +21,8 @@ from storage_v6_1 import (
     create_stock_item, adjust_stock, get_stock_report,
     record_change_order,
     add_task_to_group, get_group_children, edit_task_text,
-    get_all_change_orders, create_call_reminder
+    get_all_change_orders, create_call_reminder,
+    create_inspection
 )
 
 from storage_v6_1 import Task
@@ -210,6 +212,371 @@ def classify_message(text: str) -> dict:
     return {"tag": "task", "subtype": "assigned", "order_state": None}
 
 # >>> PATCH_CLASSIFIER_V6_1_END <<<
+
+# >>> PATCH_1_INSPECTION_CLASSIFIER_START — INSPECTOR SCHEDULING V6.1 <<<
+
+_INSPECTION_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+_INSPECTION_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def classify_inspection(text: str) -> bool:
+    t = (text or "").lower()
+
+    return (
+        "inspection" in t
+        and ("book" in t or "schedule" in t)
+    )
+
+
+def _inspection_datetime_from_date(
+    date_value: dt.date,
+) -> dt.datetime:
+    """
+    Store the requested inspection calendar date at midnight.
+
+    This is the requested inspection date, not the time at which
+    the WhatsApp message was received.
+    """
+    return dt.datetime.combine(
+        date_value,
+        dt.time.min,
+    )
+
+
+def _next_inspection_weekday(
+    weekday_name: str,
+    today: dt.date,
+) -> dt.date:
+    """
+    Resolve the next occurrence of a named weekday.
+
+    If the requested weekday is today, today's date is used.
+    """
+    target_weekday = _INSPECTION_WEEKDAYS[weekday_name]
+    days_ahead = (
+        target_weekday - today.weekday()
+    ) % 7
+
+    return today + dt.timedelta(days=days_ahead)
+
+
+def _inspection_reference_date(
+    timezone_name: str,
+) -> dt.date:
+    """
+    Return the current calendar date in the sender's timezone.
+
+    America/New_York is used when the supplied timezone is missing
+    or invalid.
+    """
+    safe_timezone_name = (
+        timezone_name or "America/New_York"
+    )
+
+    try:
+        sender_timezone = ZoneInfo(safe_timezone_name)
+    except Exception:
+        sender_timezone = ZoneInfo(
+            "America/New_York"
+        )
+
+    return dt.datetime.now(
+        sender_timezone
+    ).date()
+
+
+def parse_inspection_request(
+    text: str,
+    today: Optional[dt.date] = None,
+    timezone_name: str = "America/New_York",
+) -> Optional[dict]:
+    """
+    Parse inspection scheduling messages such as:
+
+      Schedule inspection for slab on Friday
+      Book inspection for framing tomorrow
+      Schedule inspection for electrical rough-in on 08/14/2026
+      Schedule inspection for plumbing on August 14
+      Schedule inspection for final on 2026-08-14
+
+    Returns:
+
+      {
+          "phase": "slab",
+          "required_date": datetime(...)
+      }
+
+    Returns None when either the inspection phase or the requested
+    date cannot be parsed.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    working = raw.lower().strip()
+
+    if today is None:
+        today = _inspection_reference_date(
+            timezone_name
+        )
+
+    command_match = re.match(
+        r"^\s*(?:schedule|book)\s+"
+        r"(?:an?\s+)?inspection\s+for\s+",
+        working,
+        flags=re.IGNORECASE,
+    )
+
+    if not command_match:
+        return None
+
+    body = working[
+        command_match.end():
+    ].strip()
+
+    if not body:
+        return None
+
+    requested_date = None
+    date_span = None
+
+    # ISO date:
+    # 2026-08-14
+    iso_match = re.search(
+        r"\b(?:on\s+)?"
+        r"(\d{4})-(\d{1,2})-(\d{1,2})\b",
+        body,
+        flags=re.IGNORECASE,
+    )
+
+    if iso_match:
+        try:
+            requested_date = dt.date(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+            )
+            date_span = iso_match.span()
+        except ValueError:
+            return None
+
+    # Numeric US date:
+    # 08/14/2026 or 08/14
+    if requested_date is None:
+        numeric_match = re.search(
+            r"\b(?:on\s+)?"
+            r"(\d{1,2})/(\d{1,2})"
+            r"(?:/(\d{2,4}))?\b",
+            body,
+            flags=re.IGNORECASE,
+        )
+
+        if numeric_match:
+            month = int(
+                numeric_match.group(1)
+            )
+            day = int(
+                numeric_match.group(2)
+            )
+            year_text = numeric_match.group(3)
+
+            if year_text:
+                year = int(year_text)
+
+                if year < 100:
+                    year += 2000
+            else:
+                year = today.year
+
+            try:
+                requested_date = dt.date(
+                    year,
+                    month,
+                    day,
+                )
+            except ValueError:
+                return None
+
+            if (
+                not year_text
+                and requested_date < today
+            ):
+                try:
+                    requested_date = dt.date(
+                        year + 1,
+                        month,
+                        day,
+                    )
+                except ValueError:
+                    return None
+
+            date_span = numeric_match.span()
+
+    # Month-name date:
+    # August 14 or August 14, 2026
+    if requested_date is None:
+        month_names = "|".join(
+            _INSPECTION_MONTHS.keys()
+        )
+
+        month_match = re.search(
+            rf"\b(?:on\s+)?"
+            rf"({month_names})\s+"
+            rf"(\d{{1,2}})"
+            rf"(?:st|nd|rd|th)?"
+            rf"(?:,\s*|\s+)?"
+            rf"(\d{{4}})?\b",
+            body,
+            flags=re.IGNORECASE,
+        )
+
+        if month_match:
+            month = _INSPECTION_MONTHS[
+                month_match.group(1).lower()
+            ]
+            day = int(
+                month_match.group(2)
+            )
+            year_text = month_match.group(3)
+
+            year = (
+                int(year_text)
+                if year_text
+                else today.year
+            )
+
+            try:
+                requested_date = dt.date(
+                    year,
+                    month,
+                    day,
+                )
+            except ValueError:
+                return None
+
+            if (
+                not year_text
+                and requested_date < today
+            ):
+                try:
+                    requested_date = dt.date(
+                        year + 1,
+                        month,
+                        day,
+                    )
+                except ValueError:
+                    return None
+
+            date_span = month_match.span()
+
+    # Relative date:
+    # today or tomorrow
+    if requested_date is None:
+        relative_match = re.search(
+            r"\b(?:on\s+)?"
+            r"(today|tomorrow)\b",
+            body,
+            flags=re.IGNORECASE,
+        )
+
+        if relative_match:
+            relative_word = (
+                relative_match.group(1).lower()
+            )
+
+            if relative_word == "today":
+                requested_date = today
+            else:
+                requested_date = (
+                    today + dt.timedelta(days=1)
+                )
+
+            date_span = relative_match.span()
+
+    # Named weekday:
+    # Friday or on Friday
+    if requested_date is None:
+        weekday_names = "|".join(
+            _INSPECTION_WEEKDAYS.keys()
+        )
+
+        weekday_match = re.search(
+            rf"\b(?:on\s+)?"
+            rf"({weekday_names})\b",
+            body,
+            flags=re.IGNORECASE,
+        )
+
+        if weekday_match:
+            weekday_name = (
+                weekday_match.group(1).lower()
+            )
+
+            requested_date = (
+                _next_inspection_weekday(
+                    weekday_name,
+                    today,
+                )
+            )
+
+            date_span = weekday_match.span()
+
+    if (
+        requested_date is None
+        or date_span is None
+    ):
+        return None
+
+    # Everything before the detected date expression
+    # is treated as the inspection phase.
+    phase = body[
+        :date_span[0]
+    ].strip()
+
+    phase = re.sub(
+        r"\s+\bon\s*$",
+        "",
+        phase,
+    ).strip()
+
+    phase = phase.rstrip(" ,.-")
+
+    if not phase:
+        return None
+
+    return {
+        "phase": phase,
+        "required_date": (
+            _inspection_datetime_from_date(
+                requested_date
+            )
+        ),
+    }
+
+# >>> PATCH_1_INSPECTION_CLASSIFIER_END <<<
+
 
 # ---------------------------------------------------------------------
 # WhatsApp send utility
@@ -1088,6 +1455,97 @@ def webhook():
         if text and is_search_request(text):
             run_search(sender, text)
             return ("", 200)
+
+        # >>> PATCH_1_INSPECTION_WEBHOOK_START — INSPECTOR SCHEDULING V6.1 <<<
+
+        if text and classify_inspection(text):
+            sender_timezone = "America/New_York"
+
+            with DBSession() as s:
+                sender_user = (
+                    s.query(User)
+                    .filter(
+                        User.wa_id == sender,
+                        User.active == True,
+                    )
+                    .first()
+                )
+
+                if (
+                    sender_user
+                    and sender_user.timezone
+                ):
+                    sender_timezone = (
+                        sender_user.timezone
+                    )
+
+            parsed_inspection = (
+                parse_inspection_request(
+                    text,
+                    timezone_name=sender_timezone,
+                )
+            )
+
+            if not parsed_inspection:
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    (
+                        "Please include the inspection "
+                        "phase and date. For example: "
+                        "Schedule inspection for slab "
+                        "on Friday."
+                    ),
+                )
+                return ("", 200)
+
+            user_info = (
+                get_user_role(sender) or {}
+            )
+
+            project_code = user_info.get(
+                "project_code"
+            )
+
+            payload = {
+                "project_code": project_code,
+                "phase": (
+                    parsed_inspection["phase"]
+                ),
+                "required_date": (
+                    parsed_inspection[
+                        "required_date"
+                    ]
+                ),
+                "inspector": None,
+                "notes": text,
+            }
+
+            row = create_inspection(payload)
+
+            requested_date_text = (
+                parsed_inspection[
+                    "required_date"
+                ].strftime(
+                    "%A, %B %d, %Y"
+                )
+            )
+
+            send_whatsapp_text(
+                phone_id,
+                sender,
+                (
+                    f"Inspection logged "
+                    f"(#{row['id']}): "
+                    f"{parsed_inspection['phase']} "
+                    f"on {requested_date_text}."
+                ),
+            )
+
+            return ("", 200)
+
+        # >>> PATCH_1_INSPECTION_WEBHOOK_END <<<
+
 
         # -------------------------------------------------------------
         # FALLBACK → classifier + task creation

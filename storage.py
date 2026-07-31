@@ -115,6 +115,39 @@ def set_client_display_name(client_id: str, name: str) -> dict:
 
 # >>> PATCH_5_STORAGE_END <<<
 
+
+# >>> PATCH_1_INSPECTION_STORAGE_START — INSPECTOR SCHEDULING V6.1 <<<
+
+class Inspection(Base):
+    __tablename__ = "inspections"
+
+    id = Column(Integer, primary_key=True)
+    project_code = Column(String, index=True)
+    phase = Column(String)
+    required_date = Column(DateTime)
+    actual_date = Column(DateTime)
+    inspector = Column(String)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+
+
+def create_inspection(payload: dict) -> dict:
+    with SessionLocal() as s:
+        ins = Inspection(
+            project_code=payload.get("project_code"),
+            phase=payload.get("phase"),
+            required_date=payload.get("required_date"),
+            inspector=payload.get("inspector"),
+            notes=payload.get("notes"),
+        )
+        s.add(ins)
+        s.commit()
+        s.refresh(ins)
+
+        return {"id": ins.id}
+
+# >>> PATCH_1_INSPECTION_STORAGE_END <<<
+
 class Task(Base):
     __tablename__ = "tasks"
 

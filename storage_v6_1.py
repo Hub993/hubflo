@@ -11,6 +11,7 @@ from storage import (
 
     # Models
     Task,
+    Inspection,
     SystemState,
     # Meeting model is used by meeting helpers
     Meeting,
@@ -29,6 +30,9 @@ from storage import (
     set_order_state,
     revoke_last,
     subcontractor_accuracy,
+
+    # Inspector scheduling
+    create_inspection,
 
     # Meetings
     create_meeting,
