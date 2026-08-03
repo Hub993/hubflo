@@ -2048,6 +2048,137 @@ def admin_inspections_json():
 
 # >>> PATCH_1_INSPECTION_ADMIN_END <<<
 
+# >>> PATCH_2_DELAY_ADMIN_START — READ-ONLY TEST VIEW V6.1 <<<
+
+@app.route("/admin/delays", methods=["GET"])
+def admin_delays_view():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage_v6_1 import DelayLog
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(DelayLog)
+            .order_by(DelayLog.id.desc())
+            .all()
+        )
+
+    def h(value):
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def display_datetime(value):
+        return value.isoformat(sep=" ") if value else ""
+
+    headings = (
+        "<tr>"
+        "<th>ID</th>"
+        "<th>Task ID</th>"
+        "<th>Project Code</th>"
+        "<th>Reporter</th>"
+        "<th>Days</th>"
+        "<th>Reason</th>"
+        "<th>Created At</th>"
+        "</tr>"
+    )
+
+    table_rows = []
+
+    for row in rows:
+        table_rows.append(
+            "<tr>"
+            f"<td>{row.id}</td>"
+            f"<td>{h(row.task_id)}</td>"
+            f"<td>{h(row.project_code)}</td>"
+            f"<td>{h(row.reporter)}</td>"
+            f"<td>{h(row.days)}</td>"
+            f"<td>{h(row.reason)}</td>"
+            f"<td>{h(display_datetime(row.created_at))}</td>"
+            "</tr>"
+        )
+
+    body = f"""
+    <html>
+    <head>
+        <title>HubFlo Delay Test View</title>
+        <style>
+            body{{
+                font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+            }}
+            table{{
+                border-collapse:collapse;
+                width:100%;
+            }}
+            th,td{{
+                border:1px solid #ddd;
+                padding:6px;
+                font-size:13px;
+                vertical-align:top;
+            }}
+            th{{
+                background:#f2f2f2;
+                text-align:left;
+            }}
+        </style>
+    </head>
+    <body>
+        <h2>HubFlo Critical-Path Delays — Test View</h2>
+        <p>Read-only verification endpoint.</p>
+        <table>
+            {headings}
+            {''.join(table_rows)}
+        </table>
+    </body>
+    </html>
+    """
+
+    return Response(
+        body,
+        200,
+        mimetype="text/html",
+    )
+
+
+@app.route("/admin/delays.json", methods=["GET"])
+def admin_delays_json():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage_v6_1 import DelayLog
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(DelayLog)
+            .order_by(DelayLog.id.desc())
+            .all()
+        )
+
+        output = []
+
+        for row in rows:
+            output.append({
+                "id": row.id,
+                "task_id": row.task_id,
+                "project_code": row.project_code,
+                "reporter": row.reporter,
+                "days": row.days,
+                "reason": row.reason,
+                "created_at": (
+                    row.created_at.isoformat()
+                    if row.created_at
+                    else None
+                ),
+            })
+
+    return jsonify(output), 200
+
+# >>> PATCH_2_DELAY_ADMIN_END <<<
+
 # >>> PATCH_11_APP_START — SUPPLIER DIRECTORY <<<
 
 @app.route("/admin/supplier/create", methods=["POST"])
