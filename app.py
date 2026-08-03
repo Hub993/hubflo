@@ -22,7 +22,7 @@ from storage_v6_1 import (
     record_change_order,
     add_task_to_group, get_group_children, edit_task_text,
     get_all_change_orders, create_call_reminder,
-    create_inspection
+    create_inspection, log_delay
 )
 
 from storage_v6_1 import Task
@@ -576,6 +576,45 @@ def parse_inspection_request(
     }
 
 # >>> PATCH_1_INSPECTION_CLASSIFIER_END <<<
+
+# >>> PATCH_2_DELAY_CLASSIFIER_START — CRITICAL-PATH DELAY TRACKING V6.1 <<<
+
+def classify_delay(text: str) -> bool:
+    t = (text or "").lower().strip()
+
+    if not t:
+        return False
+
+    negative_delay_patterns = [
+        r"\bno\s+delay\b",
+        r"\bno\s+delays\b",
+        r"\bnot\s+delayed\b",
+        r"\bnot\s+delay(?:ed|ing)?\b",
+        r"\bwithout\s+delay\b",
+        r"\bzero\s+delay\b",
+        r"\b0\s+days?\s+(?:of\s+)?delay\b",
+        r"\bnot\s+running\s+late\b",
+    ]
+
+    if any(
+        re.search(pattern, t)
+        for pattern in negative_delay_patterns
+    ):
+        return False
+
+    positive_delay_patterns = [
+        r"\bdelay(?:ed|ing|s)?\b",
+        r"\brunning\s+late\b",
+        r"\bbehind\s+schedule\b",
+        r"\blate\s+by\b",
+    ]
+
+    return any(
+        re.search(pattern, t)
+        for pattern in positive_delay_patterns
+    )
+
+# >>> PATCH_2_DELAY_CLASSIFIER_END <<<
 
 
 # ---------------------------------------------------------------------
@@ -1545,6 +1584,142 @@ def webhook():
             return ("", 200)
 
         # >>> PATCH_1_INSPECTION_WEBHOOK_END <<<
+
+        # >>> PATCH_2_DELAY_WEBHOOK_START — CRITICAL-PATH DELAY TRACKING V6.1 <<<
+
+        if text and classify_delay(text):
+            user_info = get_user_role(sender) or {}
+            project_code = user_info.get("project_code")
+
+            task_match = re.search(
+                r"\btask\s+#?(\d+)\b",
+                text.lower(),
+            )
+
+            if not task_match:
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    (
+                        "Please include the task number. "
+                        "For example: Delay task 101 "
+                        "by 3 days due to rain."
+                    ),
+                )
+                return ("", 200)
+
+            task_id = int(task_match.group(1))
+
+            days_match = re.search(
+                r"\b(?:by\s+)?"
+                r"(-?\d+(?:\.\d+)?)\s+days?\b",
+                text.lower(),
+            )
+
+            if not days_match:
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    (
+                        "Please include a positive delay duration. "
+                        "For example: Delay task 101 "
+                        "by 3 days due to rain."
+                    ),
+                )
+                return ("", 200)
+
+            delay_days = float(
+                days_match.group(1)
+            )
+
+            if delay_days <= 0:
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    (
+                        "Delay duration must be greater "
+                        "than zero days."
+                    ),
+                )
+                return ("", 200)
+
+            payload = {
+                "task_id": task_id,
+                "project_code": project_code,
+                "reporter": sender,
+                "days": delay_days,
+                "reason": text,
+            }
+
+            result = log_delay(payload)
+
+            if result.get("status") != "ok":
+                error_code = result.get("code")
+
+                if error_code == "sender_project_missing":
+                    message = (
+                        "Your WhatsApp number is not mapped "
+                        "to a project, so the delay cannot "
+                        "be logged."
+                    )
+
+                elif error_code == "task_project_missing":
+                    message = (
+                        f"Task {task_id} is not mapped to "
+                        "a project, so the delay cannot "
+                        "be logged."
+                    )
+
+                elif error_code == "task_not_found":
+                    message = (
+                        f"Task {task_id} was not found. "
+                        "Please check the task number."
+                    )
+
+                elif error_code == "project_mismatch":
+                    message = (
+                        f"Task {task_id} is not part of "
+                        "your mapped project."
+                    )
+
+                elif error_code == "invalid_task_id":
+                    message = (
+                        "Please provide a valid task number."
+                    )
+
+                elif error_code == "invalid_delay_days":
+                    message = (
+                        "Please provide a delay duration "
+                        "greater than zero days."
+                    )
+
+                else:
+                    message = (
+                        "The delay could not be logged. "
+                        "Please check the task number, "
+                        "project mapping, and delay duration."
+                    )
+
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    message,
+                )
+                return ("", 200)
+
+            send_whatsapp_text(
+                phone_id,
+                sender,
+                (
+                    f"Delay logged (#{result['id']}): "
+                    f"task {result['task_id']} delayed "
+                    f"by {result['days']:g} days."
+                ),
+            )
+
+            return ("", 200)
+
+        # >>> PATCH_2_DELAY_WEBHOOK_END <<<
 
 
         # -------------------------------------------------------------

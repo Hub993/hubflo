@@ -12,6 +12,7 @@ from storage import (
     # Models
     Task,
     Inspection,
+    DelayLog,
     SystemState,
     # Meeting model is used by meeting helpers
     Meeting,
@@ -33,6 +34,9 @@ from storage import (
 
     # Inspector scheduling
     create_inspection,
+
+    # Critical-path delay tracking
+    log_delay,
 
     # Meetings
     create_meeting,

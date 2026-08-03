@@ -148,6 +148,137 @@ def create_inspection(payload: dict) -> dict:
 
 # >>> PATCH_1_INSPECTION_STORAGE_END <<<
 
+# >>> PATCH_2_DELAY_STORAGE_START — CRITICAL-PATH DELAY TRACKING V6.1 <<<
+
+class DelayLog(Base):
+    __tablename__ = "delay_logs"
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, index=True)
+    project_code = Column(String, index=True)
+    reporter = Column(String)
+    days = Column(Float)
+    reason = Column(Text)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+
+
+def log_delay(payload: dict) -> dict:
+    """
+    Validate and create a critical-path delay record.
+
+    Required:
+      - sender mapped to a project
+      - valid existing task_id
+      - task mapped to a project
+      - task project exactly matches sender project
+      - positive delay duration
+    """
+    task_id = payload.get("task_id")
+    project_code = payload.get("project_code")
+    reporter = payload.get("reporter")
+    reason = payload.get("reason")
+
+    sender_project_code = (
+        str(project_code).strip()
+        if project_code is not None
+        else ""
+    )
+
+    if not sender_project_code:
+        return {
+            "status": "error",
+            "code": "sender_project_missing",
+            "message": (
+                "The sender is not mapped to a project."
+            ),
+        }
+
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError):
+        return {
+            "status": "error",
+            "code": "invalid_task_id",
+            "message": "A valid task number is required.",
+        }
+
+    try:
+        delay_days = float(payload.get("days"))
+    except (TypeError, ValueError):
+        return {
+            "status": "error",
+            "code": "invalid_delay_days",
+            "message": "A valid delay duration is required.",
+        }
+
+    if delay_days <= 0:
+        return {
+            "status": "error",
+            "code": "invalid_delay_days",
+            "message": (
+                "Delay duration must be greater than zero."
+            ),
+        }
+
+    with SessionLocal() as s:
+        task = s.get(Task, task_id)
+
+        if not task:
+            return {
+                "status": "error",
+                "code": "task_not_found",
+                "message": f"Task {task_id} was not found.",
+            }
+
+        task_project_code = (
+            str(task.project_code).strip()
+            if task.project_code is not None
+            else ""
+        )
+
+        if not task_project_code:
+            return {
+                "status": "error",
+                "code": "task_project_missing",
+                "message": (
+                    f"Task {task_id} is not mapped "
+                    f"to a project."
+                ),
+            }
+
+        if task_project_code != sender_project_code:
+            return {
+                "status": "error",
+                "code": "project_mismatch",
+                "message": (
+                    f"Task {task_id} belongs to project "
+                    f"{task_project_code}, not "
+                    f"{sender_project_code}."
+                ),
+            }
+
+        delay = DelayLog(
+            task_id=task.id,
+            project_code=task_project_code,
+            reporter=reporter,
+            days=delay_days,
+            reason=reason,
+        )
+
+        s.add(delay)
+        s.commit()
+        s.refresh(delay)
+
+        return {
+            "status": "ok",
+            "id": delay.id,
+            "task_id": delay.task_id,
+            "project_code": delay.project_code,
+            "days": delay.days,
+        }
+
+# >>> PATCH_2_DELAY_STORAGE_END <<<
+
 class Task(Base):
     __tablename__ = "tasks"
 
