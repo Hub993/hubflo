@@ -1731,6 +1731,148 @@ def admin_view_json():
 
     return jsonify(out)
 
+# >>> PATCH_1_INSPECTION_ADMIN_START — READ-ONLY TEST VIEW V6.1 <<<
+
+@app.route("/admin/inspections", methods=["GET"])
+def admin_inspections_view():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage_v6_1 import Inspection
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(Inspection)
+            .order_by(Inspection.id.desc())
+            .all()
+        )
+
+    def h(value):
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def display_datetime(value):
+        return value.isoformat(sep=" ") if value else ""
+
+    headings = (
+        "<tr>"
+        "<th>ID</th>"
+        "<th>Project Code</th>"
+        "<th>Phase</th>"
+        "<th>Required Date</th>"
+        "<th>Actual Date</th>"
+        "<th>Inspector</th>"
+        "<th>Notes</th>"
+        "<th>Created At</th>"
+        "</tr>"
+    )
+
+    table_rows = []
+
+    for row in rows:
+        table_rows.append(
+            "<tr>"
+            f"<td>{row.id}</td>"
+            f"<td>{h(row.project_code)}</td>"
+            f"<td>{h(row.phase)}</td>"
+            f"<td>{h(display_datetime(row.required_date))}</td>"
+            f"<td>{h(display_datetime(row.actual_date))}</td>"
+            f"<td>{h(row.inspector)}</td>"
+            f"<td>{h(row.notes)}</td>"
+            f"<td>{h(display_datetime(row.created_at))}</td>"
+            "</tr>"
+        )
+
+    body = f"""
+    <html>
+    <head>
+        <title>HubFlo Inspection Test View</title>
+        <style>
+            body{{
+                font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+            }}
+            table{{
+                border-collapse:collapse;
+                width:100%;
+            }}
+            th,td{{
+                border:1px solid #ddd;
+                padding:6px;
+                font-size:13px;
+                vertical-align:top;
+            }}
+            th{{
+                background:#f2f2f2;
+                text-align:left;
+            }}
+        </style>
+    </head>
+    <body>
+        <h2>HubFlo Inspections — Test View</h2>
+        <p>Read-only verification endpoint.</p>
+        <table>
+            {headings}
+            {''.join(table_rows)}
+        </table>
+    </body>
+    </html>
+    """
+
+    return Response(
+        body,
+        200,
+        mimetype="text/html",
+    )
+
+
+@app.route("/admin/inspections.json", methods=["GET"])
+def admin_inspections_json():
+    if not _check_admin():
+        return _auth_fail()
+
+    from storage_v6_1 import Inspection
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(Inspection)
+            .order_by(Inspection.id.desc())
+            .all()
+        )
+
+        output = []
+
+        for row in rows:
+            output.append({
+                "id": row.id,
+                "project_code": row.project_code,
+                "phase": row.phase,
+                "required_date": (
+                    row.required_date.isoformat()
+                    if row.required_date
+                    else None
+                ),
+                "actual_date": (
+                    row.actual_date.isoformat()
+                    if row.actual_date
+                    else None
+                ),
+                "inspector": row.inspector,
+                "notes": row.notes,
+                "created_at": (
+                    row.created_at.isoformat()
+                    if row.created_at
+                    else None
+                ),
+            })
+
+    return jsonify(output), 200
+
+# >>> PATCH_1_INSPECTION_ADMIN_END <<<
+
 # >>> PATCH_11_APP_START — SUPPLIER DIRECTORY <<<
 
 @app.route("/admin/supplier/create", methods=["POST"])
