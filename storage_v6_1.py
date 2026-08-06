@@ -13,6 +13,9 @@ from storage import (
     Task,
     Inspection,
     DelayLog,
+    # >>> FEATURE_3_REMINDER_FACADE_MODEL_START — V6.1 <<<
+    PMReminder,
+    # >>> FEATURE_3_REMINDER_FACADE_MODEL_END <<<
     SystemState,
     # Meeting model is used by meeting helpers
     Meeting,
@@ -37,6 +40,17 @@ from storage import (
 
     # Critical-path delay tracking
     log_delay,
+
+    # >>> FEATURE_3_REMINDER_FACADE_API_START — V6.1 <<<
+    create_pm_reminder,
+    claim_due_pm_reminders,
+    complete_pm_reminder_delivery,
+    fail_pm_reminder_delivery,
+    acknowledge_pm_reminder,
+    snooze_pm_reminder,
+    redirect_pm_reminder,
+    cancel_pm_reminder,
+    # >>> FEATURE_3_REMINDER_FACADE_API_END <<<
 
     # Meetings
     create_meeting,

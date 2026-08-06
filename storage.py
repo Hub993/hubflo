@@ -279,6 +279,718 @@ def log_delay(payload: dict) -> dict:
 
 # >>> PATCH_2_DELAY_STORAGE_END <<<
 
+# >>> FEATURE_3_REMINDER_STORAGE_START — REMINDER FRAMEWORK COMPLETION V6.1 <<<
+
+class PMReminder(Base):
+    __tablename__ = "pm_reminders"
+
+    id = Column(Integer, primary_key=True)
+
+    # The owner never changes. recipient_wa may change when redirected.
+    pm_wa = Column(String(64), nullable=False, index=True)
+    recipient_wa = Column(String(64), nullable=True, index=True)
+    project_code = Column(String(128), nullable=True, index=True)
+
+    # Preserve the inbound reminder text exactly; rule is scheduling metadata.
+    text = Column(Text, nullable=False)
+    rule = Column(String(128), nullable=True)
+    timezone = Column(String(64), default="America/New_York")
+
+    # next_run is stored as naive UTC for compatibility with existing storage.
+    next_run = Column(DateTime, nullable=False, index=True)
+    recurring = Column(Boolean, default=False, index=True)
+    recurrence_rule = Column(String(32), default="none")
+    recurrence_interval = Column(Integer, default=1)
+    recurrence_seconds = Column(Integer, nullable=True)
+    recurrence_anchor_day = Column(Integer, nullable=True)
+
+    status = Column(String(24), default="active", index=True)
+    active = Column(Boolean, default=True, index=True)
+
+    # Database-backed delivery claim prevents concurrent scheduler execution.
+    claimed_at = Column(DateTime, nullable=True, index=True)
+    claim_token = Column(String(64), nullable=True, index=True)
+    retry_after = Column(DateTime, nullable=True, index=True)
+
+    delivered_at = Column(DateTime, nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    snoozed_at = Column(DateTime, nullable=True)
+    redirected_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    failed_at = Column(DateTime, nullable=True)
+
+    delivery_count = Column(Integer, default=0)
+    failure_count = Column(Integer, default=0)
+    last_error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=dt.datetime.utcnow,
+        onupdate=dt.datetime.utcnow,
+    )
+
+
+def _normalize_pm_reminder_utc(value) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    if not isinstance(value, dt.datetime):
+        return None
+
+    if value.tzinfo is not None:
+        value = value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+    return value
+
+
+def _as_pm_reminder_dict(reminder: PMReminder) -> dict:
+    return {
+        "id": reminder.id,
+        "pm_wa": reminder.pm_wa,
+        "recipient_wa": reminder.recipient_wa or reminder.pm_wa,
+        "project_code": reminder.project_code,
+        "text": reminder.text,
+        "rule": reminder.rule,
+        "timezone": reminder.timezone or "America/New_York",
+        "next_run": reminder.next_run,
+        "recurring": bool(reminder.recurring),
+        "recurrence_rule": reminder.recurrence_rule or "none",
+        "recurrence_interval": reminder.recurrence_interval or 1,
+        "recurrence_seconds": reminder.recurrence_seconds,
+        "recurrence_anchor_day": reminder.recurrence_anchor_day,
+        "status": reminder.status,
+        "active": bool(reminder.active),
+        "claim_token": reminder.claim_token,
+        "retry_after": reminder.retry_after,
+        "delivered_at": reminder.delivered_at,
+        "acknowledged_at": reminder.acknowledged_at,
+        "cancelled_at": reminder.cancelled_at,
+        "completed_at": reminder.completed_at,
+        "delivery_count": reminder.delivery_count or 0,
+        "failure_count": reminder.failure_count or 0,
+        "last_error": reminder.last_error,
+        "created_at": reminder.created_at,
+        "updated_at": reminder.updated_at,
+    }
+
+
+def create_pm_reminder(payload: dict) -> dict:
+    """Create a scheduled reminder while preserving its text exactly."""
+    payload = payload or {}
+    owner_wa = str(payload.get("pm_wa") or payload.get("owner_wa") or "").strip()
+    if not owner_wa:
+        return {"status": "error", "code": "owner_required"}
+
+    next_run = _normalize_pm_reminder_utc(payload.get("next_run"))
+    if next_run is None:
+        return {"status": "error", "code": "next_run_required"}
+
+    original_text = payload.get("text")
+    if original_text is None:
+        original_text = payload.get("reminder_text")
+    if original_text is None:
+        original_text = payload.get("rule")
+    if original_text is None:
+        original_text = ""
+    if not isinstance(original_text, str):
+        original_text = str(original_text)
+
+    with SessionLocal() as s:
+        timezone_name = payload.get("timezone")
+        if not timezone_name:
+            owner = s.query(User).filter(User.wa_id == owner_wa).first()
+            timezone_name = (
+                owner.timezone
+                if owner and owner.timezone
+                else "America/New_York"
+            )
+
+        recurrence_rule = str(
+            payload.get("recurrence_rule") or "none"
+        ).strip().lower()
+        recurrence_interval = payload.get("recurrence_interval") or 1
+        try:
+            recurrence_interval = max(1, int(recurrence_interval))
+        except (TypeError, ValueError):
+            recurrence_interval = 1
+
+        recurrence_seconds = payload.get("recurrence_seconds")
+        try:
+            recurrence_seconds = (
+                int(recurrence_seconds)
+                if recurrence_seconds is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            recurrence_seconds = None
+
+        recurring = bool(payload.get("recurring")) or (
+            recurrence_rule not in ("", "none", "once")
+        ) or bool(recurrence_seconds)
+
+        anchor_day = payload.get("recurrence_anchor_day")
+        try:
+            anchor_day = int(anchor_day) if anchor_day is not None else None
+        except (TypeError, ValueError):
+            anchor_day = None
+
+        reminder = PMReminder(
+            pm_wa=owner_wa,
+            recipient_wa=(
+                str(payload.get("recipient_wa") or owner_wa).strip()
+                or owner_wa
+            ),
+            project_code=payload.get("project_code"),
+            text=original_text,
+            rule=payload.get("rule") or (recurrence_rule if recurring else "once"),
+            timezone=str(timezone_name or "America/New_York"),
+            next_run=next_run,
+            recurring=recurring,
+            recurrence_rule=recurrence_rule if recurring else "none",
+            recurrence_interval=recurrence_interval,
+            recurrence_seconds=recurrence_seconds,
+            recurrence_anchor_day=anchor_day,
+            status="active",
+            active=True,
+        )
+        s.add(reminder)
+        s.commit()
+        s.refresh(reminder)
+        result = _as_pm_reminder_dict(reminder)
+
+    log_audit(
+        owner_wa,
+        "reminder_create",
+        "pm_reminder",
+        result["id"],
+        details=f"next_run={result['next_run']}",
+    )
+    result["status"] = "ok"
+    return result
+
+
+def _pm_reminder_recurrence_kind(reminder: PMReminder) -> str:
+    kind = (reminder.recurrence_rule or "").strip().lower()
+    if kind not in ("", "none", "once"):
+        return kind
+
+    rule_text = (reminder.rule or "").lower()
+    if "weekday" in rule_text:
+        return "weekdays"
+    if "month" in rule_text:
+        return "monthly"
+    if "week" in rule_text:
+        return "weekly"
+    if "day" in rule_text or "daily" in rule_text:
+        return "daily"
+    if "hour" in rule_text or "hourly" in rule_text:
+        return "hourly"
+    if reminder.recurrence_seconds:
+        return "interval"
+    return "none"
+
+
+def _pm_reminder_is_recurring(reminder: PMReminder) -> bool:
+    return bool(reminder.recurring) or (
+        _pm_reminder_recurrence_kind(reminder) != "none"
+    )
+
+
+def _add_pm_reminder_months(
+    local_value: dt.datetime,
+    months: int,
+    anchor_day: int,
+) -> dt.datetime:
+    import calendar
+
+    month_index = (local_value.year * 12 + local_value.month - 1) + months
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(anchor_day, calendar.monthrange(year, month)[1])
+    return local_value.replace(year=year, month=month, day=day)
+
+
+def _advance_pm_reminder_next_run(
+    reminder: PMReminder,
+    after_utc: dt.datetime,
+) -> dt.datetime:
+    """Advance recurrence in the owner's timezone and return naive UTC."""
+    from zoneinfo import ZoneInfo
+
+    after_utc = _normalize_pm_reminder_utc(after_utc) or dt.datetime.utcnow()
+    current_utc = reminder.next_run or after_utc
+    kind = _pm_reminder_recurrence_kind(reminder)
+    interval = max(1, int(reminder.recurrence_interval or 1))
+
+    if kind in ("interval", "hourly"):
+        seconds = reminder.recurrence_seconds
+        if not seconds:
+            seconds = 3600 * interval
+        seconds = max(60, int(seconds))
+        elapsed = max(0.0, (after_utc - current_utc).total_seconds())
+        steps = max(1, int(elapsed // seconds) + 1)
+        return current_utc + dt.timedelta(seconds=steps * seconds)
+
+    try:
+        owner_tz = ZoneInfo(reminder.timezone or "America/New_York")
+    except Exception:
+        owner_tz = ZoneInfo("America/New_York")
+
+    current_local = current_utc.replace(
+        tzinfo=dt.timezone.utc
+    ).astimezone(owner_tz)
+    candidate_local = current_local
+    anchor_day = reminder.recurrence_anchor_day or current_local.day
+
+    for _ in range(3700):
+        if kind == "daily":
+            candidate_local = candidate_local + dt.timedelta(days=interval)
+        elif kind == "weekly":
+            candidate_local = candidate_local + dt.timedelta(weeks=interval)
+        elif kind == "monthly":
+            candidate_local = _add_pm_reminder_months(
+                candidate_local,
+                interval,
+                anchor_day,
+            )
+        elif kind == "weekdays":
+            business_days = interval
+            while business_days > 0:
+                candidate_local = candidate_local + dt.timedelta(days=1)
+                if candidate_local.weekday() < 5:
+                    business_days -= 1
+        else:
+            candidate_local = candidate_local + dt.timedelta(days=1)
+
+        candidate_utc = candidate_local.astimezone(
+            dt.timezone.utc
+        ).replace(tzinfo=None)
+        if candidate_utc > after_utc:
+            return candidate_utc
+
+    # Defensive fallback; normal recurrence paths return inside the loop.
+    return after_utc + dt.timedelta(days=1)
+
+
+def claim_due_pm_reminders(
+    now_utc: Optional[dt.datetime] = None,
+    limit: int = 50,
+    lease_seconds: int = 300,
+) -> list[dict]:
+    """Atomically claim due reminders so only one worker can deliver each."""
+    import uuid
+    from sqlalchemy import or_
+
+    now_utc = _normalize_pm_reminder_utc(now_utc) or dt.datetime.utcnow()
+    stale_before = now_utc - dt.timedelta(seconds=max(60, lease_seconds))
+
+    with SessionLocal() as s:
+        stale_rows = (
+            s.query(PMReminder)
+            .filter(
+                PMReminder.active == True,
+                PMReminder.status == "delivering",
+                PMReminder.claimed_at != None,
+                PMReminder.claimed_at <= stale_before,
+            )
+            .all()
+        )
+        for stale in stale_rows:
+            stale.status = "active"
+            stale.claimed_at = None
+            stale.claim_token = None
+            stale.retry_after = now_utc + dt.timedelta(minutes=5)
+            stale.failed_at = now_utc
+            stale.failure_count = (stale.failure_count or 0) + 1
+            stale.last_error = "delivery claim expired before completion"
+
+        s.flush()
+
+        candidate_ids = [
+            row[0]
+            for row in (
+                s.query(PMReminder.id)
+                .filter(
+                    PMReminder.active == True,
+                    PMReminder.status == "active",
+                    PMReminder.next_run <= now_utc,
+                    or_(
+                        PMReminder.retry_after == None,
+                        PMReminder.retry_after <= now_utc,
+                    ),
+                )
+                .order_by(PMReminder.next_run.asc(), PMReminder.id.asc())
+                .limit(max(1, int(limit)))
+                .all()
+            )
+        ]
+
+        claimed = []
+        for reminder_id in candidate_ids:
+            token = uuid.uuid4().hex
+            updated = (
+                s.query(PMReminder)
+                .filter(
+                    PMReminder.id == reminder_id,
+                    PMReminder.active == True,
+                    PMReminder.status == "active",
+                    PMReminder.next_run <= now_utc,
+                    or_(
+                        PMReminder.retry_after == None,
+                        PMReminder.retry_after <= now_utc,
+                    ),
+                )
+                .update(
+                    {
+                        PMReminder.status: "delivering",
+                        PMReminder.claimed_at: now_utc,
+                        PMReminder.claim_token: token,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated == 1:
+                s.flush()
+                reminder = s.get(PMReminder, reminder_id)
+                claimed.append(_as_pm_reminder_dict(reminder))
+
+        s.commit()
+        return claimed
+
+
+def complete_pm_reminder_delivery(
+    reminder_id: int,
+    claim_token: str,
+    delivered_at: Optional[dt.datetime] = None,
+) -> dict:
+    delivered_at = (
+        _normalize_pm_reminder_utc(delivered_at)
+        or dt.datetime.utcnow()
+    )
+
+    with SessionLocal() as s:
+        reminder = (
+            s.query(PMReminder)
+            .filter(
+                PMReminder.id == int(reminder_id),
+                PMReminder.status == "delivering",
+                PMReminder.claim_token == claim_token,
+            )
+            .first()
+        )
+        if not reminder:
+            return {"status": "error", "code": "claim_not_found"}
+
+        reminder.delivered_at = delivered_at
+        reminder.delivery_count = (reminder.delivery_count or 0) + 1
+        reminder.failure_count = 0
+        reminder.failed_at = None
+        reminder.last_error = None
+        reminder.retry_after = None
+        reminder.claimed_at = None
+        reminder.claim_token = None
+        reminder.acknowledged_at = None
+
+        if _pm_reminder_is_recurring(reminder):
+            reminder.recurring = True
+            reminder.next_run = _advance_pm_reminder_next_run(
+                reminder,
+                delivered_at,
+            )
+            reminder.status = "active"
+            reminder.active = True
+            reminder.completed_at = None
+        else:
+            reminder.status = "completed"
+            reminder.active = False
+            reminder.completed_at = delivered_at
+
+        s.commit()
+        s.refresh(reminder)
+        result = _as_pm_reminder_dict(reminder)
+
+    log_audit(
+        reminder.pm_wa,
+        "reminder_delivered",
+        "pm_reminder",
+        int(reminder_id),
+        details=f"recipient={result['recipient_wa']}",
+    )
+    result["status_result"] = "ok"
+    return result
+
+
+def fail_pm_reminder_delivery(
+    reminder_id: int,
+    claim_token: str,
+    error: str,
+    failed_at: Optional[dt.datetime] = None,
+) -> dict:
+    failed_at = _normalize_pm_reminder_utc(failed_at) or dt.datetime.utcnow()
+
+    with SessionLocal() as s:
+        reminder = (
+            s.query(PMReminder)
+            .filter(
+                PMReminder.id == int(reminder_id),
+                PMReminder.status == "delivering",
+                PMReminder.claim_token == claim_token,
+            )
+            .first()
+        )
+        if not reminder:
+            return {"status": "error", "code": "claim_not_found"}
+
+        reminder.failure_count = (reminder.failure_count or 0) + 1
+        backoff_minutes = min(
+            60,
+            5 * (2 ** min(reminder.failure_count - 1, 4)),
+        )
+        reminder.failed_at = failed_at
+        reminder.last_error = str(error or "delivery failed")[:2000]
+        reminder.retry_after = failed_at + dt.timedelta(
+            minutes=backoff_minutes
+        )
+        reminder.status = "active"
+        reminder.active = True
+        reminder.claimed_at = None
+        reminder.claim_token = None
+
+        s.commit()
+        s.refresh(reminder)
+        result = _as_pm_reminder_dict(reminder)
+
+    log_audit(
+        reminder.pm_wa,
+        "reminder_delivery_failed",
+        "pm_reminder",
+        int(reminder_id),
+        details=result["last_error"],
+    )
+    result["status_result"] = "retry_scheduled"
+    return result
+
+
+def _pm_reminder_for_actor(
+    session,
+    actor_wa: str,
+    reminder_id: Optional[int] = None,
+    active_only: bool = False,
+    delivered_only: bool = False,
+) -> Optional[PMReminder]:
+    q = session.query(PMReminder).filter(
+        (PMReminder.pm_wa == actor_wa)
+        | (PMReminder.recipient_wa == actor_wa)
+    )
+
+    if reminder_id is not None:
+        try:
+            q = q.filter(PMReminder.id == int(reminder_id))
+        except (TypeError, ValueError):
+            return None
+
+    if active_only:
+        q = q.filter(
+            PMReminder.active == True,
+            PMReminder.status == "active",
+        )
+
+    if delivered_only:
+        q = q.filter(
+            PMReminder.delivered_at != None,
+            PMReminder.status != "cancelled",
+        )
+        return q.order_by(
+            PMReminder.delivered_at.desc(),
+            PMReminder.id.desc(),
+        ).first()
+
+    return q.order_by(PMReminder.id.desc()).first()
+
+
+def acknowledge_pm_reminder(
+    actor_wa: str,
+    reminder_id: Optional[int] = None,
+) -> dict:
+    now_utc = dt.datetime.utcnow()
+    with SessionLocal() as s:
+        reminder = _pm_reminder_for_actor(
+            s,
+            actor_wa,
+            reminder_id=reminder_id,
+            delivered_only=True,
+        )
+        if not reminder:
+            return {"status": "not_found"}
+
+        reminder.acknowledged_at = now_utc
+        s.commit()
+        s.refresh(reminder)
+        result = _as_pm_reminder_dict(reminder)
+
+    log_audit(actor_wa, "reminder_acknowledge", "pm_reminder", result["id"])
+    result["status_result"] = "acknowledged"
+    return result
+
+
+def snooze_pm_reminder(
+    actor_wa: str,
+    until_utc: dt.datetime,
+    reminder_id: Optional[int] = None,
+) -> dict:
+    until_utc = _normalize_pm_reminder_utc(until_utc)
+    if until_utc is None or until_utc <= dt.datetime.utcnow():
+        return {"status": "error", "code": "invalid_snooze_time"}
+
+    with SessionLocal() as s:
+        reminder = _pm_reminder_for_actor(
+            s,
+            actor_wa,
+            reminder_id=reminder_id,
+            active_only=True,
+        )
+        if not reminder:
+            # A successfully delivered one-time reminder is completed
+            # automatically, but may still be reopened by Snooze/Postpone.
+            reminder = _pm_reminder_for_actor(
+                s,
+                actor_wa,
+                reminder_id=reminder_id,
+                delivered_only=True,
+            )
+        if not reminder:
+            return {"status": "not_found"}
+
+        reminder.next_run = until_utc
+        reminder.retry_after = None
+        reminder.snoozed_at = dt.datetime.utcnow()
+        reminder.acknowledged_at = None
+        reminder.claimed_at = None
+        reminder.claim_token = None
+        reminder.status = "active"
+        reminder.active = True
+        reminder.completed_at = None
+        reminder.cancelled_at = None
+        s.commit()
+        s.refresh(reminder)
+        result = _as_pm_reminder_dict(reminder)
+
+    log_audit(
+        actor_wa,
+        "reminder_snooze",
+        "pm_reminder",
+        result["id"],
+        details=f"next_run={result['next_run']}",
+    )
+    result["status_result"] = "snoozed"
+    return result
+
+
+def redirect_pm_reminder(
+    actor_wa: str,
+    recipient_wa: str,
+    reminder_id: Optional[int] = None,
+) -> dict:
+    recipient_wa = str(recipient_wa or "").strip()
+    if not recipient_wa:
+        return {"status": "error", "code": "recipient_required"}
+
+    with SessionLocal() as s:
+        reminder = _pm_reminder_for_actor(
+            s,
+            actor_wa,
+            reminder_id=reminder_id,
+            active_only=True,
+        )
+        reopened_completed_one_time = False
+        if not reminder:
+            # A successfully delivered one-time reminder is completed
+            # automatically, but may still be reopened by Redirect/Reassign.
+            reminder = _pm_reminder_for_actor(
+                s,
+                actor_wa,
+                reminder_id=reminder_id,
+                delivered_only=True,
+            )
+            reopened_completed_one_time = bool(
+                reminder
+                and reminder.status == "completed"
+                and not reminder.active
+                and not _pm_reminder_is_recurring(reminder)
+            )
+        if not reminder:
+            return {"status": "not_found"}
+
+        prior_recipient = reminder.recipient_wa or reminder.pm_wa
+        reminder.recipient_wa = recipient_wa
+        reminder.redirected_at = dt.datetime.utcnow()
+
+        if reopened_completed_one_time:
+            reminder.next_run = dt.datetime.utcnow()
+            reminder.status = "active"
+            reminder.active = True
+            reminder.completed_at = None
+            reminder.claimed_at = None
+            reminder.claim_token = None
+            reminder.retry_after = None
+            reminder.failed_at = None
+            reminder.failure_count = 0
+            reminder.last_error = None
+
+        s.commit()
+        s.refresh(reminder)
+        result = _as_pm_reminder_dict(reminder)
+
+    log_audit(
+        actor_wa,
+        "reminder_redirect",
+        "pm_reminder",
+        result["id"],
+        details=f"from={prior_recipient};to={recipient_wa}",
+    )
+    result["status_result"] = "redirected"
+    return result
+
+
+def cancel_pm_reminder(
+    actor_wa: str,
+    reminder_id: Optional[int] = None,
+) -> dict:
+    now_utc = dt.datetime.utcnow()
+    with SessionLocal() as s:
+        reminder = _pm_reminder_for_actor(
+            s,
+            actor_wa,
+            reminder_id=reminder_id,
+            active_only=True,
+        )
+        if not reminder:
+            return {"status": "not_found"}
+
+        reminder.status = "cancelled"
+        reminder.active = False
+        reminder.cancelled_at = now_utc
+        reminder.claimed_at = None
+        reminder.claim_token = None
+        reminder.retry_after = None
+        s.commit()
+        s.refresh(reminder)
+        result = _as_pm_reminder_dict(reminder)
+
+    log_audit(actor_wa, "reminder_cancel", "pm_reminder", result["id"])
+    result["status_result"] = "cancelled"
+    return result
+
+# >>> FEATURE_3_REMINDER_STORAGE_END <<<
+
 class Task(Base):
     __tablename__ = "tasks"
 
@@ -462,6 +1174,79 @@ def _repair_tasks():
         with ENGINE.connect() as conn:
             conn.execute(text("ALTER TABLE tasks DROP COLUMN client_id"))
 
+# >>> FEATURE_3_REMINDER_SCHEMA_REPAIR_START — BACKWARD COMPATIBILITY V6.1 <<<
+
+def _repair_pm_reminders():
+    """Add lifecycle columns when an earlier reminder table already exists."""
+    insp = inspect(ENGINE)
+    if "pm_reminders" not in insp.get_table_names():
+        return
+
+    existing = {c["name"] for c in insp.get_columns("pm_reminders")}
+    additions = {
+        "recipient_wa": "VARCHAR(64)",
+        "project_code": "VARCHAR(128)",
+        "text": "TEXT",
+        "rule": "VARCHAR(128)",
+        "timezone": "VARCHAR(64)",
+        "next_run": "TIMESTAMP",
+        "recurring": "BOOLEAN",
+        "recurrence_rule": "VARCHAR(32)",
+        "recurrence_interval": "INTEGER",
+        "recurrence_seconds": "INTEGER",
+        "recurrence_anchor_day": "INTEGER",
+        "status": "VARCHAR(24)",
+        "active": "BOOLEAN",
+        "claimed_at": "TIMESTAMP",
+        "claim_token": "VARCHAR(64)",
+        "retry_after": "TIMESTAMP",
+        "delivered_at": "TIMESTAMP",
+        "acknowledged_at": "TIMESTAMP",
+        "snoozed_at": "TIMESTAMP",
+        "redirected_at": "TIMESTAMP",
+        "cancelled_at": "TIMESTAMP",
+        "completed_at": "TIMESTAMP",
+        "failed_at": "TIMESTAMP",
+        "delivery_count": "INTEGER",
+        "failure_count": "INTEGER",
+        "last_error": "TEXT",
+        "created_at": "TIMESTAMP",
+        "updated_at": "TIMESTAMP",
+    }
+
+    true_literal = "TRUE" if ENGINE.dialect.name == "postgresql" else "1"
+    false_literal = "FALSE" if ENGINE.dialect.name == "postgresql" else "0"
+
+    with ENGINE.begin() as conn:
+        for column_name, column_type in additions.items():
+            if column_name not in existing:
+                conn.execute(text(
+                    f"ALTER TABLE pm_reminders "
+                    f"ADD COLUMN {column_name} {column_type}"
+                ))
+
+        conn.execute(text(
+            "UPDATE pm_reminders "
+            "SET recipient_wa = COALESCE(recipient_wa, pm_wa), "
+            "text = COALESCE(text, rule, ''), "
+            "timezone = COALESCE(NULLIF(timezone, ''), "
+            "(SELECT timezone FROM users "
+            "WHERE users.wa_id = pm_reminders.pm_wa LIMIT 1), "
+            "'America/New_York'), "
+            "recurring = COALESCE(recurring, " + false_literal + "), "
+            "recurrence_rule = COALESCE(recurrence_rule, 'none'), "
+            "recurrence_interval = COALESCE(recurrence_interval, 1), "
+            "status = COALESCE(status, 'active'), "
+            "active = COALESCE(active, " + true_literal + "), "
+            "delivery_count = COALESCE(delivery_count, 0), "
+            "failure_count = COALESCE(failure_count, 0), "
+            "created_at = COALESCE(created_at, CURRENT_TIMESTAMP), "
+            "updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"
+        ))
+
+# >>> FEATURE_3_REMINDER_SCHEMA_REPAIR_END <<<
+
+
 # ---------------------------------------------------------------------
 # Hygiene helpers (used by /heartbeat and tether checks)
 # ---------------------------------------------------------------------
@@ -501,6 +1286,13 @@ def init_db():
         _repair_tasks()
     except Exception:
         pass
+
+    # >>> FEATURE_3_REMINDER_INIT_START — SCHEMA REPAIR V6.1 <<<
+    try:
+        _repair_pm_reminders()
+    except Exception:
+        pass
+    # >>> FEATURE_3_REMINDER_INIT_END <<<
 
     return True
 

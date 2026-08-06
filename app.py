@@ -22,7 +22,13 @@ from storage_v6_1 import (
     record_change_order,
     add_task_to_group, get_group_children, edit_task_text,
     get_all_change_orders, create_call_reminder,
-    create_inspection, log_delay
+    create_inspection, log_delay,
+    # >>> FEATURE_3_REMINDER_IMPORTS_START — REMINDER FRAMEWORK V6.1 <<<
+    PMReminder, create_pm_reminder, claim_due_pm_reminders,
+    complete_pm_reminder_delivery, fail_pm_reminder_delivery,
+    acknowledge_pm_reminder, snooze_pm_reminder,
+    redirect_pm_reminder, cancel_pm_reminder,
+    # >>> FEATURE_3_REMINDER_IMPORTS_END <<<
 )
 
 from storage_v6_1 import Task
@@ -615,6 +621,513 @@ def classify_delay(text: str) -> bool:
     )
 
 # >>> PATCH_2_DELAY_CLASSIFIER_END <<<
+
+
+# >>> FEATURE_3_REMINDER_CLASSIFIER_START — REMINDER FRAMEWORK COMPLETION V6.1 <<<
+
+_REMINDER_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+_REMINDER_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def classify_pm_reminder(text: str) -> bool:
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+
+    return bool(
+        re.search(r"\bremind\s+me\b", t)
+        or re.search(r"\bset\s+(?:a\s+)?reminder\b", t)
+    )
+
+
+def classify_pm_reminder_lifecycle(text: str) -> Optional[str]:
+    t = (text or "").lower().strip()
+    if not t:
+        return None
+
+    # Creation commands take precedence even when the reminder body
+    # contains lifecycle words such as cancel, reassign, or acknowledge.
+    if re.match(
+        r"^(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\b",
+        t,
+    ):
+        return None
+
+    if t in ("ok", "okay", "ack", "acknowledge"):
+        return "acknowledge"
+
+    if re.match(
+        r"^(?:please\s+)?(?:ok|okay|ack|acknowledge)\b.*\breminder\b",
+        t,
+    ):
+        return "acknowledge"
+
+    if re.match(
+        r"^(?:please\s+)?(?:snooze|postpone)\b.*\breminder\b",
+        t,
+    ):
+        return "snooze"
+
+    if re.match(
+        r"^(?:please\s+)?(?:redirect|reassign)\b.*\breminder\b",
+        t,
+    ):
+        return "redirect"
+
+    if re.match(
+        r"^(?:please\s+)?cancel\b.*\breminder\b",
+        t,
+    ):
+        return "cancel"
+
+    return None
+
+
+def _pm_reminder_id_from_text(text: str) -> Optional[int]:
+    t = (text or "").lower()
+    match = re.search(r"\breminder\s*#?\s*(\d+)\b", t)
+    if not match:
+        match = re.search(
+            r"^(?:ok|okay|ack|acknowledge)\s*#?\s*(\d+)\b",
+            t.strip(),
+        )
+    return int(match.group(1)) if match else None
+
+
+def _pm_reminder_clock(text: str) -> Optional[dt.time]:
+    t = (text or "").lower()
+
+    if re.search(r"\bat\s+noon\b", t):
+        return dt.time(12, 0)
+    if re.search(r"\bat\s+midnight\b", t):
+        return dt.time(0, 0)
+
+    match = re.search(
+        r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+        t,
+    )
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = match.group(3)
+
+    if minute > 59:
+        return None
+
+    if meridiem:
+        if hour < 1 or hour > 12:
+            return None
+        if meridiem == "am":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+    elif hour > 23:
+        return None
+
+    return dt.time(hour, minute)
+
+
+def _pm_reminder_next_weekday(
+    start_date: dt.date,
+    weekday: int,
+    include_today: bool = True,
+) -> dt.date:
+    days_ahead = (weekday - start_date.weekday()) % 7
+    if days_ahead == 0 and not include_today:
+        days_ahead = 7
+    return start_date + dt.timedelta(days=days_ahead)
+
+
+def _pm_reminder_add_months(
+    value: dt.datetime,
+    months: int,
+    anchor_day: Optional[int] = None,
+) -> dt.datetime:
+    import calendar
+
+    month_index = value.year * 12 + value.month - 1 + months
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(
+        anchor_day or value.day,
+        calendar.monthrange(year, month)[1],
+    )
+    return value.replace(year=year, month=month, day=day)
+
+
+def _pm_reminder_to_utc_naive(local_value: dt.datetime) -> dt.datetime:
+    return local_value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
+def parse_pm_reminder_request(
+    text: str,
+    timezone_name: str = "America/New_York",
+    now_local: Optional[dt.datetime] = None,
+) -> Optional[dict]:
+    """Parse initial schedule metadata without altering the stored text."""
+    raw = text or ""
+    t = raw.lower().strip()
+    if not t:
+        return None
+
+    try:
+        owner_tz = ZoneInfo(timezone_name or "America/New_York")
+    except Exception:
+        owner_tz = ZoneInfo("America/New_York")
+        timezone_name = "America/New_York"
+
+    if now_local is None:
+        now_local = dt.datetime.now(owner_tz)
+    elif now_local.tzinfo is None:
+        now_local = now_local.replace(tzinfo=owner_tz)
+    else:
+        now_local = now_local.astimezone(owner_tz)
+
+    recurrence_rule = "none"
+    recurrence_interval = 1
+    recurrence_seconds = None
+    recurrence_anchor_day = None
+
+    every_n_match = re.search(
+        r"\bevery\s+(\d+)\s+"
+        r"(minutes?|hours?|days?|weeks?|months?)\b",
+        t,
+    )
+    if every_n_match:
+        recurrence_interval = max(1, int(every_n_match.group(1)))
+        unit = every_n_match.group(2)
+        if unit.startswith("minute"):
+            recurrence_rule = "interval"
+            recurrence_seconds = recurrence_interval * 60
+        elif unit.startswith("hour"):
+            recurrence_rule = "interval"
+            recurrence_seconds = recurrence_interval * 3600
+        elif unit.startswith("day"):
+            recurrence_rule = "daily"
+        elif unit.startswith("week"):
+            recurrence_rule = "weekly"
+        else:
+            recurrence_rule = "monthly"
+
+    weekday_recurrence_match = re.search(
+        r"\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        t,
+    )
+    if weekday_recurrence_match:
+        recurrence_rule = "weekly"
+
+    if re.search(r"\bevery\s+weekday\b", t):
+        recurrence_rule = "weekdays"
+    elif re.search(r"\b(?:every\s+day|daily)\b", t):
+        recurrence_rule = "daily"
+    elif re.search(r"\b(?:every\s+week|weekly)\b", t):
+        recurrence_rule = "weekly"
+    elif re.search(r"\b(?:every\s+month|monthly)\b", t):
+        recurrence_rule = "monthly"
+    elif re.search(r"\b(?:every\s+hour|hourly)\b", t):
+        recurrence_rule = "hourly"
+        recurrence_seconds = 3600
+
+    relative_match = re.search(
+        r"\bin\s+(\d+)\s+(minutes?|hours?|days?|weeks?)\b",
+        t,
+    )
+    if relative_match and recurrence_rule == "none":
+        amount = int(relative_match.group(1))
+        unit = relative_match.group(2)
+        if amount <= 0:
+            return None
+        if unit.startswith("minute"):
+            next_local = now_local + dt.timedelta(minutes=amount)
+        elif unit.startswith("hour"):
+            next_local = now_local + dt.timedelta(hours=amount)
+        elif unit.startswith("day"):
+            next_local = now_local + dt.timedelta(days=amount)
+        else:
+            next_local = now_local + dt.timedelta(weeks=amount)
+
+        return {
+            "next_run": _pm_reminder_to_utc_naive(next_local),
+            "rule": "once",
+            "recurring": False,
+            "recurrence_rule": "none",
+            "recurrence_interval": 1,
+            "recurrence_seconds": None,
+            "recurrence_anchor_day": None,
+            "timezone": timezone_name,
+        }
+
+    clock_value = _pm_reminder_clock(t)
+
+    # Fixed intervals without an explicit clock begin after one interval.
+    if recurrence_rule in ("interval", "hourly") and clock_value is None:
+        seconds = recurrence_seconds or (3600 * recurrence_interval)
+        next_local = now_local + dt.timedelta(seconds=seconds)
+        return {
+            "next_run": _pm_reminder_to_utc_naive(next_local),
+            "rule": recurrence_rule,
+            "recurring": True,
+            "recurrence_rule": recurrence_rule,
+            "recurrence_interval": recurrence_interval,
+            "recurrence_seconds": seconds,
+            "recurrence_anchor_day": None,
+            "timezone": timezone_name,
+        }
+
+    target_date = None
+
+    iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", t)
+    if iso_match:
+        try:
+            target_date = dt.date(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+            )
+        except ValueError:
+            return None
+
+    if target_date is None:
+        numeric_match = re.search(
+            r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b",
+            t,
+        )
+        if numeric_match:
+            month = int(numeric_match.group(1))
+            day = int(numeric_match.group(2))
+            year_text = numeric_match.group(3)
+            year = int(year_text) if year_text else now_local.year
+            if year < 100:
+                year += 2000
+            try:
+                target_date = dt.date(year, month, day)
+            except ValueError:
+                return None
+            if not year_text and target_date < now_local.date():
+                target_date = dt.date(year + 1, month, day)
+
+    if target_date is None:
+        month_names = "|".join(_REMINDER_MONTHS)
+        month_match = re.search(
+            rf"\b({month_names})\s+(\d{{1,2}})"
+            rf"(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b",
+            t,
+        )
+        if month_match:
+            month = _REMINDER_MONTHS[month_match.group(1)]
+            day = int(month_match.group(2))
+            year_text = month_match.group(3)
+            year = int(year_text) if year_text else now_local.year
+            try:
+                target_date = dt.date(year, month, day)
+            except ValueError:
+                return None
+            if not year_text and target_date < now_local.date():
+                target_date = dt.date(year + 1, month, day)
+
+    if target_date is None:
+        if re.search(r"\btomorrow\b", t):
+            target_date = now_local.date() + dt.timedelta(days=1)
+        elif re.search(r"\btoday\b", t):
+            target_date = now_local.date()
+
+    weekday_match = re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        t,
+    )
+    if target_date is None and weekday_match:
+        weekday = _REMINDER_WEEKDAYS[weekday_match.group(1)]
+        target_date = _pm_reminder_next_weekday(
+            now_local.date(),
+            weekday,
+            include_today=True,
+        )
+
+    monthly_day_match = re.search(
+        r"\bon\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b",
+        t,
+    )
+    if recurrence_rule == "monthly" and monthly_day_match:
+        recurrence_anchor_day = int(monthly_day_match.group(1))
+
+    if clock_value is None:
+        if recurrence_rule == "daily":
+            next_local = now_local + dt.timedelta(days=recurrence_interval)
+        elif recurrence_rule == "weekly":
+            if weekday_recurrence_match:
+                weekday = _REMINDER_WEEKDAYS[
+                    weekday_recurrence_match.group(1)
+                ]
+                next_date = _pm_reminder_next_weekday(
+                    now_local.date(),
+                    weekday,
+                    include_today=False,
+                )
+                next_local = dt.datetime.combine(
+                    next_date,
+                    now_local.timetz().replace(tzinfo=None),
+                    tzinfo=owner_tz,
+                )
+            else:
+                next_local = now_local + dt.timedelta(weeks=recurrence_interval)
+        elif recurrence_rule == "weekdays":
+            next_date = now_local.date()
+            while True:
+                next_date += dt.timedelta(days=1)
+                if next_date.weekday() < 5:
+                    break
+            next_local = dt.datetime.combine(
+                next_date,
+                now_local.timetz().replace(tzinfo=None),
+                tzinfo=owner_tz,
+            )
+        elif recurrence_rule == "monthly":
+            recurrence_anchor_day = recurrence_anchor_day or now_local.day
+            next_local = _pm_reminder_add_months(
+                now_local,
+                recurrence_interval,
+                recurrence_anchor_day,
+            )
+        else:
+            return None
+    else:
+        if target_date is None:
+            target_date = now_local.date()
+
+        if recurrence_rule == "weekly" and weekday_recurrence_match:
+            weekday = _REMINDER_WEEKDAYS[
+                weekday_recurrence_match.group(1)
+            ]
+            target_date = _pm_reminder_next_weekday(
+                now_local.date(),
+                weekday,
+                include_today=True,
+            )
+
+        if recurrence_rule == "weekdays":
+            target_date = now_local.date()
+            if target_date.weekday() >= 5:
+                while target_date.weekday() >= 5:
+                    target_date += dt.timedelta(days=1)
+
+        if recurrence_rule == "monthly":
+            recurrence_anchor_day = recurrence_anchor_day or target_date.day
+            try:
+                target_date = target_date.replace(day=recurrence_anchor_day)
+            except ValueError:
+                next_local = _pm_reminder_add_months(
+                    dt.datetime.combine(
+                        target_date.replace(day=1),
+                        clock_value,
+                        tzinfo=owner_tz,
+                    ),
+                    0,
+                    recurrence_anchor_day,
+                )
+                target_date = next_local.date()
+
+        next_local = dt.datetime.combine(
+            target_date,
+            clock_value,
+            tzinfo=owner_tz,
+        )
+
+        if next_local <= now_local:
+            if recurrence_rule == "daily":
+                next_local += dt.timedelta(days=recurrence_interval)
+            elif recurrence_rule == "weekly":
+                next_local += dt.timedelta(weeks=recurrence_interval)
+            elif recurrence_rule == "weekdays":
+                while True:
+                    next_local += dt.timedelta(days=1)
+                    if next_local.weekday() < 5:
+                        break
+            elif recurrence_rule == "monthly":
+                next_local = _pm_reminder_add_months(
+                    next_local,
+                    recurrence_interval,
+                    recurrence_anchor_day,
+                )
+            elif recurrence_rule in ("interval", "hourly"):
+                seconds = recurrence_seconds or 3600
+                next_local += dt.timedelta(seconds=seconds)
+            elif target_date == now_local.date():
+                next_local += dt.timedelta(days=1)
+            else:
+                return None
+
+    recurring = recurrence_rule != "none"
+    return {
+        "next_run": _pm_reminder_to_utc_naive(next_local),
+        "rule": recurrence_rule if recurring else "once",
+        "recurring": recurring,
+        "recurrence_rule": recurrence_rule,
+        "recurrence_interval": recurrence_interval,
+        "recurrence_seconds": recurrence_seconds,
+        "recurrence_anchor_day": recurrence_anchor_day,
+        "timezone": timezone_name,
+    }
+
+
+def parse_pm_reminder_snooze_until(
+    text: str,
+    timezone_name: str,
+) -> Optional[dt.datetime]:
+    t = (text or "").lower()
+    duration_match = re.search(
+        r"\b(\d+)\s+(minutes?|hours?|days?|weeks?)\b",
+        t,
+    )
+    if duration_match:
+        amount = int(duration_match.group(1))
+        unit = duration_match.group(2)
+        if amount <= 0:
+            return None
+        now_utc = dt.datetime.utcnow()
+        if unit.startswith("minute"):
+            return now_utc + dt.timedelta(minutes=amount)
+        if unit.startswith("hour"):
+            return now_utc + dt.timedelta(hours=amount)
+        if unit.startswith("day"):
+            return now_utc + dt.timedelta(days=amount)
+        return now_utc + dt.timedelta(weeks=amount)
+
+    until_match = re.search(r"\b(?:until|to)\s+(.+)$", text or "", re.I)
+    if until_match:
+        parsed = parse_pm_reminder_request(
+            f"remind me {until_match.group(1)}",
+            timezone_name=timezone_name,
+        )
+        if parsed:
+            return parsed["next_run"]
+
+    return None
+
+# >>> FEATURE_3_REMINDER_CLASSIFIER_END <<<
 
 
 # ---------------------------------------------------------------------
@@ -1332,6 +1845,289 @@ def webhook():
                 "name": meta.get("filename"),
             }
             text = meta.get("caption")
+
+        # >>> FEATURE_3_REMINDER_WEBHOOK_START — LIFECYCLE + CREATION V6.1 <<<
+
+        if text:
+            reminder_action = classify_pm_reminder_lifecycle(text)
+            reminder_id = _pm_reminder_id_from_text(text)
+
+            if reminder_action == "acknowledge":
+                result = acknowledge_pm_reminder(
+                    sender,
+                    reminder_id=reminder_id,
+                )
+                if result.get("status") != "not_found":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        f"Reminder #{result['id']} acknowledged.",
+                    )
+                    return ("", 200)
+
+                # A plain OK remains available to existing workflows when
+                # the sender has no delivered reminder to acknowledge.
+                if "reminder" in text.lower() or reminder_id is not None:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "No delivered reminder was found to acknowledge.",
+                    )
+                    return ("", 200)
+
+            elif reminder_action == "snooze":
+                sender_timezone = "America/New_York"
+                with DBSession() as s:
+                    sender_user = (
+                        s.query(User)
+                        .filter(
+                            User.wa_id == sender,
+                            User.active == True,
+                        )
+                        .first()
+                    )
+                    if sender_user and sender_user.timezone:
+                        sender_timezone = sender_user.timezone
+
+                until_utc = parse_pm_reminder_snooze_until(
+                    text,
+                    sender_timezone,
+                )
+                if until_utc is None:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        (
+                            "Include how long to snooze the reminder. "
+                            "For example: Snooze reminder 12 for 30 minutes."
+                        ),
+                    )
+                    return ("", 200)
+
+                result = snooze_pm_reminder(
+                    sender,
+                    until_utc,
+                    reminder_id=reminder_id,
+                )
+                if result.get("status") == "not_found":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "No active reminder was found to snooze.",
+                    )
+                    return ("", 200)
+                if result.get("status") == "error":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "The reminder could not be snoozed to that time.",
+                    )
+                    return ("", 200)
+
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"Reminder #{result['id']} postponed.",
+                )
+                return ("", 200)
+
+            elif reminder_action == "redirect":
+                target_match = re.search(
+                    r"\bto\s+(.+)$",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                target_text = (
+                    target_match.group(1).strip(" .")
+                    if target_match
+                    else ""
+                )
+                target_wa = None
+
+                digits = re.sub(r"\D", "", target_text)
+                with DBSession() as s:
+                    active_users = (
+                        s.query(User)
+                        .filter(User.active == True)
+                        .all()
+                    )
+
+                    if len(digits) >= 7:
+                        matched_user = next(
+                            (
+                                user
+                                for user in active_users
+                                if re.sub(r"\D", "", user.wa_id or "")
+                                == digits
+                            ),
+                            None,
+                        )
+                        if matched_user:
+                            target_wa = matched_user.wa_id
+                    else:
+                        target_key = target_text.casefold()
+                        matched_user = next(
+                            (
+                                user
+                                for user in active_users
+                                if target_key
+                                and target_key in {
+                                    (user.name or "").strip().casefold(),
+                                    (user.subcontractor_name or "")
+                                    .strip()
+                                    .casefold(),
+                                }
+                            ),
+                            None,
+                        )
+                        if matched_user:
+                            target_wa = matched_user.wa_id
+
+                if not target_wa:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        (
+                            "Name a linked active user or WhatsApp number. "
+                            "For example: Reassign reminder 12 to John Smith."
+                        ),
+                    )
+                    return ("", 200)
+
+                result = redirect_pm_reminder(
+                    sender,
+                    target_wa,
+                    reminder_id=reminder_id,
+                )
+                if result.get("status") == "not_found":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "No active reminder was found to reassign.",
+                    )
+                    return ("", 200)
+
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    (
+                        f"Reminder #{result['id']} reassigned "
+                        f"to {result['recipient_wa']}."
+                    ),
+                )
+                return ("", 200)
+
+            elif reminder_action == "cancel":
+                result = cancel_pm_reminder(
+                    sender,
+                    reminder_id=reminder_id,
+                )
+                if result.get("status") == "not_found":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "No active reminder was found to cancel.",
+                    )
+                    return ("", 200)
+
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"Reminder #{result['id']} cancelled.",
+                )
+                return ("", 200)
+
+            if classify_pm_reminder(text):
+                sender_timezone = "America/New_York"
+                with DBSession() as s:
+                    sender_user = (
+                        s.query(User)
+                        .filter(
+                            User.wa_id == sender,
+                            User.active == True,
+                        )
+                        .first()
+                    )
+                    if sender_user and sender_user.timezone:
+                        sender_timezone = sender_user.timezone
+
+                parsed_reminder = parse_pm_reminder_request(
+                    text,
+                    timezone_name=sender_timezone,
+                )
+                if not parsed_reminder:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        (
+                            "Include when the reminder should run. "
+                            "For example: Remind me tomorrow at 9 AM "
+                            "to call the inspector."
+                        ),
+                    )
+                    return ("", 200)
+
+                user_info = get_user_role(sender) or {}
+                payload = {
+                    "pm_wa": sender,
+                    "recipient_wa": sender,
+                    "project_code": user_info.get("project_code"),
+                    # Store the inbound text without stripping or rewriting.
+                    "text": text,
+                    "rule": parsed_reminder["rule"],
+                    "timezone": parsed_reminder["timezone"],
+                    "next_run": parsed_reminder["next_run"],
+                    "recurring": parsed_reminder["recurring"],
+                    "recurrence_rule": parsed_reminder[
+                        "recurrence_rule"
+                    ],
+                    "recurrence_interval": parsed_reminder[
+                        "recurrence_interval"
+                    ],
+                    "recurrence_seconds": parsed_reminder[
+                        "recurrence_seconds"
+                    ],
+                    "recurrence_anchor_day": parsed_reminder[
+                        "recurrence_anchor_day"
+                    ],
+                }
+                result = create_pm_reminder(payload)
+
+                if result.get("status") != "ok":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "The reminder could not be created.",
+                    )
+                    return ("", 200)
+
+                try:
+                    owner_tz = ZoneInfo(sender_timezone)
+                except Exception:
+                    owner_tz = ZoneInfo("America/New_York")
+
+                next_local = result["next_run"].replace(
+                    tzinfo=dt.timezone.utc
+                ).astimezone(owner_tz)
+
+                recurrence_note = (
+                    f" Recurs {result['recurrence_rule']}."
+                    if result.get("recurring")
+                    else ""
+                )
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    (
+                        f"Reminder #{result['id']} scheduled for "
+                        f"{next_local.strftime('%A, %B %d, %Y at %I:%M %p')}."
+                        f"{recurrence_note}"
+                    ),
+                )
+                return ("", 200)
+
+        # >>> FEATURE_3_REMINDER_WEBHOOK_END <<<
+
 
         # -------------------------------------------------------------
         # AUTO-FIX FOR PRIOR BAD TASKS (PRESERVED FROM FRIDAY)
@@ -3050,6 +3846,97 @@ def daily_pm_digest_scheduler():
         time.sleep(60)
 
 threading.Thread(target=daily_pm_digest_scheduler, daemon=True).start()
+
+
+# >>> FEATURE_3_REMINDER_SCHEDULER_START — AUTOMATIC DELIVERY V6.1 <<<
+
+def run_due_pm_reminders_once(
+    now_utc: Optional[dt.datetime] = None,
+    limit: int = 50,
+) -> dict:
+    """Claim, deliver, and finalize one due-reminder batch."""
+    now_utc = now_utc or dt.datetime.utcnow()
+    claimed = claim_due_pm_reminders(
+        now_utc=now_utc,
+        limit=limit,
+    )
+
+    delivered = 0
+    failed = 0
+
+    for reminder in claimed:
+        reminder_id = reminder["id"]
+        claim_token = reminder["claim_token"]
+        recipient_wa = reminder.get("recipient_wa") or reminder.get("pm_wa")
+
+        try:
+            # The stored reminder text is delivered without rewriting.
+            ok, response_data = send_whatsapp_text(
+                DEFAULT_PHONE_ID,
+                recipient_wa,
+                reminder.get("text") or "",
+            )
+        except Exception as exc:
+            ok = False
+            response_data = {"error": str(exc)}
+
+        if ok:
+            completed = complete_pm_reminder_delivery(
+                reminder_id,
+                claim_token,
+                delivered_at=dt.datetime.utcnow(),
+            )
+            if completed.get("status") == "error":
+                log.error(
+                    "REMINDER_COMPLETE_FAILED id=%s result=%s",
+                    reminder_id,
+                    completed,
+                )
+                failed += 1
+            else:
+                delivered += 1
+        else:
+            fail_pm_reminder_delivery(
+                reminder_id,
+                claim_token,
+                error=json.dumps(response_data or {}, default=str),
+                failed_at=dt.datetime.utcnow(),
+            )
+            failed += 1
+
+    return {
+        "status": "ok",
+        "claimed": len(claimed),
+        "delivered": delivered,
+        "failed": failed,
+    }
+
+
+def pm_reminder_scheduler():
+    while True:
+        try:
+            result = run_due_pm_reminders_once()
+            if result["claimed"]:
+                log.info("PM_REMINDER_TICK %s", result)
+        except Exception:
+            log.exception("PM reminder scheduler tick failed")
+        time.sleep(30)
+
+
+threading.Thread(
+    target=pm_reminder_scheduler,
+    daemon=True,
+    name="hubflo-pm-reminders",
+).start()
+
+
+@app.route("/admin/reminders/tick", methods=["POST"])
+def admin_reminders_tick():
+    if not _check_admin():
+        return _auth_fail()
+    return jsonify(run_due_pm_reminders_once()), 200
+
+# >>> FEATURE_3_REMINDER_SCHEDULER_END <<<
 
 
 # ============================================================
