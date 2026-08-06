@@ -2595,6 +2595,173 @@ def api_summary():
     if not _check_admin(): return _auth_fail()
     return jsonify(get_summary())
 
+
+# >>> FEATURE_3D_REMINDER_ADMIN_VISIBILITY_START — READ-ONLY V6.1 <<<
+
+def _admin_pm_reminder_datetime(value):
+    """Serialize reminder timestamps without mutating reminder state."""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        rendered = value.isoformat()
+        return rendered if value.tzinfo is not None else rendered + "Z"
+    return str(value)
+
+
+def _admin_pm_reminder_dict(reminder: PMReminder) -> dict:
+    """Read-only admin representation of one reminder."""
+    return {
+        "id": reminder.id,
+        "pm_wa": reminder.pm_wa,
+        "recipient_wa": reminder.recipient_wa or reminder.pm_wa,
+        "project_code": reminder.project_code,
+        "text": reminder.text,
+        "rule": reminder.rule,
+        "timezone": reminder.timezone or "America/New_York",
+        "next_run": _admin_pm_reminder_datetime(reminder.next_run),
+        "recurring": bool(reminder.recurring),
+        "recurrence_rule": reminder.recurrence_rule or "none",
+        "recurrence_interval": reminder.recurrence_interval or 1,
+        "recurrence_seconds": reminder.recurrence_seconds,
+        "recurrence_anchor_day": reminder.recurrence_anchor_day,
+        "status": reminder.status,
+        "active": bool(reminder.active),
+        "claimed_at": _admin_pm_reminder_datetime(reminder.claimed_at),
+        "retry_after": _admin_pm_reminder_datetime(reminder.retry_after),
+        "delivered_at": _admin_pm_reminder_datetime(reminder.delivered_at),
+        "acknowledged_at": _admin_pm_reminder_datetime(
+            reminder.acknowledged_at
+        ),
+        "snoozed_at": _admin_pm_reminder_datetime(reminder.snoozed_at),
+        "redirected_at": _admin_pm_reminder_datetime(
+            reminder.redirected_at
+        ),
+        "cancelled_at": _admin_pm_reminder_datetime(reminder.cancelled_at),
+        "completed_at": _admin_pm_reminder_datetime(reminder.completed_at),
+        "failed_at": _admin_pm_reminder_datetime(reminder.failed_at),
+        "delivery_count": reminder.delivery_count or 0,
+        "failure_count": reminder.failure_count or 0,
+        "last_error": reminder.last_error,
+        "created_at": _admin_pm_reminder_datetime(reminder.created_at),
+        "updated_at": _admin_pm_reminder_datetime(reminder.updated_at),
+    }
+
+
+def _admin_pm_reminder_rows() -> list[dict]:
+    """Return all reminders newest first without changing lifecycle state."""
+    with SessionLocal() as s:
+        reminders = (
+            s.query(PMReminder)
+            .order_by(PMReminder.id.desc())
+            .all()
+        )
+        return [
+            _admin_pm_reminder_dict(reminder)
+            for reminder in reminders
+        ]
+
+
+@app.route("/admin/reminders.json", methods=["GET"])
+def admin_reminders_json():
+    if not _check_admin():
+        return _auth_fail()
+    return jsonify(_admin_pm_reminder_rows()), 200
+
+
+@app.route("/admin/reminders", methods=["GET"])
+def admin_reminders():
+    if not _check_admin():
+        return _auth_fail()
+
+    rows = _admin_pm_reminder_rows()
+
+    def h(value):
+        return (
+            str(value if value is not None else "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    table_rows = []
+    for row in rows:
+        recurrence = (
+            row["recurrence_rule"]
+            if row["recurring"]
+            else "one-time"
+        )
+        table_rows.append(
+            "<tr>"
+            f"<td>{row['id']}</td>"
+            f"<td>{h(row['pm_wa'])}</td>"
+            f"<td>{h(row['recipient_wa'])}</td>"
+            f"<td>{h(row['project_code'])}</td>"
+            f"<td>{h(row['status'])}</td>"
+            f"<td>{'yes' if row['active'] else 'no'}</td>"
+            f"<td>{h(row['next_run'])}</td>"
+            f"<td>{h(row['timezone'])}</td>"
+            f"<td>{h(row['rule'])}</td>"
+            f"<td>{h(recurrence)}</td>"
+            f"<td>{row['recurrence_interval']}</td>"
+            f"<td>{h(row['recurrence_seconds'])}</td>"
+            f"<td>{h(row['recurrence_anchor_day'])}</td>"
+            f"<td>{h(row['claimed_at'])}</td>"
+            f"<td>{h(row['delivered_at'])}</td>"
+            f"<td>{h(row['acknowledged_at'])}</td>"
+            f"<td>{h(row['snoozed_at'])}</td>"
+            f"<td>{h(row['redirected_at'])}</td>"
+            f"<td>{h(row['cancelled_at'])}</td>"
+            f"<td>{h(row['completed_at'])}</td>"
+            f"<td>{h(row['failed_at'])}</td>"
+            f"<td>{h(row['retry_after'])}</td>"
+            f"<td>{row['delivery_count']}</td>"
+            f"<td>{row['failure_count']}</td>"
+            f"<td>{h(row['last_error'])}</td>"
+            f"<td>{h(row['created_at'])}</td>"
+            f"<td>{h(row['updated_at'])}</td>"
+            f"<td class=\"reminder-text\">{h(row['text'])}</td>"
+            "</tr>"
+        )
+
+    body = "".join(table_rows) or (
+        '<tr><td colspan="28">No reminders found.</td></tr>'
+    )
+
+    html = (
+        "<!doctype html><html><head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>HUBFLO Reminders</title>"
+        "<style>"
+        "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "margin:20px;color:#222}"
+        ".table-wrap{overflow-x:auto}"
+        "table{border-collapse:collapse;width:100%;font-size:13px}"
+        "th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;"
+        "vertical-align:top;white-space:nowrap}"
+        "th{background:#f3f3f3;position:sticky;top:0}"
+        ".reminder-text{white-space:pre-wrap;min-width:320px}"
+        "</style></head><body>"
+        f"<h1>Reminder Admin Visibility</h1><p>Total: {len(rows)}</p>"
+        "<div class=\"table-wrap\"><table><thead><tr>"
+        "<th>ID</th><th>Owner</th><th>Recipient</th><th>Project</th>"
+        "<th>Status</th><th>Active</th><th>Next Run (UTC)</th>"
+        "<th>Timezone</th><th>Rule</th><th>Recurrence</th>"
+        "<th>Recurrence Interval</th><th>Recurrence Seconds</th>"
+        "<th>Recurrence Anchor Day</th><th>Claimed At</th>"
+        "<th>Delivered</th><th>Acknowledged</th><th>Snoozed At</th>"
+        "<th>Redirected At</th><th>Cancelled At</th><th>Completed At</th>"
+        "<th>Failed At</th><th>Retry After</th><th>Deliveries</th>"
+        "<th>Failures</th><th>Last Error</th><th>Created At</th>"
+        "<th>Updated At</th><th>Original Text</th>"
+        f"</tr></thead><tbody>{body}</tbody></table></div>"
+        "</body></html>"
+    )
+    return Response(html, status=200, mimetype="text/html")
+
+# >>> FEATURE_3D_REMINDER_ADMIN_VISIBILITY_END <<<
+
 @app.route("/admin/view", methods=["GET"])
 def admin_view():
     if not _check_admin(): return _auth_fail()
