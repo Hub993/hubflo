@@ -1174,6 +1174,42 @@ def _repair_tasks():
         with ENGINE.connect() as conn:
             conn.execute(text("ALTER TABLE tasks DROP COLUMN client_id"))
 
+def _repair_pm_project_map():
+    """Ensure existing pm_project_map tables contain client_id + expected index."""
+    insp = inspect(ENGINE)
+
+    if "pm_project_map" not in insp.get_table_names():
+        return
+
+    existing_columns = {
+        column["name"]
+        for column in insp.get_columns("pm_project_map")
+    }
+    existing_indexes = {
+        index.get("name")
+        for index in insp.get_indexes("pm_project_map")
+    }
+
+    with ENGINE.begin() as conn:
+        if "client_id" not in existing_columns:
+            conn.execute(text(
+                "ALTER TABLE pm_project_map "
+                "ADD COLUMN client_id INTEGER DEFAULT 1"
+            ))
+
+        conn.execute(text(
+            "UPDATE pm_project_map "
+            "SET client_id = 1 "
+            "WHERE client_id IS NULL"
+        ))
+
+        if "ix_pm_project_map_client_id" not in existing_indexes:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_pm_project_map_client_id "
+                "ON pm_project_map (client_id)"
+            ))
+
 # >>> FEATURE_3_REMINDER_SCHEMA_REPAIR_START — BACKWARD COMPATIBILITY V6.1 <<<
 
 def _repair_pm_reminders():
@@ -1284,6 +1320,11 @@ def init_db():
 
     try:
         _repair_tasks()
+    except Exception:
+        pass
+
+    try:
+        _repair_pm_project_map()
     except Exception:
         pass
 
