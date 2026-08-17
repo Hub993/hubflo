@@ -13,6 +13,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, Response
 
+from core.conversation import CoreConversation
 from core.industry import IndustryRequest
 from industries.construction import ConstructionIndustryModule
 from storage_v6_1 import (
@@ -40,6 +41,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("hubflo")
 
 _CONSTRUCTION_INDUSTRY = ConstructionIndustryModule()
+_CORE_CONVERSATION = CoreConversation(_CONSTRUCTION_INDUSTRY)
 
 # ---------------------------------------------------------------------
 # Environment / config
@@ -252,7 +254,7 @@ _INSPECTION_MONTHS = {
 
 
 def classify_inspection(text: str) -> bool:
-    result = _CONSTRUCTION_INDUSTRY.interpret(
+    result = _CORE_CONVERSATION.interpret(
         IndustryRequest(
             capability="domain_recognition",
             text=text or "",
