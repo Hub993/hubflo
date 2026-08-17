@@ -13,6 +13,8 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, Response
 
+from core.industry import IndustryRequest
+from industries.construction import ConstructionIndustryModule
 from storage_v6_1 import (
     init_db, create_task, get_tasks, get_summary,
     mark_done, approve_task, reject_task, set_order_state,
@@ -36,6 +38,8 @@ from storage_v6_1 import Task
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("hubflo")
+
+_CONSTRUCTION_INDUSTRY = ConstructionIndustryModule()
 
 # ---------------------------------------------------------------------
 # Environment / config
@@ -248,11 +252,17 @@ _INSPECTION_MONTHS = {
 
 
 def classify_inspection(text: str) -> bool:
-    t = (text or "").lower()
+    result = _CONSTRUCTION_INDUSTRY.interpret(
+        IndustryRequest(
+            capability="domain_recognition",
+            text=text or "",
+            context={"candidate": "inspection"},
+        )
+    )
 
-    return (
-        "inspection" in t
-        and ("book" in t or "schedule" in t)
+    return bool(
+        result.handled
+        and result.classification == "inspection"
     )
 
 
@@ -586,38 +596,17 @@ def parse_inspection_request(
 # >>> PATCH_2_DELAY_CLASSIFIER_START — CRITICAL-PATH DELAY TRACKING V6.1 <<<
 
 def classify_delay(text: str) -> bool:
-    t = (text or "").lower().strip()
+    result = _CONSTRUCTION_INDUSTRY.interpret(
+        IndustryRequest(
+            capability="domain_recognition",
+            text=text or "",
+            context={"candidate": "critical_path_delay"},
+        )
+    )
 
-    if not t:
-        return False
-
-    negative_delay_patterns = [
-        r"\bno\s+delay\b",
-        r"\bno\s+delays\b",
-        r"\bnot\s+delayed\b",
-        r"\bnot\s+delay(?:ed|ing)?\b",
-        r"\bwithout\s+delay\b",
-        r"\bzero\s+delay\b",
-        r"\b0\s+days?\s+(?:of\s+)?delay\b",
-        r"\bnot\s+running\s+late\b",
-    ]
-
-    if any(
-        re.search(pattern, t)
-        for pattern in negative_delay_patterns
-    ):
-        return False
-
-    positive_delay_patterns = [
-        r"\bdelay(?:ed|ing|s)?\b",
-        r"\brunning\s+late\b",
-        r"\bbehind\s+schedule\b",
-        r"\blate\s+by\b",
-    ]
-
-    return any(
-        re.search(pattern, t)
-        for pattern in positive_delay_patterns
+    return bool(
+        result.handled
+        and result.classification == "critical_path_delay"
     )
 
 # >>> PATCH_2_DELAY_CLASSIFIER_END <<<
