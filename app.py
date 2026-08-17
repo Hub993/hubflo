@@ -598,7 +598,7 @@ def parse_inspection_request(
 # >>> PATCH_2_DELAY_CLASSIFIER_START — CRITICAL-PATH DELAY TRACKING V6.1 <<<
 
 def classify_delay(text: str) -> bool:
-    result = _CONSTRUCTION_INDUSTRY.interpret(
+    result = _CORE_CONVERSATION.interpret(
         IndustryRequest(
             capability="domain_recognition",
             text=text or "",
