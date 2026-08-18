@@ -47,6 +47,53 @@ class CoreConversation:
             request.context.get("candidate") or ""
         ).strip().lower()
 
+        if candidate == "pm_reminder_lifecycle":
+            text = (request.text or "").lower().strip()
+            if not text:
+                return ConversationResult()
+
+            # Reminder creation takes precedence over lifecycle recognition.
+            if re.match(
+                r"^(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\b",
+                text,
+            ):
+                return ConversationResult()
+
+            action = ""
+
+            if text in ("ok", "okay", "ack", "acknowledge"):
+                action = "acknowledge"
+            elif re.match(
+                r"^(?:please\s+)?(?:ok|okay|ack|acknowledge)\b.*\breminder\b",
+                text,
+            ):
+                action = "acknowledge"
+            elif re.match(
+                r"^(?:please\s+)?(?:snooze|postpone)\b.*\breminder\b",
+                text,
+            ):
+                action = "snooze"
+            elif re.match(
+                r"^(?:please\s+)?(?:redirect|reassign)\b.*\breminder\b",
+                text,
+            ):
+                action = "redirect"
+            elif re.match(
+                r"^(?:please\s+)?cancel\b.*\breminder\b",
+                text,
+            ):
+                action = "cancel"
+
+            if not action:
+                return ConversationResult()
+
+            return ConversationResult(
+                handled=True,
+                intent="reminder",
+                action=action,
+                object_type="reminder",
+            )
+
         if candidate != "pm_reminder_creation":
             return ConversationResult()
 

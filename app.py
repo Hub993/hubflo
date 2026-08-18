@@ -655,46 +655,15 @@ def classify_pm_reminder(text: str) -> bool:
 
 
 def classify_pm_reminder_lifecycle(text: str) -> Optional[str]:
-    t = (text or "").lower().strip()
-    if not t:
-        return None
+    result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="core_recognition",
+            text=text or "",
+            context={"candidate": "pm_reminder_lifecycle"},
+        )
+    )
 
-    # Creation commands take precedence even when the reminder body
-    # contains lifecycle words such as cancel, reassign, or acknowledge.
-    if re.match(
-        r"^(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder)\b",
-        t,
-    ):
-        return None
-
-    if t in ("ok", "okay", "ack", "acknowledge"):
-        return "acknowledge"
-
-    if re.match(
-        r"^(?:please\s+)?(?:ok|okay|ack|acknowledge)\b.*\breminder\b",
-        t,
-    ):
-        return "acknowledge"
-
-    if re.match(
-        r"^(?:please\s+)?(?:snooze|postpone)\b.*\breminder\b",
-        t,
-    ):
-        return "snooze"
-
-    if re.match(
-        r"^(?:please\s+)?(?:redirect|reassign)\b.*\breminder\b",
-        t,
-    ):
-        return "redirect"
-
-    if re.match(
-        r"^(?:please\s+)?cancel\b.*\breminder\b",
-        t,
-    ):
-        return "cancel"
-
-    return None
+    return result.action if result.handled else None
 
 
 def _pm_reminder_id_from_text(text: str) -> Optional[int]:
