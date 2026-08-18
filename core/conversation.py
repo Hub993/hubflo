@@ -40,12 +40,53 @@ class CoreConversation:
 
     def interpret_core(self, request: ConversationRequest) -> ConversationResult:
         """Interpret supported industry-neutral Core conversation candidates."""
-        if request.capability != "core_recognition":
-            return ConversationResult()
-
         candidate = str(
             request.context.get("candidate") or ""
         ).strip().lower()
+
+        if request.capability == "shared_datetime":
+            if candidate != "time_of_day":
+                return ConversationResult()
+
+            text = (request.text or "").lower()
+
+            if re.search(r"\bat\s+noon\b", text):
+                hour, minute = 12, 0
+            elif re.search(r"\bat\s+midnight\b", text):
+                hour, minute = 0, 0
+            else:
+                match = re.search(
+                    r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+                    text,
+                )
+                if not match:
+                    return ConversationResult()
+
+                hour = int(match.group(1))
+                minute = int(match.group(2) or 0)
+                meridiem = match.group(3)
+
+                if minute > 59:
+                    return ConversationResult()
+
+                if meridiem:
+                    if hour < 1 or hour > 12:
+                        return ConversationResult()
+                    if meridiem == "am":
+                        hour = 0 if hour == 12 else hour
+                    else:
+                        hour = 12 if hour == 12 else hour + 12
+                elif hour > 23:
+                    return ConversationResult()
+
+            return ConversationResult(
+                handled=True,
+                object_type="time",
+                metadata={"hour": hour, "minute": minute},
+            )
+
+        if request.capability != "core_recognition":
+            return ConversationResult()
 
         if candidate == "pm_reminder_lifecycle":
             text = (request.text or "").lower().strip()

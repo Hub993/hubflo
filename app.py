@@ -678,38 +678,21 @@ def _pm_reminder_id_from_text(text: str) -> Optional[int]:
 
 
 def _pm_reminder_clock(text: str) -> Optional[dt.time]:
-    t = (text or "").lower()
-
-    if re.search(r"\bat\s+noon\b", t):
-        return dt.time(12, 0)
-    if re.search(r"\bat\s+midnight\b", t):
-        return dt.time(0, 0)
-
-    match = re.search(
-        r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
-        t,
+    result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="shared_datetime",
+            text=text or "",
+            context={"candidate": "time_of_day"},
+        )
     )
-    if not match:
+
+    if not result.handled:
         return None
 
-    hour = int(match.group(1))
-    minute = int(match.group(2) or 0)
-    meridiem = match.group(3)
-
-    if minute > 59:
-        return None
-
-    if meridiem:
-        if hour < 1 or hour > 12:
-            return None
-        if meridiem == "am":
-            hour = 0 if hour == 12 else hour
-        else:
-            hour = 12 if hour == 12 else hour + 12
-    elif hour > 23:
-        return None
-
-    return dt.time(hour, minute)
+    return dt.time(
+        result.metadata["hour"],
+        result.metadata["minute"],
+    )
 
 
 def _pm_reminder_next_weekday(
