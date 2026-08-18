@@ -13,7 +13,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, Response
 
-from core.conversation import CoreConversation
+from core.conversation import ConversationRequest, CoreConversation
 from core.industry import IndustryRequest
 from industries.construction import ConstructionIndustryModule
 from storage_v6_1 import (
@@ -643,14 +643,15 @@ _REMINDER_MONTHS = {
 
 
 def classify_pm_reminder(text: str) -> bool:
-    t = (text or "").lower().strip()
-    if not t:
-        return False
-
-    return bool(
-        re.search(r"\bremind\s+me\b", t)
-        or re.search(r"\bset\s+(?:a\s+)?reminder\b", t)
+    result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="core_recognition",
+            text=text or "",
+            context={"candidate": "pm_reminder_creation"},
+        )
     )
+
+    return bool(result.handled)
 
 
 def classify_pm_reminder_lifecycle(text: str) -> Optional[str]:
