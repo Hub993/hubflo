@@ -843,72 +843,25 @@ def parse_pm_reminder_request(
         }
 
     target_date = None
+    calendar_date_result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="shared_datetime",
+            text=t,
+            context={
+                "candidate": "calendar_date",
+                "reference_date": now_local.date().isoformat(),
+            },
+        )
+    )
 
-    iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", t)
-    if iso_match:
-        try:
-            target_date = dt.date(
-                int(iso_match.group(1)),
-                int(iso_match.group(2)),
-                int(iso_match.group(3)),
-            )
-        except ValueError:
+    if calendar_date_result.handled:
+        if not calendar_date_result.metadata.get("valid"):
             return None
 
-    if target_date is None:
-        numeric_match = re.search(
-            r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b",
-            t,
-        )
-        if numeric_match:
-            month = int(numeric_match.group(1))
-            day = int(numeric_match.group(2))
-            year_text = numeric_match.group(3)
-            year = int(year_text) if year_text else now_local.year
-            if year < 100:
-                year += 2000
-            try:
-                target_date = dt.date(year, month, day)
-            except ValueError:
-                return None
-            if not year_text and target_date < now_local.date():
-                target_date = dt.date(year + 1, month, day)
-
-    if target_date is None:
-        month_names = "|".join(_REMINDER_MONTHS)
-        month_match = re.search(
-            rf"\b({month_names})\s+(\d{{1,2}})"
-            rf"(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b",
-            t,
-        )
-        if month_match:
-            month = _REMINDER_MONTHS[month_match.group(1)]
-            day = int(month_match.group(2))
-            year_text = month_match.group(3)
-            year = int(year_text) if year_text else now_local.year
-            try:
-                target_date = dt.date(year, month, day)
-            except ValueError:
-                return None
-            if not year_text and target_date < now_local.date():
-                target_date = dt.date(year + 1, month, day)
-
-    if target_date is None:
-        if re.search(r"\btomorrow\b", t):
-            target_date = now_local.date() + dt.timedelta(days=1)
-        elif re.search(r"\btoday\b", t):
-            target_date = now_local.date()
-
-    weekday_match = re.search(
-        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        t,
-    )
-    if target_date is None and weekday_match:
-        weekday = _REMINDER_WEEKDAYS[weekday_match.group(1)]
-        target_date = _pm_reminder_next_weekday(
-            now_local.date(),
-            weekday,
-            include_today=True,
+        target_date = dt.date(
+            calendar_date_result.metadata["year"],
+            calendar_date_result.metadata["month"],
+            calendar_date_result.metadata["day"],
         )
 
     monthly_day_match = re.search(
