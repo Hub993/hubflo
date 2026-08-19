@@ -796,20 +796,25 @@ def parse_pm_reminder_request(
         recurrence_rule = "hourly"
         recurrence_seconds = 3600
 
-    relative_match = re.search(
-        r"\bin\s+(\d+)\s+(minutes?|hours?|days?|weeks?)\b",
-        t,
+    relative_duration_result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="shared_datetime",
+            text=t,
+            context={"candidate": "relative_duration"},
+        )
     )
-    if relative_match and recurrence_rule == "none":
-        amount = int(relative_match.group(1))
-        unit = relative_match.group(2)
-        if amount <= 0:
+    if relative_duration_result.handled and recurrence_rule == "none":
+        metadata = relative_duration_result.metadata
+        if not metadata.get("valid"):
             return None
-        if unit.startswith("minute"):
+
+        amount = int(metadata["amount"])
+        unit = metadata["unit"]
+        if unit == "minute":
             next_local = now_local + dt.timedelta(minutes=amount)
-        elif unit.startswith("hour"):
+        elif unit == "hour":
             next_local = now_local + dt.timedelta(hours=amount)
-        elif unit.startswith("day"):
+        elif unit == "day":
             next_local = now_local + dt.timedelta(days=amount)
         else:
             next_local = now_local + dt.timedelta(weeks=amount)

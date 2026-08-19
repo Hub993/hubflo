@@ -221,6 +221,36 @@ class CoreConversation:
                     },
                 )
 
+            if candidate == "relative_duration":
+                text = (request.text or "").lower()
+                match = re.search(
+                    r"\bin\s+(\d+)\s+(minutes?|hours?|days?|weeks?)\b",
+                    text,
+                )
+                if not match:
+                    return ConversationResult()
+
+                amount = int(match.group(1))
+                unit_text = match.group(2)
+                if unit_text.startswith("minute"):
+                    unit = "minute"
+                elif unit_text.startswith("hour"):
+                    unit = "hour"
+                elif unit_text.startswith("day"):
+                    unit = "day"
+                else:
+                    unit = "week"
+
+                return ConversationResult(
+                    handled=True,
+                    object_type="duration",
+                    metadata={
+                        "amount": amount,
+                        "unit": unit,
+                        "valid": amount > 0,
+                    },
+                )
+
             if candidate != "time_of_day":
                 return ConversationResult()
 
