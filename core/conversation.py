@@ -123,6 +123,34 @@ class CoreConversation:
 
                 text = (request.text or "").lower()
 
+                def calendar_date_metadata(
+                    match,
+                    target_date=None,
+                    valid: bool = True,
+                ) -> dict[str, Any]:
+                    match_start, match_end = match.span()
+                    on_prefix = re.search(
+                        r"\bon\s+$",
+                        text[:match_start],
+                    )
+                    if on_prefix:
+                        match_start = on_prefix.start()
+
+                    metadata = {
+                        "valid": valid,
+                        "match_start": match_start,
+                        "match_end": match_end,
+                    }
+                    if target_date is not None:
+                        metadata.update(
+                            {
+                                "year": target_date.year,
+                                "month": target_date.month,
+                                "day": target_date.day,
+                            }
+                        )
+                    return metadata
+
                 iso_match = re.search(
                     r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b",
                     text,
@@ -138,18 +166,19 @@ class CoreConversation:
                         return ConversationResult(
                             handled=True,
                             object_type="date",
-                            metadata={"valid": False},
+                            metadata=calendar_date_metadata(
+                                iso_match,
+                                valid=False,
+                            ),
                         )
 
                     return ConversationResult(
                         handled=True,
                         object_type="date",
-                        metadata={
-                            "year": target_date.year,
-                            "month": target_date.month,
-                            "day": target_date.day,
-                            "valid": True,
-                        },
+                        metadata=calendar_date_metadata(
+                            iso_match,
+                            target_date=target_date,
+                        ),
                     )
 
                 numeric_match = re.search(
@@ -173,7 +202,10 @@ class CoreConversation:
                         return ConversationResult(
                             handled=True,
                             object_type="date",
-                            metadata={"valid": False},
+                            metadata=calendar_date_metadata(
+                                numeric_match,
+                                valid=False,
+                            ),
                         )
                     if not year_text and target_date < reference_date:
                         target_date = dt.date(year + 1, month, day)
@@ -181,12 +213,10 @@ class CoreConversation:
                     return ConversationResult(
                         handled=True,
                         object_type="date",
-                        metadata={
-                            "year": target_date.year,
-                            "month": target_date.month,
-                            "day": target_date.day,
-                            "valid": True,
-                        },
+                        metadata=calendar_date_metadata(
+                            numeric_match,
+                            target_date=target_date,
+                        ),
                     )
 
                 month_numbers = {
@@ -204,9 +234,22 @@ class CoreConversation:
                     "december": 12,
                 }
                 month_names = "|".join(month_numbers)
+                month_date_year_separator = str(
+                    request.context.get("month_date_year_separator") or ""
+                ).strip().lower()
+                if month_date_year_separator == "optional":
+                    month_pattern = (
+                        rf"\b({month_names})\s+(\d{{1,2}})"
+                        rf"(?:st|nd|rd|th)?"
+                        rf"(?:,\s*|\s+)?(\d{{4}})?\b"
+                    )
+                else:
+                    month_pattern = (
+                        rf"\b({month_names})\s+(\d{{1,2}})"
+                        rf"(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b"
+                    )
                 month_match = re.search(
-                    rf"\b({month_names})\s+(\d{{1,2}})"
-                    rf"(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b",
+                    month_pattern,
                     text,
                 )
                 if month_match:
@@ -224,7 +267,10 @@ class CoreConversation:
                         return ConversationResult(
                             handled=True,
                             object_type="date",
-                            metadata={"valid": False},
+                            metadata=calendar_date_metadata(
+                                month_match,
+                                valid=False,
+                            ),
                         )
                     if not year_text and target_date < reference_date:
                         target_date = dt.date(year + 1, month, day)
@@ -232,31 +278,44 @@ class CoreConversation:
                     return ConversationResult(
                         handled=True,
                         object_type="date",
-                        metadata={
-                            "year": target_date.year,
-                            "month": target_date.month,
-                            "day": target_date.day,
-                            "valid": True,
-                        },
+                        metadata=calendar_date_metadata(
+                            month_match,
+                            target_date=target_date,
+                        ),
                     )
 
-                if re.search(r"\btomorrow\b", text):
-                    target_date = reference_date + dt.timedelta(days=1)
-                elif re.search(r"\btoday\b", text):
-                    target_date = reference_date
+                relative_date_selection = str(
+                    request.context.get("relative_date_selection") or ""
+                ).strip().lower()
+                if relative_date_selection == "first_textual":
+                    date_match = re.search(
+                        r"\b(today|tomorrow)\b",
+                        text,
+                    )
+                    if date_match and date_match.group(1) == "today":
+                        target_date = reference_date
+                    elif date_match:
+                        target_date = reference_date + dt.timedelta(days=1)
+                    else:
+                        target_date = None
                 else:
-                    target_date = None
+                    date_match = re.search(r"\btomorrow\b", text)
+                    if date_match:
+                        target_date = reference_date + dt.timedelta(days=1)
+                    else:
+                        date_match = re.search(r"\btoday\b", text)
+                        target_date = reference_date if date_match else None
 
                 if target_date is None:
                     weekday_names = (
                         "monday|tuesday|wednesday|thursday|friday|"
                         "saturday|sunday"
                     )
-                    weekday_match = re.search(
+                    date_match = re.search(
                         rf"\b({weekday_names})\b",
                         text,
                     )
-                    if weekday_match:
+                    if date_match:
                         weekday = (
                             "monday",
                             "tuesday",
@@ -265,7 +324,7 @@ class CoreConversation:
                             "friday",
                             "saturday",
                             "sunday",
-                        ).index(weekday_match.group(1))
+                        ).index(date_match.group(1))
                         days_ahead = (
                             weekday - reference_date.weekday()
                         ) % 7
@@ -273,18 +332,16 @@ class CoreConversation:
                             days=days_ahead
                         )
 
-                if target_date is None:
+                if target_date is None or date_match is None:
                     return ConversationResult()
 
                 return ConversationResult(
                     handled=True,
                     object_type="date",
-                    metadata={
-                        "year": target_date.year,
-                        "month": target_date.month,
-                        "day": target_date.day,
-                        "valid": True,
-                    },
+                    metadata=calendar_date_metadata(
+                        date_match,
+                        target_date=target_date,
+                    ),
                 )
 
             if candidate == "relative_duration":

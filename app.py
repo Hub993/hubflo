@@ -380,186 +380,39 @@ def parse_inspection_request(
     requested_date = None
     date_span = None
 
-    # ISO date:
-    # 2026-08-14
-    iso_match = re.search(
-        r"\b(?:on\s+)?"
-        r"(\d{4})-(\d{1,2})-(\d{1,2})\b",
-        body,
-        flags=re.IGNORECASE,
-    )
-
-    if iso_match:
-        try:
-            requested_date = dt.date(
-                int(iso_match.group(1)),
-                int(iso_match.group(2)),
-                int(iso_match.group(3)),
+    try:
+        calendar_date_result = _CORE_CONVERSATION.interpret_core(
+            ConversationRequest(
+                capability="shared_datetime",
+                text=body,
+                context={
+                    "candidate": "calendar_date",
+                    "reference_date": today.isoformat(),
+                    "relative_date_selection": "first_textual",
+                    "month_date_year_separator": "optional",
+                },
             )
-            date_span = iso_match.span()
-        except ValueError:
+        )
+    except ValueError:
+        return None
+
+    if calendar_date_result.handled:
+        metadata = calendar_date_result.metadata
+        if not metadata.get("valid"):
             return None
 
-    # Numeric US date:
-    # 08/14/2026 or 08/14
-    if requested_date is None:
-        numeric_match = re.search(
-            r"\b(?:on\s+)?"
-            r"(\d{1,2})/(\d{1,2})"
-            r"(?:/(\d{2,4}))?\b",
-            body,
-            flags=re.IGNORECASE,
-        )
-
-        if numeric_match:
-            month = int(
-                numeric_match.group(1)
+        try:
+            requested_date = dt.date(
+                int(metadata["year"]),
+                int(metadata["month"]),
+                int(metadata["day"]),
             )
-            day = int(
-                numeric_match.group(2)
+            date_span = (
+                int(metadata["match_start"]),
+                int(metadata["match_end"]),
             )
-            year_text = numeric_match.group(3)
-
-            if year_text:
-                year = int(year_text)
-
-                if year < 100:
-                    year += 2000
-            else:
-                year = today.year
-
-            try:
-                requested_date = dt.date(
-                    year,
-                    month,
-                    day,
-                )
-            except ValueError:
-                return None
-
-            if (
-                not year_text
-                and requested_date < today
-            ):
-                try:
-                    requested_date = dt.date(
-                        year + 1,
-                        month,
-                        day,
-                    )
-                except ValueError:
-                    return None
-
-            date_span = numeric_match.span()
-
-    # Month-name date:
-    # August 14 or August 14, 2026
-    if requested_date is None:
-        month_names = "|".join(
-            _INSPECTION_MONTHS.keys()
-        )
-
-        month_match = re.search(
-            rf"\b(?:on\s+)?"
-            rf"({month_names})\s+"
-            rf"(\d{{1,2}})"
-            rf"(?:st|nd|rd|th)?"
-            rf"(?:,\s*|\s+)?"
-            rf"(\d{{4}})?\b",
-            body,
-            flags=re.IGNORECASE,
-        )
-
-        if month_match:
-            month = _INSPECTION_MONTHS[
-                month_match.group(1).lower()
-            ]
-            day = int(
-                month_match.group(2)
-            )
-            year_text = month_match.group(3)
-
-            year = (
-                int(year_text)
-                if year_text
-                else today.year
-            )
-
-            try:
-                requested_date = dt.date(
-                    year,
-                    month,
-                    day,
-                )
-            except ValueError:
-                return None
-
-            if (
-                not year_text
-                and requested_date < today
-            ):
-                try:
-                    requested_date = dt.date(
-                        year + 1,
-                        month,
-                        day,
-                    )
-                except ValueError:
-                    return None
-
-            date_span = month_match.span()
-
-    # Relative date:
-    # today or tomorrow
-    if requested_date is None:
-        relative_match = re.search(
-            r"\b(?:on\s+)?"
-            r"(today|tomorrow)\b",
-            body,
-            flags=re.IGNORECASE,
-        )
-
-        if relative_match:
-            relative_word = (
-                relative_match.group(1).lower()
-            )
-
-            if relative_word == "today":
-                requested_date = today
-            else:
-                requested_date = (
-                    today + dt.timedelta(days=1)
-                )
-
-            date_span = relative_match.span()
-
-    # Named weekday:
-    # Friday or on Friday
-    if requested_date is None:
-        weekday_names = "|".join(
-            _INSPECTION_WEEKDAYS.keys()
-        )
-
-        weekday_match = re.search(
-            rf"\b(?:on\s+)?"
-            rf"({weekday_names})\b",
-            body,
-            flags=re.IGNORECASE,
-        )
-
-        if weekday_match:
-            weekday_name = (
-                weekday_match.group(1).lower()
-            )
-
-            requested_date = (
-                _next_inspection_weekday(
-                    weekday_name,
-                    today,
-                )
-            )
-
-            date_span = weekday_match.span()
+        except (KeyError, TypeError, ValueError):
+            return None
 
     if (
         requested_date is None
