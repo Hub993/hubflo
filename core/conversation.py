@@ -45,6 +45,160 @@ class CoreConversation:
             request.context.get("candidate") or ""
         ).strip().lower()
 
+        if request.capability == "record_resolution":
+            if candidate != "text_reference":
+                return ConversationResult()
+
+            records = request.context.get("records")
+            if not isinstance(records, (list, tuple)):
+                return ConversationResult()
+
+            stop_words = {
+                "a", "an", "and", "are", "as", "at", "be", "because",
+                "been", "being", "by", "for", "from", "had", "has",
+                "have", "in", "is", "it", "of", "on", "or", "the",
+                "to", "was", "were", "with",
+            }
+
+            def normalized_tokens(value: Any) -> list[str]:
+                tokens = re.findall(
+                    r"[a-z0-9]+",
+                    str(value or "").lower().replace("-", " "),
+                )
+                return [
+                    token
+                    for token in tokens
+                    if token not in stop_words and not token.isdigit()
+                ]
+
+            def contains_sequence(
+                haystack: list[str],
+                needle_tokens: list[str],
+            ) -> bool:
+                if not needle_tokens or len(needle_tokens) > len(haystack):
+                    return False
+                width = len(needle_tokens)
+                return any(
+                    haystack[index:index + width] == needle_tokens
+                    for index in range(len(haystack) - width + 1)
+                )
+
+            def longest_shared_sequence(
+                left: list[str],
+                right: list[str],
+            ) -> int:
+                longest = 0
+                for left_index in range(len(left)):
+                    for right_index in range(len(right)):
+                        length = 0
+                        while (
+                            left_index + length < len(left)
+                            and right_index + length < len(right)
+                            and left[left_index + length]
+                            == right[right_index + length]
+                        ):
+                            length += 1
+                        longest = max(longest, length)
+                return longest
+
+            request_text = str(request.text or "")
+            text_tokens = normalized_tokens(request_text)
+            if not text_tokens:
+                return ConversationResult(
+                    handled=True,
+                    object_type="record",
+                    metadata={"resolution": "not_found", "matches": []},
+                )
+
+            leading_reference_match = re.match(
+                r"^\s*(.+?)\s+"
+                r"\b(?:is|are|was|were|has|have|had)\b",
+                request_text,
+                flags=re.IGNORECASE,
+            )
+            reference_tokens = (
+                normalized_tokens(leading_reference_match.group(1))
+                if leading_reference_match
+                else []
+            )
+
+            clear_matches = []
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+
+                record_id = record.get("id")
+                labels = record.get("labels")
+                if labels is None:
+                    labels = [record.get("label")]
+                elif isinstance(labels, str):
+                    labels = [labels]
+                elif not isinstance(labels, (list, tuple)):
+                    continue
+
+                clear_match = False
+                for label in labels:
+                    label_tokens = normalized_tokens(label)
+                    if not label_tokens:
+                        continue
+
+                    if reference_tokens:
+                        clear_match = contains_sequence(
+                            label_tokens,
+                            reference_tokens,
+                        )
+                    else:
+                        shared_length = longest_shared_sequence(
+                            text_tokens,
+                            label_tokens,
+                        )
+                        clear_match = (
+                            shared_length >= 2
+                            or (
+                                shared_length == 1
+                                and len(text_tokens) == 1
+                            )
+                        )
+
+                    if clear_match:
+                        break
+
+                if clear_match:
+                    clear_matches.append(
+                        {
+                            "id": record_id,
+                            "label": str(record.get("label") or ""),
+                        }
+                    )
+
+            if not clear_matches:
+                return ConversationResult(
+                    handled=True,
+                    object_type="record",
+                    metadata={"resolution": "not_found", "matches": []},
+                )
+
+            if len(clear_matches) == 1:
+                resolved = clear_matches[0]
+                return ConversationResult(
+                    handled=True,
+                    object_type="record",
+                    entities={"record_id": resolved["id"]},
+                    metadata={
+                        "resolution": "resolved",
+                        "match_count": 1,
+                    },
+                )
+
+            return ConversationResult(
+                handled=True,
+                object_type="record",
+                metadata={
+                    "resolution": "ambiguous",
+                    "matches": clear_matches,
+                },
+            )
+
         if request.capability == "recurrence":
             if candidate != "schedule_recurrence":
                 return ConversationResult()

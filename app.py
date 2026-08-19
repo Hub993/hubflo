@@ -464,6 +464,75 @@ def classify_delay(text: str) -> bool:
         and result.classification == "critical_path_delay"
     )
 
+def _resolve_delay_task_reference(
+    text: str,
+    project_code: Optional[str],
+) -> dict:
+    project = (
+        str(project_code).strip()
+        if project_code is not None
+        else ""
+    )
+    if not project:
+        return {"status": "project_missing"}
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(Task)
+            .filter(
+                Task.project_code == project,
+                Task.status == "open",
+            )
+            .order_by(Task.id.desc())
+            .all()
+        )
+
+    records = []
+    for row in rows:
+        label = (row.text or "").strip()
+        if not label or label.lower().startswith("[await:"):
+            continue
+        records.append(
+            {
+                "id": row.id,
+                "label": label,
+                "labels": [label],
+            }
+        )
+
+    result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="record_resolution",
+            text=text or "",
+            context={
+                "candidate": "text_reference",
+                "records": records,
+            },
+        )
+    )
+
+    resolution = str(
+        result.metadata.get("resolution") or ""
+    ).strip().lower()
+
+    if resolution == "resolved":
+        try:
+            return {
+                "status": "resolved",
+                "task_id": int(result.entities["record_id"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            return {"status": "not_found"}
+
+    if resolution == "ambiguous":
+        matches = result.metadata.get("matches")
+        return {
+            "status": "ambiguous",
+            "matches": matches if isinstance(matches, list) else [],
+        }
+
+    return {"status": "not_found"}
+
 # >>> PATCH_2_DELAY_CLASSIFIER_END <<<
 
 
@@ -2118,19 +2187,74 @@ def webhook():
                 text.lower(),
             )
 
-            if not task_match:
-                send_whatsapp_text(
-                    phone_id,
-                    sender,
-                    (
-                        "Please include the task number. "
-                        "For example: Delay task 101 "
-                        "by 3 days due to rain."
-                    ),
+            if task_match:
+                task_id = int(task_match.group(1))
+            else:
+                task_resolution = _resolve_delay_task_reference(
+                    text,
+                    project_code,
                 )
-                return ("", 200)
+                resolution_status = task_resolution.get("status")
 
-            task_id = int(task_match.group(1))
+                if resolution_status == "project_missing":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        (
+                            "Your WhatsApp number is not mapped "
+                            "to a project, so I cannot identify "
+                            "the delayed task or phase."
+                        ),
+                    )
+                    return ("", 200)
+
+                if resolution_status == "ambiguous":
+                    matches = task_resolution.get("matches") or []
+                    choices = []
+                    for match in matches[:3]:
+                        try:
+                            match_id = int(match.get("id"))
+                        except (AttributeError, TypeError, ValueError):
+                            continue
+                        label = str(match.get("label") or "").strip()
+                        if len(label) > 60:
+                            label = label[:57].rstrip() + "..."
+                        choices.append(
+                            f"task {match_id}: {label}"
+                            if label
+                            else f"task {match_id}"
+                        )
+
+                    detail = (
+                        " " + "; ".join(choices) + "."
+                        if choices
+                        else ""
+                    )
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        (
+                            "I found more than one matching task "
+                            "in your project."
+                            f"{detail} Please resend the delay "
+                            "with the specific task or phase name."
+                        ),
+                    )
+                    return ("", 200)
+
+                if resolution_status != "resolved":
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        (
+                            "I could not match that delay to a task "
+                            "in your project. Please resend it with "
+                            "the task or phase name."
+                        ),
+                    )
+                    return ("", 200)
+
+                task_id = int(task_resolution["task_id"])
 
             days_match = re.search(
                 r"\b(?:by\s+)?"
