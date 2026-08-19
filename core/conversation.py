@@ -45,6 +45,72 @@ class CoreConversation:
             request.context.get("candidate") or ""
         ).strip().lower()
 
+        if request.capability == "recurrence":
+            if candidate != "schedule_recurrence":
+                return ConversationResult()
+
+            text = (request.text or "").lower().strip()
+            recurrence_rule = "none"
+            recurrence_interval = 1
+            recurrence_seconds = None
+            recurrence_weekday = None
+
+            every_n_match = re.search(
+                r"\bevery\s+(\d+)\s+"
+                r"(minutes?|hours?|days?|weeks?|months?)\b",
+                text,
+            )
+            if every_n_match:
+                recurrence_interval = max(1, int(every_n_match.group(1)))
+                unit = every_n_match.group(2)
+                if unit.startswith("minute"):
+                    recurrence_rule = "interval"
+                    recurrence_seconds = recurrence_interval * 60
+                elif unit.startswith("hour"):
+                    recurrence_rule = "interval"
+                    recurrence_seconds = recurrence_interval * 3600
+                elif unit.startswith("day"):
+                    recurrence_rule = "daily"
+                elif unit.startswith("week"):
+                    recurrence_rule = "weekly"
+                else:
+                    recurrence_rule = "monthly"
+
+            weekday_recurrence_match = re.search(
+                r"\bevery\s+"
+                r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+                text,
+            )
+            if weekday_recurrence_match:
+                recurrence_rule = "weekly"
+                recurrence_weekday = weekday_recurrence_match.group(1)
+
+            if re.search(r"\bevery\s+weekday\b", text):
+                recurrence_rule = "weekdays"
+            elif re.search(r"\b(?:every\s+day|daily)\b", text):
+                recurrence_rule = "daily"
+            elif re.search(r"\b(?:every\s+week|weekly)\b", text):
+                recurrence_rule = "weekly"
+            elif re.search(r"\b(?:every\s+month|monthly)\b", text):
+                recurrence_rule = "monthly"
+            elif re.search(r"\b(?:every\s+hour|hourly)\b", text):
+                recurrence_rule = "hourly"
+                recurrence_seconds = 3600
+
+            if recurrence_rule == "none":
+                return ConversationResult()
+
+            return ConversationResult(
+                handled=True,
+                object_type="recurrence",
+                metadata={
+                    "recurrence_rule": recurrence_rule,
+                    "recurrence_interval": recurrence_interval,
+                    "recurrence_seconds": recurrence_seconds,
+                    "weekday": recurrence_weekday,
+                },
+            )
+
         if request.capability == "shared_datetime":
             if candidate == "calendar_date":
                 reference_date_text = str(

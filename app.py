@@ -755,46 +755,21 @@ def parse_pm_reminder_request(
     recurrence_interval = 1
     recurrence_seconds = None
     recurrence_anchor_day = None
+    recurrence_weekday = None
 
-    every_n_match = re.search(
-        r"\bevery\s+(\d+)\s+"
-        r"(minutes?|hours?|days?|weeks?|months?)\b",
-        t,
+    recurrence_result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="recurrence",
+            text=t,
+            context={"candidate": "schedule_recurrence"},
+        )
     )
-    if every_n_match:
-        recurrence_interval = max(1, int(every_n_match.group(1)))
-        unit = every_n_match.group(2)
-        if unit.startswith("minute"):
-            recurrence_rule = "interval"
-            recurrence_seconds = recurrence_interval * 60
-        elif unit.startswith("hour"):
-            recurrence_rule = "interval"
-            recurrence_seconds = recurrence_interval * 3600
-        elif unit.startswith("day"):
-            recurrence_rule = "daily"
-        elif unit.startswith("week"):
-            recurrence_rule = "weekly"
-        else:
-            recurrence_rule = "monthly"
-
-    weekday_recurrence_match = re.search(
-        r"\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        t,
-    )
-    if weekday_recurrence_match:
-        recurrence_rule = "weekly"
-
-    if re.search(r"\bevery\s+weekday\b", t):
-        recurrence_rule = "weekdays"
-    elif re.search(r"\b(?:every\s+day|daily)\b", t):
-        recurrence_rule = "daily"
-    elif re.search(r"\b(?:every\s+week|weekly)\b", t):
-        recurrence_rule = "weekly"
-    elif re.search(r"\b(?:every\s+month|monthly)\b", t):
-        recurrence_rule = "monthly"
-    elif re.search(r"\b(?:every\s+hour|hourly)\b", t):
-        recurrence_rule = "hourly"
-        recurrence_seconds = 3600
+    if recurrence_result.handled:
+        recurrence_metadata = recurrence_result.metadata
+        recurrence_rule = recurrence_metadata["recurrence_rule"]
+        recurrence_interval = recurrence_metadata["recurrence_interval"]
+        recurrence_seconds = recurrence_metadata["recurrence_seconds"]
+        recurrence_weekday = recurrence_metadata.get("weekday")
 
     relative_duration_result = _CORE_CONVERSATION.interpret_core(
         ConversationRequest(
@@ -880,10 +855,8 @@ def parse_pm_reminder_request(
         if recurrence_rule == "daily":
             next_local = now_local + dt.timedelta(days=recurrence_interval)
         elif recurrence_rule == "weekly":
-            if weekday_recurrence_match:
-                weekday = _REMINDER_WEEKDAYS[
-                    weekday_recurrence_match.group(1)
-                ]
+            if recurrence_weekday:
+                weekday = _REMINDER_WEEKDAYS[recurrence_weekday]
                 next_date = _pm_reminder_next_weekday(
                     now_local.date(),
                     weekday,
@@ -920,10 +893,8 @@ def parse_pm_reminder_request(
         if target_date is None:
             target_date = now_local.date()
 
-        if recurrence_rule == "weekly" and weekday_recurrence_match:
-            weekday = _REMINDER_WEEKDAYS[
-                weekday_recurrence_match.group(1)
-            ]
+        if recurrence_rule == "weekly" and recurrence_weekday:
+            weekday = _REMINDER_WEEKDAYS[recurrence_weekday]
             target_date = _pm_reminder_next_weekday(
                 now_local.date(),
                 weekday,
