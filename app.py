@@ -1037,7 +1037,192 @@ def webhook():
         create_task,
         adjust_stock,
         create_stock_item,
+        save_pending_conversation_state,
+        get_pending_conversation_state,
+        claim_conversation_state_continuation,
+        advance_conversation_state_continuation,
+        resolve_conversation_state,
     )
+
+    # -----------------------------------------------------------------
+    # MU12 — GENERIC PERSISTENT CONVERSATION-STATE ORCHESTRATION
+    # -----------------------------------------------------------------
+    def _conversation_scope(sender_wa: str) -> tuple[int, Optional[str]]:
+        user_info = get_user_role(sender_wa) or {}
+        try:
+            client_id = int(user_info.get("client_id") or 1)
+        except (TypeError, ValueError):
+            client_id = 1
+
+        project_code = user_info.get("project_code")
+        if project_code is not None:
+            project_code = str(project_code).strip() or None
+        return client_id, project_code
+
+    def _conversation_client_id(sender_wa: str) -> int:
+        return _conversation_scope(sender_wa)[0]
+
+    def _get_active_conversation_state(sender_wa: str) -> Optional[dict]:
+        client_id, project_code = _conversation_scope(sender_wa)
+        state = get_pending_conversation_state(
+            sender_wa,
+            client_id,
+            project_code,
+        )
+        if state is None and project_code is not None:
+            state = get_pending_conversation_state(
+                sender_wa,
+                client_id,
+                None,
+            )
+        return state
+
+    def _await_expected_field(await_text: str) -> Optional[str]:
+        match = re.match(
+            r"^\s*\[await:([^\]]+)\]",
+            await_text or "",
+            flags=re.IGNORECASE,
+        )
+        return match.group(1).strip().lower() if match else None
+
+    def _save_await_conversation_state(
+        task_id: int,
+        task_sender: str,
+        project_code: Optional[str],
+        await_text: str,
+        original_request: str,
+        structured_context: Optional[dict] = None,
+        candidate_metadata: Optional[dict] = None,
+    ) -> Optional[dict]:
+        expected_field = _await_expected_field(await_text)
+        if not expected_field:
+            return None
+
+        client_id = _conversation_client_id(task_sender)
+        continuation_key = f"business-state:{int(task_id)}"
+        existing = get_pending_conversation_state(
+            task_sender,
+            client_id,
+            project_code,
+            continuation_key=continuation_key,
+        )
+
+        if existing:
+            original_request = existing["original_request"]
+            if structured_context is None:
+                structured_context = existing.get("structured_context") or {}
+            if candidate_metadata is None:
+                candidate_metadata = existing.get("candidate_metadata") or {}
+            continuation = existing.get("continuation") or {}
+        else:
+            structured_context = structured_context or {
+                "source_record_id": int(task_id),
+            }
+            candidate_metadata = candidate_metadata or {}
+            continuation = {
+                "source_record_id": int(task_id),
+                "source_record_type": "pending_business_state",
+            }
+
+        state = save_pending_conversation_state(
+            {
+                "client_id": client_id,
+                "sender": task_sender,
+                "project_code": project_code,
+                "state_kind": "await",
+                "expected_field": expected_field,
+                "original_request": original_request or "",
+                "structured_context": structured_context,
+                "candidate_metadata": candidate_metadata,
+                "continuation": continuation,
+                "continuation_key": continuation_key,
+            }
+        )
+        return state if state.get("active") else None
+
+    def _get_await_conversation_state(awaiting) -> Optional[dict]:
+        return get_pending_conversation_state(
+            awaiting.sender,
+            _conversation_client_id(awaiting.sender),
+            awaiting.project_code,
+            continuation_key=f"business-state:{int(awaiting.id)}",
+        )
+
+    def _ensure_await_conversation_state(awaiting) -> Optional[dict]:
+        existing = _get_await_conversation_state(awaiting)
+        if existing:
+            return existing
+
+        body = (awaiting.text or "").split("\n", 1)
+        fallback_original = body[1] if len(body) == 2 else awaiting.text or ""
+        return _save_await_conversation_state(
+            awaiting.id,
+            awaiting.sender,
+            awaiting.project_code,
+            awaiting.text or "",
+            fallback_original,
+        )
+
+    def _sync_await_conversation_state_after_resolver(
+        pending_state: Optional[dict],
+        awaiting,
+        prior_text: str,
+        prior_status: str,
+    ) -> None:
+        if not pending_state:
+            return
+
+        if (awaiting.text or "") == prior_text and awaiting.status == prior_status:
+            return
+
+        expected_field = _await_expected_field(awaiting.text or "")
+        if awaiting.status == "open" and expected_field:
+            advance_conversation_state_continuation(
+                pending_state["id"],
+                pending_state["sender"],
+                pending_state["client_id"],
+                pending_state.get("project_code"),
+                expected_field,
+            )
+            return
+
+        resolve_conversation_state(
+            pending_state["id"],
+            pending_state["sender"],
+            pending_state["client_id"],
+            pending_state.get("project_code"),
+        )
+
+    def _run_await_resolver(
+        resolver,
+        awaiting,
+        raw_txt: str,
+        sender_wa: str,
+        session,
+        pending_state: Optional[dict],
+    ) -> bool:
+        if not pending_state:
+            return False
+
+        claimed_state = claim_conversation_state_continuation(
+            pending_state["id"],
+            pending_state["sender"],
+            pending_state["client_id"],
+            pending_state.get("project_code"),
+        )
+        if claimed_state.get("status_result") != "claimed":
+            return False
+
+        prior_text = awaiting.text or ""
+        prior_status = awaiting.status
+        resolver(awaiting, raw_txt, sender_wa, session)
+        _sync_await_conversation_state_after_resolver(
+            claimed_state,
+            awaiting,
+            prior_text,
+            prior_status,
+        )
+        return True
 
     # -----------------------------------------------------------------
     # BLOCK 1 ENDS HERE — READY FOR BLOCK 2 (SEARCH ENGINE)
@@ -1395,6 +1580,18 @@ def webhook():
     # Scope: guard non-numeric input, preserve state, stop retry cascade
     # -----------------------------------------------------------------
 
+    def validate_new_stock_qty_reply(raw_txt: str) -> dict:
+        """Expose the existing guarded quantity rule without mutation."""
+        raw = (raw_txt or "").strip()
+        if not raw.isdigit():
+            return {"valid": False, "reason": "whole_number"}
+
+        qty_val = int(raw)
+        if qty_val <= 0:
+            return {"valid": False, "reason": "positive"}
+
+        return {"valid": True, "value": qty_val}
+
     def resolve_await_new_stock_qty(awaiting, raw_txt, sender, s):
         """[await:new_stock_qty] → choose quantity, create item (guarded)."""
 
@@ -1408,25 +1605,22 @@ def webhook():
         material = meta.get("material", "stock item")
         unit = meta.get("unit", "units")
 
-        raw = (raw_txt or "").strip()
+        validation = validate_new_stock_qty_reply(raw_txt)
 
         # HARD GUARD — only accept whole-number input
-        if not raw.isdigit():
+        if not validation["valid"]:
+            if validation["reason"] == "whole_number":
+                message = "Send a whole number for the quantity."
+            else:
+                message = "Quantity must be greater than zero."
             send_whatsapp_text(
                 phone_id,
                 sender,
-                "Send a whole number for the quantity."
+                message
             )
             return
 
-        qty_val = int(raw)
-        if qty_val <= 0:
-            send_whatsapp_text(
-                phone_id,
-                sender,
-                "Quantity must be greater than zero."
-            )
-            return
+        qty_val = int(validation["value"])
 
         create_stock_item({
             "name": material,
@@ -1566,6 +1760,13 @@ def webhook():
                         )
                         t.text = f"[await:{flag}]\n{body}"
                         s.commit()
+                        _save_await_conversation_state(
+                            t.id,
+                            t.sender,
+                            t.project_code,
+                            t.text or "",
+                            body,
+                        )
                 send_whatsapp_text(phone_id, sender, prompt)
                 return ("", 200)
 
@@ -1578,8 +1779,16 @@ def webhook():
                 with S2() as s:
                     t = s.get(T2, tid)
                     if t:
-                        t.text = f"[await:item]\n{t.text or ''}"
+                        original_request = t.text or ""
+                        t.text = f"[await:item]\n{original_request}"
                         s.commit()
+                        _save_await_conversation_state(
+                            t.id,
+                            t.sender,
+                            t.project_code,
+                            t.text or "",
+                            original_request,
+                        )
                 send_whatsapp_text(phone_id, sender, "Great — what item should we order?")
                 return ("", 200)
 
@@ -1974,43 +2183,128 @@ def webhook():
                 s.commit()
 
         # -------------------------------------------------------------
-        # CHECK FOR AWAITING TASK (ALL TYPES)
+        # CHECK FOR PERSISTENT CONVERSATION STATE / LEGACY AWAIT
         # -------------------------------------------------------------
         if text:
-            with DBSession() as s:
-                awaiting = (
-                    s.query(Task)
-                    .filter(
-                        Task.sender == sender,
-                        Task.status == "open",
-                        Task.text.ilike("[await:%]%"),
-                    )
-                    .order_by(Task.id.desc())
-                    .first()
-                )
+            deterministic_recognition = (
+                has_deterministic_normal_route_recognition(text)
+            )
+            pending_state = _get_active_conversation_state(sender)
 
-                bypass_pending_await = False
-                if awaiting:
-                    deterministic_recognition = (
-                        has_deterministic_normal_route_recognition(text)
+            with DBSession() as s:
+                awaiting = None
+
+                # Persistent generic state is discovered first. Existing await
+                # Tasks remain compatibility/business-state records only.
+                if pending_state and pending_state.get("state_kind") == "await":
+                    continuation = pending_state.get("continuation") or {}
+                    try:
+                        source_record_id = int(
+                            continuation.get("source_record_id")
+                        )
+                    except (TypeError, ValueError):
+                        source_record_id = None
+
+                    if source_record_id is not None:
+                        candidate_await = (
+                            s.query(Task)
+                            .filter(
+                                Task.id == source_record_id,
+                                Task.sender == sender,
+                                Task.status == "open",
+                                Task.text.ilike("[await:%]%"),
+                            )
+                            .first()
+                        )
+                        if candidate_await:
+                            state_project = pending_state.get("project_code")
+                            task_project = candidate_await.project_code
+                            if task_project is not None:
+                                task_project = str(task_project).strip() or None
+                            if task_project == state_project:
+                                awaiting = candidate_await
+
+                # Backward-compatible discovery for pre-MU12 await records.
+                if pending_state is None:
+                    awaiting = (
+                        s.query(Task)
+                        .filter(
+                            Task.sender == sender,
+                            Task.status == "open",
+                            Task.text.ilike("[await:%]%"),
+                        )
+                        .order_by(Task.id.desc())
+                        .first()
                     )
+
+                    if awaiting and not deterministic_recognition:
+                        _, current_project = _conversation_scope(sender)
+                        await_project = awaiting.project_code
+                        if await_project is not None:
+                            await_project = str(await_project).strip() or None
+                        if (
+                            await_project is None
+                            or await_project == current_project
+                        ):
+                            pending_state = _ensure_await_conversation_state(
+                                awaiting
+                            )
+
+                pending_reply_valid = False
+                pending_reply_invalid = False
+                if pending_state and awaiting:
+                    continuation = pending_state.get("continuation") or {}
+                    try:
+                        continuation_matches = (
+                            int(continuation.get("source_record_id"))
+                            == int(awaiting.id)
+                        )
+                    except (TypeError, ValueError):
+                        continuation_matches = False
+
+                    if (
+                        continuation_matches
+                        and pending_state.get("expected_field")
+                        == "new_stock_qty"
+                    ):
+                        validation = validate_new_stock_qty_reply(text)
+                        pending_reply_valid = bool(validation["valid"])
+                        pending_reply_invalid = not pending_reply_valid
+
+                arbitration = None
+                if pending_state or awaiting:
                     arbitration = _CORE_CONVERSATION.interpret_core(
                         ConversationRequest(
                             capability="routing_arbitration",
                             context={
-                                "candidate": "await_vs_normal_route",
+                                "candidate": (
+                                    "await_vs_normal_route"
+                                    if awaiting
+                                    else "pending_state_vs_normal_route"
+                                ),
                                 "deterministic_recognition": (
                                     deterministic_recognition
                                 ),
+                                "pending_reply_valid": pending_reply_valid,
+                                "pending_reply_invalid": pending_reply_invalid,
                             },
                         )
                     )
-                    bypass_pending_await = bool(
-                        arbitration.handled
-                        and arbitration.action == "normal_route"
-                    )
 
-                if awaiting and not bypass_pending_await:
+                bypass_pending = bool(
+                    arbitration
+                    and arbitration.handled
+                    and arbitration.action == "normal_route"
+                )
+
+                # A generic pending state that is not backed by a legacy await
+                # is preserved until a later consumer supplies authoritative
+                # continuation evidence. Deterministic unrelated commands retain
+                # MU11 normal-route bypass behavior.
+                if pending_state and not awaiting and not bypass_pending:
+                    return ("", 200)
+
+                if awaiting and not bypass_pending:
                     raw_txt = (text or "").strip()
                     await_lower = (awaiting.text or "").lower()
 
@@ -2018,38 +2312,67 @@ def webhook():
                     # ORDER AWAIT CHAINS
                     # ------------------------------
                     if await_lower.startswith("[await:item]"):
-                        resolve_await_item(awaiting, raw_txt, sender, s)
+                        _run_await_resolver(
+                            resolve_await_item, awaiting, raw_txt, sender, s,
+                            pending_state,
+                        )
                         return ("", 200)
 
                     if await_lower.startswith("[await:quantity]"):
-                        resolve_await_quantity(awaiting, raw_txt, sender, s)
+                        _run_await_resolver(
+                            resolve_await_quantity, awaiting, raw_txt, sender, s,
+                            pending_state,
+                        )
                         return ("", 200)
 
                     if await_lower.startswith("[await:supplier]"):
-                        resolve_await_supplier(awaiting, raw_txt, sender, s)
+                        _run_await_resolver(
+                            resolve_await_supplier, awaiting, raw_txt, sender, s,
+                            pending_state,
+                        )
                         return ("", 200)
 
                     if await_lower.startswith("[await:delivery_date]"):
-                        resolve_await_delivery_date(awaiting, raw_txt, sender, s)
+                        _run_await_resolver(
+                            resolve_await_delivery_date, awaiting, raw_txt, sender, s,
+                            pending_state,
+                        )
                         return ("", 200)
 
                     if await_lower.startswith("[await:drop_location]"):
-                        resolve_await_drop_location(awaiting, raw_txt, sender, s)
+                        _run_await_resolver(
+                            resolve_await_drop_location, awaiting, raw_txt, sender, s,
+                            pending_state,
+                        )
                         return ("", 200)
 
                     # ------------------------------
                     # STOCK AWAIT CHAINS
                     # ------------------------------
                     if await_lower.startswith("[await:stock_unit]"):
-                        resolve_await_stock_unit(awaiting, raw_txt, sender, s)
+                        _run_await_resolver(
+                            resolve_await_stock_unit, awaiting, raw_txt, sender, s,
+                            pending_state,
+                        )
                         return ("", 200)
 
                     if await_lower.startswith("[await:new_stock_unit]"):
-                        resolve_await_new_stock_unit(awaiting, raw_txt, sender, s)
+                        _run_await_resolver(
+                            resolve_await_new_stock_unit, awaiting, raw_txt, sender, s,
+                            pending_state,
+                        )
                         return ("", 200)
 
                     if await_lower.startswith("[await:new_stock_qty]"):
-                        resolve_await_new_stock_qty(awaiting, raw_txt, sender, s)
+                        if pending_reply_invalid:
+                            resolve_await_new_stock_qty(
+                                awaiting, raw_txt, sender, s
+                            )
+                        else:
+                            _run_await_resolver(
+                                resolve_await_new_stock_qty, awaiting, raw_txt,
+                                sender, s, pending_state,
+                            )
                         return ("", 200)
 
         # -------------------------------------------------------------
@@ -2057,7 +2380,7 @@ def webhook():
         # -------------------------------------------------------------
         if text and is_new_stock_item_request(text):
             material = parse_new_stock_item(text)
-            create_task(
+            pending_row = create_task(
                 sender=sender,
                 text=f"[await:new_stock_unit] material={material}",
                 tag="stock",
@@ -2066,6 +2389,13 @@ def webhook():
                 order_state=None,
                 attachment=None,
                 subtype="assigned",
+            )
+            _save_await_conversation_state(
+                pending_row["id"],
+                sender,
+                pending_row.get("project_code"),
+                pending_row.get("text") or "",
+                text or "",
             )
             send_whatsapp_text(
                 phone_id,
@@ -2086,7 +2416,7 @@ def webhook():
                     f"qty={stock_cmd.get('qty')};"
                     f"material={stock_cmd['material']}"
                 )
-                create_task(
+                pending_row = create_task(
                     sender=sender,
                     text=f"[await:stock_unit] {meta}",
                     tag="stock",
@@ -2095,6 +2425,13 @@ def webhook():
                     order_state=None,
                     attachment=None,
                     subtype="assigned",
+                )
+                _save_await_conversation_state(
+                    pending_row["id"],
+                    sender,
+                    pending_row.get("project_code"),
+                    pending_row.get("text") or "",
+                    text or "",
                 )
                 send_whatsapp_text(
                     phone_id,
@@ -2456,8 +2793,20 @@ def webhook():
             with DBSession() as s:
                 t = s.get(Task, new_row["id"])
                 if t and not (t.text or "").lower().startswith("[await:item]"):
-                    t.text = f"[await:item]\n{t.text}"
+                    original_request = t.text or ""
+                    t.text = f"[await:item]\n{original_request}"
                     s.commit()
+                    _save_await_conversation_state(
+                        t.id,
+                        t.sender,
+                        t.project_code,
+                        t.text or "",
+                        original_request,
+                        structured_context={
+                            "source_record_id": t.id,
+                            "classification": cls,
+                        },
+                    )
             send_whatsapp_text(phone_id, sender, "Item?")
             return ("", 200)
 

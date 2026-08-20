@@ -46,22 +46,41 @@ class CoreConversation:
         ).strip().lower()
 
         if request.capability == "routing_arbitration":
-            if candidate != "await_vs_normal_route":
+            if candidate not in (
+                "await_vs_normal_route",
+                "pending_state_vs_normal_route",
+            ):
                 return ConversationResult()
 
             deterministic_recognition = (
                 request.context.get("deterministic_recognition") is True
             )
+            pending_reply_valid = (
+                request.context.get("pending_reply_valid") is True
+            )
+            pending_reply_invalid = (
+                request.context.get("pending_reply_invalid") is True
+            )
+
+            if deterministic_recognition and pending_reply_valid:
+                action = "pending_await"
+            elif deterministic_recognition:
+                action = "normal_route"
+            elif pending_reply_valid and pending_reply_invalid:
+                action = "pending_await"
+            elif pending_reply_valid:
+                action = "resume_pending"
+            else:
+                action = "pending_await"
+
             return ConversationResult(
                 handled=True,
-                action=(
-                    "normal_route"
-                    if deterministic_recognition
-                    else "pending_await"
-                ),
+                action=action,
                 object_type="routing",
                 metadata={
-                    "bypass_pending_await": deterministic_recognition,
+                    "bypass_pending_await": action == "normal_route",
+                    "resume_pending": action == "resume_pending",
+                    "preserve_pending": action != "resume_pending",
                 },
             )
 

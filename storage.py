@@ -2,11 +2,13 @@
 # Derived from verified v5 base + reinforced tethered safeguards
 # ---------------------------------------------------------------------
 import os
+import json
 import datetime as dt
 from typing import Optional, Iterable
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, Text, Boolean, Float
+    create_engine, Column, Integer, String, DateTime, Text, Boolean, Float,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import inspect, text
@@ -1157,6 +1159,401 @@ class SystemState(Base):
     redmode = Column(Boolean, default=False)
     redmode_reason = Column(String(200), nullable=True)
 
+
+# >>> MU12_CONVERSATION_STATE_STORAGE_START <<<
+
+class ConversationState(Base):
+    """Persistent industry-neutral conversation continuation state."""
+
+    __tablename__ = "conversation_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "sender",
+            "continuation_key",
+            name="uq_conversation_state_continuation",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, nullable=False, index=True)
+    sender = Column(String(64), nullable=False, index=True)
+    project_code = Column(String(128), nullable=True, index=True)
+    state_kind = Column(String(32), nullable=False, index=True)
+    expected_field = Column(String(128), nullable=True)
+    original_request = Column(Text, nullable=False, default="")
+    structured_context_json = Column("structured_context", Text, nullable=True)
+    candidate_metadata_json = Column("candidate_metadata", Text, nullable=True)
+    continuation_json = Column("continuation", Text, nullable=True)
+    continuation_key = Column(String(256), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default="active", index=True)
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=dt.datetime.utcnow,
+        onupdate=dt.datetime.utcnow,
+    )
+    resolved_at = Column(DateTime, nullable=True)
+
+
+def _conversation_state_json(value) -> str:
+    return json.dumps(
+        value if value is not None else {},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _conversation_state_value(value: Optional[str]):
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed
+
+
+def _as_conversation_state_dict(state: ConversationState) -> dict:
+    return {
+        "id": state.id,
+        "client_id": state.client_id,
+        "sender": state.sender,
+        "project_code": state.project_code,
+        "state_kind": state.state_kind,
+        "expected_field": state.expected_field,
+        "original_request": state.original_request or "",
+        "structured_context": _conversation_state_value(
+            state.structured_context_json
+        ),
+        "candidate_metadata": _conversation_state_value(
+            state.candidate_metadata_json
+        ),
+        "continuation": _conversation_state_value(state.continuation_json),
+        "continuation_key": state.continuation_key,
+        "status": state.status,
+        "active": bool(state.active),
+        "created_at": state.created_at,
+        "updated_at": state.updated_at,
+        "resolved_at": state.resolved_at,
+    }
+
+
+def save_pending_conversation_state(payload: dict) -> dict:
+    """Create or idempotently refresh one generic active continuation."""
+    payload = payload or {}
+    sender = str(payload.get("sender") or "").strip()
+    state_kind = str(payload.get("state_kind") or "").strip()
+    continuation_key = str(payload.get("continuation_key") or "").strip()
+    if not sender or not state_kind or not continuation_key:
+        return {"status": "error", "code": "required_state_identity_missing"}
+
+    try:
+        client_id = int(payload.get("client_id") or current_client_id())
+    except (TypeError, ValueError):
+        return {"status": "error", "code": "invalid_client_id"}
+
+    project_code = payload.get("project_code")
+    if project_code is not None:
+        project_code = str(project_code).strip() or None
+
+    expected_field = payload.get("expected_field")
+    if expected_field is not None:
+        expected_field = str(expected_field).strip() or None
+
+    original_request = payload.get("original_request")
+    if original_request is None:
+        original_request = ""
+    elif not isinstance(original_request, str):
+        original_request = str(original_request)
+
+    structured_context_supplied = "structured_context" in payload
+    candidate_metadata_supplied = "candidate_metadata" in payload
+    continuation_supplied = "continuation" in payload
+
+    structured_context_json = _conversation_state_json(
+        payload.get("structured_context")
+    )
+    candidate_metadata_json = _conversation_state_json(
+        payload.get("candidate_metadata")
+    )
+    continuation_json = _conversation_state_json(payload.get("continuation"))
+
+    with SessionLocal() as s:
+        state = (
+            s.query(ConversationState)
+            .filter(
+                ConversationState.client_id == client_id,
+                ConversationState.sender == sender,
+                ConversationState.continuation_key == continuation_key,
+            )
+            .first()
+        )
+
+        if state is None:
+            state = ConversationState(
+                client_id=client_id,
+                sender=sender,
+                project_code=project_code,
+                state_kind=state_kind,
+                expected_field=expected_field,
+                original_request=original_request,
+                structured_context_json=structured_context_json,
+                candidate_metadata_json=candidate_metadata_json,
+                continuation_json=continuation_json,
+                continuation_key=continuation_key,
+                status="active",
+                active=True,
+            )
+            s.add(state)
+            s.commit()
+            s.refresh(state)
+            result = _as_conversation_state_dict(state)
+            result["status_result"] = "created"
+            return result
+
+        if not state.active or state.status != "active":
+            result = _as_conversation_state_dict(state)
+            result["status_result"] = "inactive"
+            return result
+
+        if state.project_code != project_code or state.state_kind != state_kind:
+            result = _as_conversation_state_dict(state)
+            result["status_result"] = "scope_conflict"
+            return result
+
+        changes = {"expected_field": expected_field}
+        if structured_context_supplied:
+            changes["structured_context_json"] = structured_context_json
+        if candidate_metadata_supplied:
+            changes["candidate_metadata_json"] = candidate_metadata_json
+        if continuation_supplied:
+            changes["continuation_json"] = continuation_json
+        if not state.original_request and original_request:
+            changes["original_request"] = original_request
+
+        changed = False
+        for field_name, value in changes.items():
+            if getattr(state, field_name) != value:
+                setattr(state, field_name, value)
+                changed = True
+
+        if changed:
+            state.updated_at = dt.datetime.utcnow()
+            s.commit()
+            s.refresh(state)
+
+        result = _as_conversation_state_dict(state)
+        result["status_result"] = "updated" if changed else "unchanged"
+        return result
+
+
+def get_pending_conversation_state(
+    sender: str,
+    client_id: int,
+    project_code: Optional[str],
+    continuation_key: Optional[str] = None,
+) -> Optional[dict]:
+    """Retrieve one active state inside exact sender/client/project scope."""
+    sender = str(sender or "").strip()
+    if not sender:
+        return None
+    try:
+        client_id = int(client_id)
+    except (TypeError, ValueError):
+        return None
+
+    normalized_project = (
+        str(project_code).strip() if project_code is not None else None
+    )
+    if normalized_project == "":
+        normalized_project = None
+
+    with SessionLocal() as s:
+        q = s.query(ConversationState).filter(
+            ConversationState.client_id == client_id,
+            ConversationState.sender == sender,
+            ConversationState.active == True,
+            ConversationState.status.in_(("active", "continuing")),
+        )
+        if normalized_project is None:
+            q = q.filter(ConversationState.project_code == None)
+        else:
+            q = q.filter(ConversationState.project_code == normalized_project)
+        if continuation_key:
+            q = q.filter(
+                ConversationState.continuation_key == str(continuation_key)
+            )
+
+        state = q.order_by(ConversationState.id.desc()).first()
+        return _as_conversation_state_dict(state) if state else None
+
+
+def claim_conversation_state_continuation(
+    state_id: int,
+    sender: str,
+    client_id: int,
+    project_code: Optional[str],
+) -> dict:
+    """Atomically claim one active continuation before orchestration resumes it."""
+    try:
+        state_id = int(state_id)
+        client_id = int(client_id)
+    except (TypeError, ValueError):
+        return {"status": "error", "code": "invalid_state_identity"}
+
+    sender = str(sender or "").strip()
+    normalized_project = (
+        str(project_code).strip() if project_code is not None else None
+    )
+    if normalized_project == "":
+        normalized_project = None
+
+    with SessionLocal() as s:
+        q = s.query(ConversationState).filter(
+            ConversationState.id == state_id,
+            ConversationState.client_id == client_id,
+            ConversationState.sender == sender,
+            ConversationState.active == True,
+            ConversationState.status == "active",
+        )
+        if normalized_project is None:
+            q = q.filter(ConversationState.project_code == None)
+        else:
+            q = q.filter(ConversationState.project_code == normalized_project)
+
+        now_utc = dt.datetime.utcnow()
+        updated = q.update(
+            {
+                ConversationState.status: "continuing",
+                ConversationState.updated_at: now_utc,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            s.rollback()
+            return {"status": "not_found"}
+
+        s.commit()
+        state = s.get(ConversationState, state_id)
+        result = _as_conversation_state_dict(state)
+        result["status_result"] = "claimed"
+        return result
+
+
+def advance_conversation_state_continuation(
+    state_id: int,
+    sender: str,
+    client_id: int,
+    project_code: Optional[str],
+    expected_field: Optional[str],
+) -> dict:
+    """Return a claimed continuation to active state for its next field."""
+    try:
+        state_id = int(state_id)
+        client_id = int(client_id)
+    except (TypeError, ValueError):
+        return {"status": "error", "code": "invalid_state_identity"}
+
+    sender = str(sender or "").strip()
+    normalized_project = (
+        str(project_code).strip() if project_code is not None else None
+    )
+    if normalized_project == "":
+        normalized_project = None
+
+    if expected_field is not None:
+        expected_field = str(expected_field).strip() or None
+
+    with SessionLocal() as s:
+        q = s.query(ConversationState).filter(
+            ConversationState.id == state_id,
+            ConversationState.client_id == client_id,
+            ConversationState.sender == sender,
+            ConversationState.active == True,
+            ConversationState.status == "continuing",
+        )
+        if normalized_project is None:
+            q = q.filter(ConversationState.project_code == None)
+        else:
+            q = q.filter(ConversationState.project_code == normalized_project)
+
+        now_utc = dt.datetime.utcnow()
+        updated = q.update(
+            {
+                ConversationState.status: "active",
+                ConversationState.expected_field: expected_field,
+                ConversationState.updated_at: now_utc,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            s.rollback()
+            return {"status": "not_found"}
+
+        s.commit()
+        state = s.get(ConversationState, state_id)
+        result = _as_conversation_state_dict(state)
+        result["status_result"] = "advanced"
+        return result
+
+
+def resolve_conversation_state(
+    state_id: int,
+    sender: str,
+    client_id: int,
+    project_code: Optional[str],
+) -> dict:
+    """Resolve one active state once, within exact identity/scope bounds."""
+    try:
+        state_id = int(state_id)
+        client_id = int(client_id)
+    except (TypeError, ValueError):
+        return {"status": "error", "code": "invalid_state_identity"}
+
+    sender = str(sender or "").strip()
+    normalized_project = (
+        str(project_code).strip() if project_code is not None else None
+    )
+    if normalized_project == "":
+        normalized_project = None
+
+    with SessionLocal() as s:
+        q = s.query(ConversationState).filter(
+            ConversationState.id == state_id,
+            ConversationState.client_id == client_id,
+            ConversationState.sender == sender,
+            ConversationState.active == True,
+            ConversationState.status.in_(("active", "continuing")),
+        )
+        if normalized_project is None:
+            q = q.filter(ConversationState.project_code == None)
+        else:
+            q = q.filter(ConversationState.project_code == normalized_project)
+
+        now_utc = dt.datetime.utcnow()
+        updated = q.update(
+            {
+                ConversationState.status: "resolved",
+                ConversationState.active: False,
+                ConversationState.resolved_at: now_utc,
+                ConversationState.updated_at: now_utc,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            s.rollback()
+            return {"status": "not_found"}
+        s.commit()
+        state = s.get(ConversationState, state_id)
+        result = _as_conversation_state_dict(state)
+        result["status_result"] = "resolved"
+        return result
+
+# >>> MU12_CONVERSATION_STATE_STORAGE_END <<<
+
 # --- HOTFIX: ensure system_state table matches model ---
 from sqlalchemy import inspect, text
 def _repair_system_state():
@@ -1403,6 +1800,7 @@ def get_user_role(wa_id: str) -> Optional[dict]:
             return None
         return {
             "wa_id": u.wa_id,
+            "client_id": u.client_id,
             "name": u.name,
             "role": u.role,
             "subcontractor_name": u.subcontractor_name,

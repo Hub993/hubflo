@@ -16,6 +16,7 @@ from storage import (
     # >>> FEATURE_3_REMINDER_FACADE_MODEL_START — V6.1 <<<
     PMReminder,
     # >>> FEATURE_3_REMINDER_FACADE_MODEL_END <<<
+    ConversationState,
     SystemState,
     # Meeting model is used by meeting helpers
     Meeting,
@@ -77,6 +78,13 @@ from storage import (
     # Supplier directory
     supplier_create,
     supplier_list,
+
+    # Generic persistent conversation state
+    save_pending_conversation_state,
+    get_pending_conversation_state,
+    claim_conversation_state_continuation,
+    advance_conversation_state_continuation,
+    resolve_conversation_state,
 
     # Hygiene / system state
     hygiene_pin,
