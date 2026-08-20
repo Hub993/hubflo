@@ -45,6 +45,26 @@ class CoreConversation:
             request.context.get("candidate") or ""
         ).strip().lower()
 
+        if request.capability == "routing_arbitration":
+            if candidate != "await_vs_normal_route":
+                return ConversationResult()
+
+            deterministic_recognition = (
+                request.context.get("deterministic_recognition") is True
+            )
+            return ConversationResult(
+                handled=True,
+                action=(
+                    "normal_route"
+                    if deterministic_recognition
+                    else "pending_await"
+                ),
+                object_type="routing",
+                metadata={
+                    "bypass_pending_await": deterministic_recognition,
+                },
+            )
+
         if request.capability == "record_resolution":
             if candidate != "text_reference":
                 return ConversationResult()

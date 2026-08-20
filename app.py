@@ -1616,6 +1616,40 @@ def webhook():
     # -----------------------------------------------------------------
 
     # -----------------------------------------------------------------
+    # MU11 — NON-MUTATING NORMAL-ROUTE RECOGNITION EVIDENCE
+    # -----------------------------------------------------------------
+    def has_deterministic_normal_route_recognition(raw_text: str) -> bool:
+        t = raw_text or ""
+        lower = t.lower()
+
+        # Preserve the existing await-bypass compatibility path exactly.
+        if any(w in lower for w in (
+            "approve",
+            "reject",
+            "change the order",
+            "change that order",
+            "change order",
+            "change it",
+            "change it to",
+        )):
+            return True
+
+        # Probe only existing authoritative recognition. These helpers do not
+        # execute handlers or mutate the pending await.
+        if is_new_stock_item_request(t):
+            return True
+        if parse_stock_command(t):
+            return True
+        if is_search_request(t):
+            return True
+        if classify_inspection(t):
+            return True
+        if classify_delay(t):
+            return True
+
+        return False
+
+    # -----------------------------------------------------------------
     # MAIN MESSAGE LOOP — W2 CLEAN REBUILD
     # -----------------------------------------------------------------
 
@@ -1942,15 +1976,7 @@ def webhook():
         # -------------------------------------------------------------
         # CHECK FOR AWAITING TASK (ALL TYPES)
         # -------------------------------------------------------------
-        if text and not any(w in (text.lower()) for w in (
-            "approve",
-            "reject",
-            "change the order",
-            "change that order",
-            "change order",
-            "change it",
-            "change it to",
-        )):
+        if text:
             with DBSession() as s:
                 awaiting = (
                     s.query(Task)
@@ -1963,7 +1989,28 @@ def webhook():
                     .first()
                 )
 
+                bypass_pending_await = False
                 if awaiting:
+                    deterministic_recognition = (
+                        has_deterministic_normal_route_recognition(text)
+                    )
+                    arbitration = _CORE_CONVERSATION.interpret_core(
+                        ConversationRequest(
+                            capability="routing_arbitration",
+                            context={
+                                "candidate": "await_vs_normal_route",
+                                "deterministic_recognition": (
+                                    deterministic_recognition
+                                ),
+                            },
+                        )
+                    )
+                    bypass_pending_await = bool(
+                        arbitration.handled
+                        and arbitration.action == "normal_route"
+                    )
+
+                if awaiting and not bypass_pending_await:
                     raw_txt = (text or "").strip()
                     await_lower = (awaiting.text or "").lower()
 
