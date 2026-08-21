@@ -143,6 +143,32 @@ class CoreConversation:
             request_text = str(request.text or "")
             text_tokens = normalized_tokens(request_text)
             if not text_tokens:
+                if (
+                    request.context.get("resolve_single_unqualified") is True
+                ):
+                    valid_records = [
+                        record
+                        for record in records
+                        if isinstance(record, dict)
+                        and record.get("id") is not None
+                        and (
+                            record.get("label")
+                            or record.get("labels")
+                        )
+                    ]
+                    if len(valid_records) == 1:
+                        resolved = valid_records[0]
+                        return ConversationResult(
+                            handled=True,
+                            object_type="record",
+                            entities={"record_id": resolved.get("id")},
+                            metadata={
+                                "resolution": "resolved",
+                                "match_count": 1,
+                                "unqualified_single": True,
+                            },
+                        )
+
                 return ConversationResult(
                     handled=True,
                     object_type="record",

@@ -8,7 +8,7 @@
 # - Stock / material tracking
 # ---------------------------------------------------------------
 
-import os, json, logging, datetime as dt, requests
+import os, json, logging, datetime as dt, requests, hashlib
 from typing import Optional
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, Response
@@ -1048,16 +1048,25 @@ def webhook():
     # MU12 — GENERIC PERSISTENT CONVERSATION-STATE ORCHESTRATION
     # -----------------------------------------------------------------
     def _conversation_scope(sender_wa: str) -> tuple[int, Optional[str]]:
-        user_info = get_user_role(sender_wa) or {}
-        try:
-            client_id = int(user_info.get("client_id") or 1)
-        except (TypeError, ValueError):
-            client_id = 1
+        with DBSession() as s:
+            sender_user = (
+                s.query(User)
+                .filter(User.wa_id == sender_wa)
+                .first()
+            )
 
-        project_code = user_info.get("project_code")
-        if project_code is not None:
-            project_code = str(project_code).strip() or None
-        return client_id, project_code
+            if not sender_user:
+                return 1, None
+
+            try:
+                client_id = int(sender_user.client_id or 1)
+            except (TypeError, ValueError):
+                client_id = 1
+
+            project_code = sender_user.project_code
+            if project_code is not None:
+                project_code = str(project_code).strip() or None
+            return client_id, project_code
 
     def _conversation_client_id(sender_wa: str) -> int:
         return _conversation_scope(sender_wa)[0]
@@ -1859,6 +1868,1292 @@ def webhook():
         return False
 
     # -----------------------------------------------------------------
+    # MU13 — SHARED RESOLUTION + PERSISTENT CLARIFICATION ORCHESTRATION
+    # -----------------------------------------------------------------
+    def _mu13_sender_authorization(sender_wa: str) -> Optional[dict]:
+        client_id, sender_project = _conversation_scope(sender_wa)
+        with DBSession() as s:
+            sender_user = (
+                s.query(User)
+                .filter(
+                    User.wa_id == sender_wa,
+                    User.active == True,
+                )
+                .first()
+            )
+            if not sender_user:
+                return None
+
+            projects = set()
+            if sender_project:
+                projects.add(sender_project)
+
+            mapped_rows = (
+                s.query(PMProjectMap.project_code)
+                .filter(
+                    PMProjectMap.pm_user_id == sender_user.id,
+                    PMProjectMap.client_id == client_id,
+                )
+                .all()
+            )
+            for row in mapped_rows:
+                project_code = row.project_code
+                if project_code is not None:
+                    project_code = str(project_code).strip() or None
+                if project_code:
+                    projects.add(project_code)
+
+            return {
+                "client_id": client_id,
+                "sender_project_code": sender_project,
+                "project_codes": sorted(projects),
+            }
+
+    def _mu13_project_records(authorization: Optional[dict]) -> list[dict]:
+        if not authorization:
+            return []
+        records = []
+        for project_code in authorization.get("project_codes") or []:
+            code = str(project_code or "").strip()
+            if not code:
+                continue
+            records.append(
+                {
+                    "id": code,
+                    "label": code,
+                    "labels": [code, f"project {code}"],
+                }
+            )
+        return records
+
+    def _mu13_authorized_reminder_records(
+        sender_wa: str,
+        action: str,
+        authorization: Optional[dict] = None,
+    ) -> list[dict]:
+        authorization = authorization or _mu13_sender_authorization(sender_wa)
+        if not authorization:
+            return []
+
+        allowed_projects = set(authorization.get("project_codes") or [])
+        records = []
+        with DBSession() as s:
+            rows = (
+                s.query(PMReminder)
+                .filter(
+                    (PMReminder.pm_wa == sender_wa)
+                    | (PMReminder.recipient_wa == sender_wa)
+                )
+                .order_by(PMReminder.id.desc())
+                .all()
+            )
+
+            for reminder in rows:
+                if action == "acknowledge":
+                    eligible = (
+                        reminder.delivered_at is not None
+                        and reminder.status != "cancelled"
+                    )
+                elif action == "cancel":
+                    eligible = bool(reminder.active) and reminder.status == "active"
+                elif action in ("snooze", "redirect"):
+                    eligible = (
+                        (bool(reminder.active) and reminder.status == "active")
+                        or (
+                            reminder.delivered_at is not None
+                            and reminder.status != "cancelled"
+                        )
+                    )
+                else:
+                    eligible = False
+
+                if not eligible:
+                    continue
+
+                project_code = reminder.project_code
+                if project_code is not None:
+                    project_code = str(project_code).strip() or None
+                if project_code and project_code not in allowed_projects:
+                    continue
+
+                raw_label = (reminder.text or "").strip()
+                display_label = raw_label or "Reminder"
+                labels = [display_label]
+
+                records.append(
+                    {
+                        "id": reminder.id,
+                        "label": display_label,
+                        "labels": labels,
+                        "project_code": project_code,
+                    }
+                )
+
+        return records
+
+    def _mu13_authorized_person_records(
+        sender_wa: str,
+        authorization: Optional[dict] = None,
+    ) -> list[dict]:
+        authorization = authorization or _mu13_sender_authorization(sender_wa)
+        if not authorization:
+            return []
+
+        client_id = int(authorization["client_id"])
+        allowed_projects = set(authorization.get("project_codes") or [])
+
+        with DBSession() as s:
+            mapping_rows = (
+                s.query(PMProjectMap.pm_user_id, PMProjectMap.project_code)
+                .filter(PMProjectMap.client_id == client_id)
+                .all()
+            )
+            mapped_projects: dict[int, set[str]] = {}
+            for user_id, project_code in mapping_rows:
+                code = str(project_code or "").strip()
+                if code:
+                    mapped_projects.setdefault(int(user_id), set()).add(code)
+
+            users = (
+                s.query(User)
+                .filter(
+                    User.client_id == client_id,
+                    User.active == True,
+                )
+                .order_by(User.id.asc())
+                .all()
+            )
+
+            records = []
+            for user in users:
+                projects = set(mapped_projects.get(int(user.id), set()))
+                user_project = str(user.project_code or "").strip()
+                if user_project:
+                    projects.add(user_project)
+                if user.wa_id == sender_wa:
+                    projects.update(allowed_projects)
+
+                if allowed_projects:
+                    if user.wa_id != sender_wa and not (projects & allowed_projects):
+                        continue
+                elif user.wa_id != sender_wa:
+                    continue
+
+                labels = []
+                for value in (
+                    user.name,
+                    user.subcontractor_name,
+                    user.wa_id,
+                ):
+                    label = str(value or "").strip()
+                    if label and label not in labels:
+                        labels.append(label)
+
+                if not labels:
+                    continue
+
+                records.append(
+                    {
+                        "id": user.wa_id,
+                        "label": labels[0],
+                        "labels": labels,
+                        "project_codes": sorted(projects),
+                    }
+                )
+
+        return records
+
+    def _mu13_person_records_for_project(
+        records: list[dict],
+        project_code: Optional[str],
+    ) -> list[dict]:
+        project = str(project_code or "").strip()
+        if not project:
+            return list(records)
+        return [
+            record
+            for record in records
+            if project in set(record.get("project_codes") or [])
+        ]
+
+    def _mu13_intersect_persisted_records(
+        persisted_records: list[dict],
+        current_records: list[dict],
+    ) -> list[dict]:
+        current_by_id = {
+            str(record.get("id")): record
+            for record in current_records
+            if record.get("id") is not None
+        }
+        available = []
+        for persisted in persisted_records:
+            if persisted.get("id") is None:
+                continue
+            current = current_by_id.get(str(persisted.get("id")))
+            if not current:
+                continue
+
+            candidate = dict(persisted)
+
+            if "project_code" in persisted or "project_code" in current:
+                persisted_project = str(
+                    persisted.get("project_code") or ""
+                ).strip()
+                current_project = str(
+                    current.get("project_code") or ""
+                ).strip()
+                if persisted_project and not current_project:
+                    continue
+                candidate["project_code"] = current_project or None
+
+            if "project_codes" in persisted or "project_codes" in current:
+                persisted_projects = {
+                    str(value).strip()
+                    for value in (persisted.get("project_codes") or [])
+                    if str(value).strip()
+                }
+                current_projects = {
+                    str(value).strip()
+                    for value in (current.get("project_codes") or [])
+                    if str(value).strip()
+                }
+                shared_projects = persisted_projects & current_projects
+                if persisted_projects and not shared_projects:
+                    continue
+                candidate["project_codes"] = sorted(shared_projects)
+
+            available.append(candidate)
+
+        return available
+
+    def _mu13_authorization_within_persisted_scope(
+        state: dict,
+        candidate_metadata: dict,
+        current_authorization: Optional[dict],
+    ) -> Optional[dict]:
+        if not current_authorization:
+            return None
+
+        persisted_scope = candidate_metadata.get("authorization_scope") or {}
+        if str(persisted_scope.get("sender") or "") != str(state["sender"]):
+            return None
+        try:
+            persisted_client_id = int(persisted_scope["client_id"])
+            current_client_id = int(current_authorization["client_id"])
+            state_client_id = int(state["client_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (
+            persisted_client_id == current_client_id == state_client_id
+        ):
+            return None
+
+        persisted_projects = {
+            str(value).strip()
+            for value in (persisted_scope.get("project_codes") or [])
+            if str(value).strip()
+        }
+        current_projects = {
+            str(value).strip()
+            for value in (current_authorization.get("project_codes") or [])
+            if str(value).strip()
+        }
+        narrowed = dict(current_authorization)
+        narrowed["project_codes"] = sorted(
+            persisted_projects & current_projects
+        )
+
+        sender_project = str(
+            current_authorization.get("sender_project_code") or ""
+        ).strip()
+        narrowed["sender_project_code"] = (
+            sender_project
+            if sender_project in persisted_projects
+            else None
+        )
+        return narrowed
+
+    def _mu13_resolve_records(
+        query_text: str,
+        records: list[dict],
+        allow_single_unqualified: bool = False,
+    ) -> dict:
+        result = _CORE_CONVERSATION.interpret_core(
+            ConversationRequest(
+                capability="record_resolution",
+                text=query_text or "",
+                context={
+                    "candidate": "text_reference",
+                    "records": records,
+                    "resolve_single_unqualified": allow_single_unqualified,
+                },
+            )
+        )
+        resolution = str(
+            result.metadata.get("resolution") or "not_found"
+        ).strip().lower()
+        if resolution == "resolved":
+            return {
+                "status": "resolved",
+                "record_id": result.entities.get("record_id"),
+            }
+        if resolution == "ambiguous":
+            matches = result.metadata.get("matches")
+            return {
+                "status": "ambiguous",
+                "matches": matches if isinstance(matches, list) else [],
+            }
+        return {"status": "not_found", "matches": []}
+
+    def _mu13_resolve_person(query_text: str, records: list[dict]) -> dict:
+        target = str(query_text or "").strip()
+        digits = re.sub(r"\D", "", target)
+        if len(digits) >= 7:
+            exact = [
+                record
+                for record in records
+                if re.sub(r"\D", "", str(record.get("id") or "")) == digits
+            ]
+            if len(exact) == 1:
+                return {"status": "resolved", "record_id": exact[0]["id"]}
+            if len(exact) > 1:
+                return {"status": "ambiguous", "matches": exact}
+            return {"status": "not_found", "matches": []}
+
+        return _mu13_resolve_records(target, records)
+
+    def _mu13_reminder_reference_text(
+        raw_text: str,
+        action: str,
+        strip_command: bool = True,
+    ) -> str:
+        working = str(raw_text or "").strip()
+        if action == "redirect":
+            target_match = re.search(
+                r"\bto\s+(.+)$",
+                working,
+                flags=re.IGNORECASE,
+            )
+            if target_match:
+                working = working[:target_match.start()]
+
+        if strip_command:
+            # Recognition already happened through the authoritative lifecycle
+            # classifier; remove only its leading command token for reference
+            # matching rather than re-recognizing lifecycle language here.
+            working = re.sub(
+                r"^\s*(?:please\s+)?[^\s]+\b",
+                "",
+                working,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        working = re.sub(
+            r"\breminders?\s*#?\s*\d*\b",
+            " ",
+            working,
+            flags=re.IGNORECASE,
+        )
+
+        if action == "snooze":
+            working = re.sub(
+                r"\bfor\s+\d+\s+(?:minutes?|hours?|days?|weeks?)\b.*$",
+                " ",
+                working,
+                flags=re.IGNORECASE,
+            )
+            working = re.sub(
+                r"\buntil\s+.+$",
+                " ",
+                working,
+                flags=re.IGNORECASE,
+            )
+
+        return " ".join(working.strip(" .,:;-_").split())
+
+    def _mu13_strip_project_reference(
+        reference_text: str,
+        project_code: Optional[str],
+    ) -> str:
+        working = str(reference_text or "")
+        project = str(project_code or "").strip()
+        if project:
+            working = re.sub(
+                rf"\bproject\s+{re.escape(project)}\b",
+                " ",
+                working,
+                flags=re.IGNORECASE,
+            )
+            working = re.sub(
+                rf"\b{re.escape(project)}\b",
+                " ",
+                working,
+                flags=re.IGNORECASE,
+            )
+        working = re.sub(r"\babout\b", " ", working, flags=re.IGNORECASE)
+        return " ".join(working.strip(" .,:;-_").split())
+
+    def _mu13_redirect_target_text(raw_text: str) -> str:
+        target_match = re.search(
+            r"\bto\s+(.+)$",
+            raw_text or "",
+            flags=re.IGNORECASE,
+        )
+        return (
+            target_match.group(1).strip(" .")
+            if target_match
+            else ""
+        )
+
+    def _mu13_sender_timezone(sender_wa: str) -> str:
+        with DBSession() as s:
+            sender_user = (
+                s.query(User)
+                .filter(
+                    User.wa_id == sender_wa,
+                    User.active == True,
+                )
+                .first()
+            )
+            if sender_user and sender_user.timezone:
+                return sender_user.timezone
+        return "America/New_York"
+
+    def _mu13_message_continuation_key(
+        message: dict,
+        sender_wa: str,
+        action: str,
+        raw_text: str,
+    ) -> str:
+        identity = str(message.get("id") or message.get("timestamp") or "").strip()
+        if not identity:
+            identity = (
+                f"{sender_wa}|{action}|{raw_text}|"
+                f"{dt.datetime.utcnow().isoformat()}"
+            )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return f"reminder-lifecycle:{digest}"
+
+    def _mu13_state_payload(
+        sender_wa: str,
+        authorization: dict,
+        state_kind: str,
+        expected_field: Optional[str],
+        original_request: str,
+        structured_context: dict,
+        candidate_metadata: dict,
+        continuation_key: str,
+        continuation: dict,
+    ) -> dict:
+        _, scope_project = _conversation_scope(sender_wa)
+        return {
+            "client_id": int(authorization["client_id"]),
+            "sender": sender_wa,
+            "project_code": scope_project,
+            "state_kind": state_kind,
+            "expected_field": expected_field,
+            "original_request": original_request or "",
+            "structured_context": structured_context,
+            "candidate_metadata": candidate_metadata,
+            "continuation": continuation,
+            "continuation_key": continuation_key,
+        }
+
+    def _mu13_refresh_state(
+        state: dict,
+        expected_field: Optional[str],
+        structured_context: dict,
+    ) -> dict:
+        authorization_scope = (
+            state.get("candidate_metadata", {}).get("authorization_scope") or {}
+        )
+        payload = {
+            "client_id": state["client_id"],
+            "sender": state["sender"],
+            "project_code": state.get("project_code"),
+            "state_kind": state["state_kind"],
+            "expected_field": expected_field,
+            "original_request": state.get("original_request") or "",
+            "structured_context": structured_context,
+            "candidate_metadata": state.get("candidate_metadata") or {},
+            "continuation": state.get("continuation") or {},
+            "continuation_key": state["continuation_key"],
+        }
+        if authorization_scope and int(
+            authorization_scope.get("client_id") or state["client_id"]
+        ) != int(state["client_id"]):
+            return {"status": "error", "code": "scope_conflict"}
+        return save_pending_conversation_state(payload)
+
+    def _mu13_candidate_by_id(records: list[dict], record_id) -> Optional[dict]:
+        target = str(record_id)
+        return next(
+            (
+                record
+                for record in records
+                if record.get("id") is not None
+                and str(record.get("id")) == target
+            ),
+            None,
+        )
+
+    def _mu13_send_reminder_choices(
+        sender_wa: str,
+        records: list[dict],
+        no_match: bool = False,
+    ) -> None:
+        if not records:
+            send_whatsapp_text(
+                phone_id,
+                sender_wa,
+                "No currently authorized reminder remains for that clarification.",
+            )
+            return
+        heading = (
+            "I couldn't match that reminder. Reply with part of its subject:"
+            if no_match
+            else "More than one reminder matches. Reply with part of its subject:"
+        )
+        lines = [heading]
+        for record in records[:10]:
+            label = str(record.get("label") or "Reminder").strip()
+            project_code = str(record.get("project_code") or "").strip()
+            if len(label) > 90:
+                label = label[:87] + "..."
+            suffix = f" [{project_code}]" if project_code else ""
+            lines.append(f"- #{record['id']}: {label}{suffix}")
+        send_whatsapp_text(phone_id, sender_wa, "\n".join(lines))
+
+    def _mu13_send_person_choices(
+        sender_wa: str,
+        records: list[dict],
+        no_match: bool = False,
+    ) -> None:
+        if not records:
+            send_whatsapp_text(
+                phone_id,
+                sender_wa,
+                "No linked active user is currently authorized for that reminder.",
+            )
+            return
+        heading = (
+            "I couldn't match that person. Reply with the person's name:"
+            if no_match
+            else "More than one person matches. Reply with the person's name:"
+        )
+        lines = [heading]
+        for record in records[:10]:
+            lines.append(f"- {record.get('label') or record.get('id')}")
+        send_whatsapp_text(phone_id, sender_wa, "\n".join(lines))
+
+    def _mu13_send_action_not_found(sender_wa: str, action: str) -> None:
+        messages = {
+            "acknowledge": "No delivered reminder was found to acknowledge.",
+            "snooze": "No active reminder was found to snooze.",
+            "redirect": "No active reminder was found to reassign.",
+            "cancel": "No active reminder was found to cancel.",
+        }
+        send_whatsapp_text(
+            phone_id,
+            sender_wa,
+            messages.get(action, "No matching reminder was found."),
+        )
+
+    def _mu13_execute_reminder_action(
+        sender_wa: str,
+        action: str,
+        structured_context: dict,
+    ) -> bool:
+        try:
+            reminder_id = int(structured_context["reminder_id"])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        if action == "acknowledge":
+            result = acknowledge_pm_reminder(
+                sender_wa,
+                reminder_id=reminder_id,
+            )
+            if result.get("status") == "not_found":
+                _mu13_send_action_not_found(sender_wa, action)
+                return False
+            send_whatsapp_text(
+                phone_id,
+                sender_wa,
+                f"Reminder #{result['id']} acknowledged.",
+            )
+            return True
+
+        if action == "snooze":
+            until_text = str(structured_context.get("snooze_until") or "").strip()
+            try:
+                until_utc = dt.datetime.fromisoformat(until_text)
+            except (TypeError, ValueError):
+                return False
+            result = snooze_pm_reminder(
+                sender_wa,
+                until_utc,
+                reminder_id=reminder_id,
+            )
+            if result.get("status") == "not_found":
+                _mu13_send_action_not_found(sender_wa, action)
+                return False
+            if result.get("status") == "error":
+                send_whatsapp_text(
+                    phone_id,
+                    sender_wa,
+                    "The reminder could not be snoozed to that time.",
+                )
+                return False
+            send_whatsapp_text(
+                phone_id,
+                sender_wa,
+                f"Reminder #{result['id']} postponed.",
+            )
+            return True
+
+        if action == "redirect":
+            recipient_wa = str(
+                structured_context.get("recipient_wa") or ""
+            ).strip()
+            if not recipient_wa:
+                return False
+            result = redirect_pm_reminder(
+                sender_wa,
+                recipient_wa,
+                reminder_id=reminder_id,
+            )
+            if result.get("status") == "not_found":
+                _mu13_send_action_not_found(sender_wa, action)
+                return False
+            send_whatsapp_text(
+                phone_id,
+                sender_wa,
+                (
+                    f"Reminder #{result['id']} reassigned "
+                    f"to {result['recipient_wa']}."
+                ),
+            )
+            return True
+
+        if action == "cancel":
+            result = cancel_pm_reminder(
+                sender_wa,
+                reminder_id=reminder_id,
+            )
+            if result.get("status") == "not_found":
+                _mu13_send_action_not_found(sender_wa, action)
+                return False
+            send_whatsapp_text(
+                phone_id,
+                sender_wa,
+                f"Reminder #{result['id']} cancelled.",
+            )
+            return True
+
+        return False
+
+    def _mu13_revalidate_selected_continuation(
+        state: dict,
+        action: str,
+        structured_context: dict,
+        candidate_metadata: dict,
+    ) -> bool:
+        authorization = _mu13_authorization_within_persisted_scope(
+            state,
+            candidate_metadata,
+            _mu13_sender_authorization(state["sender"]),
+        )
+        if not authorization:
+            return False
+
+        persisted_reminders = candidate_metadata.get("reminder_candidates") or []
+        current_reminders = _mu13_authorized_reminder_records(
+            state["sender"],
+            action,
+            authorization,
+        )
+        current_reminders = _mu13_intersect_persisted_records(
+            persisted_reminders,
+            current_reminders,
+        )
+        reminder = _mu13_candidate_by_id(
+            current_reminders,
+            structured_context.get("reminder_id"),
+        )
+        if not reminder:
+            return False
+
+        selected_project = str(
+            structured_context.get("selected_project_code") or ""
+        ).strip()
+        if selected_project and reminder.get("project_code") != selected_project:
+            return False
+
+        if action == "redirect":
+            persisted_people = candidate_metadata.get("person_candidates") or []
+            current_people = _mu13_authorized_person_records(
+                state["sender"],
+                authorization,
+            )
+            current_people = _mu13_intersect_persisted_records(
+                persisted_people,
+                current_people,
+            )
+            current_people = _mu13_person_records_for_project(
+                current_people,
+                reminder.get("project_code"),
+            )
+            recipient = _mu13_candidate_by_id(
+                current_people,
+                structured_context.get("recipient_wa"),
+            )
+            if not recipient:
+                return False
+
+        return True
+
+    def _mu13_release_claim(state: dict) -> None:
+        if state.get("state_kind") == "clarification":
+            advance_conversation_state_continuation(
+                state["id"],
+                state["sender"],
+                state["client_id"],
+                state.get("project_code"),
+                state.get("expected_field"),
+            )
+        else:
+            resolve_conversation_state(
+                state["id"],
+                state["sender"],
+                state["client_id"],
+                state.get("project_code"),
+            )
+
+    def _mu13_claim_revalidate_execute(
+        state: dict,
+        action: str,
+        structured_context: dict,
+    ) -> bool:
+        claimed = claim_conversation_state_continuation(
+            state["id"],
+            state["sender"],
+            state["client_id"],
+            state.get("project_code"),
+        )
+        if claimed.get("status_result") != "claimed":
+            return True
+
+        candidate_metadata = claimed.get("candidate_metadata") or {}
+        if not _mu13_revalidate_selected_continuation(
+            claimed,
+            action,
+            structured_context,
+            candidate_metadata,
+        ):
+            _mu13_release_claim(claimed)
+            send_whatsapp_text(
+                phone_id,
+                claimed["sender"],
+                "That selection is no longer authorized for this clarification.",
+            )
+            return True
+
+        succeeded = _mu13_execute_reminder_action(
+            claimed["sender"],
+            action,
+            structured_context,
+        )
+        if succeeded:
+            resolve_conversation_state(
+                claimed["id"],
+                claimed["sender"],
+                claimed["client_id"],
+                claimed.get("project_code"),
+            )
+        else:
+            _mu13_release_claim(claimed)
+        return True
+
+    def _mu13_persist_reminder_state(
+        sender_wa: str,
+        authorization: dict,
+        message: dict,
+        raw_text: str,
+        action: str,
+        state_kind: str,
+        expected_field: Optional[str],
+        structured_context: dict,
+        reminder_candidates: list[dict],
+        person_candidates: list[dict],
+        project_candidates: list[dict],
+    ) -> dict:
+        continuation_key = _mu13_message_continuation_key(
+            message,
+            sender_wa,
+            action,
+            raw_text,
+        )
+        candidate_metadata = {
+            "reminder_candidates": reminder_candidates,
+            "person_candidates": person_candidates,
+            "project_candidates": project_candidates,
+            "authorization_scope": {
+                "sender": sender_wa,
+                "client_id": int(authorization["client_id"]),
+                "project_codes": list(authorization.get("project_codes") or []),
+            },
+        }
+        continuation = {
+            "kind": "reminder_lifecycle",
+            "action": action,
+        }
+        return save_pending_conversation_state(
+            _mu13_state_payload(
+                sender_wa,
+                authorization,
+                state_kind,
+                expected_field,
+                raw_text,
+                structured_context,
+                candidate_metadata,
+                continuation_key,
+                continuation,
+            )
+        )
+
+    def _mu13_initial_reminder_action(
+        message: dict,
+        sender_wa: str,
+        raw_text: str,
+        action: str,
+        reminder_id: Optional[int],
+    ) -> bool:
+        structured_context = {"action": action}
+
+        if action == "snooze":
+            until_utc = parse_pm_reminder_snooze_until(
+                raw_text,
+                _mu13_sender_timezone(sender_wa),
+            )
+            if until_utc is None:
+                send_whatsapp_text(
+                    phone_id,
+                    sender_wa,
+                    (
+                        "Include how long to snooze the reminder. "
+                        "For example: Snooze reminder 12 for 30 minutes."
+                    ),
+                )
+                return True
+            structured_context["snooze_until"] = until_utc.isoformat()
+
+        if action == "redirect":
+            structured_context["recipient_target"] = (
+                _mu13_redirect_target_text(raw_text)
+            )
+
+        authorization = _mu13_sender_authorization(sender_wa)
+        if not authorization:
+            _mu13_send_action_not_found(sender_wa, action)
+            return True
+
+        project_candidates = _mu13_project_records(authorization)
+        reminder_candidates = _mu13_authorized_reminder_records(
+            sender_wa,
+            action,
+            authorization,
+        )
+        person_candidates = (
+            _mu13_authorized_person_records(sender_wa, authorization)
+            if action == "redirect"
+            else []
+        )
+
+        if reminder_id is not None:
+            selected = _mu13_candidate_by_id(reminder_candidates, reminder_id)
+            if not selected:
+                _mu13_send_action_not_found(sender_wa, action)
+                return True
+
+            structured_context["reminder_id"] = int(reminder_id)
+            structured_context["selected_project_code"] = (
+                selected.get("project_code")
+            )
+
+            if action == "redirect":
+                scoped_people = _mu13_person_records_for_project(
+                    person_candidates,
+                    selected.get("project_code"),
+                )
+                target_resolution = _mu13_resolve_person(
+                    structured_context.get("recipient_target") or "",
+                    scoped_people,
+                )
+                if target_resolution["status"] != "resolved":
+                    if not scoped_people:
+                        send_whatsapp_text(
+                            phone_id,
+                            sender_wa,
+                            (
+                                "Name a linked active user or WhatsApp number. "
+                                "For example: Reassign reminder 12 to John Smith."
+                            ),
+                        )
+                        return True
+                    state = _mu13_persist_reminder_state(
+                        sender_wa,
+                        authorization,
+                        message,
+                        raw_text,
+                        action,
+                        "clarification",
+                        "recipient_reference",
+                        structured_context,
+                        [selected],
+                        scoped_people,
+                        project_candidates,
+                    )
+                    if state.get("status_result") == "inactive":
+                        return True
+                    _mu13_send_person_choices(
+                        sender_wa,
+                        scoped_people,
+                        no_match=(target_resolution["status"] == "not_found"),
+                    )
+                    return True
+                structured_context["recipient_wa"] = target_resolution["record_id"]
+
+            return _mu13_execute_reminder_action(
+                sender_wa,
+                action,
+                structured_context,
+            )
+
+        selected_project = None
+        project_resolution = _mu13_resolve_records(
+            raw_text,
+            project_candidates,
+        )
+        if project_resolution["status"] == "resolved":
+            selected_project = str(project_resolution["record_id"])
+            structured_context["selected_project_code"] = selected_project
+            reminder_candidates = [
+                record
+                for record in reminder_candidates
+                if record.get("project_code") == selected_project
+            ]
+            if action == "redirect":
+                person_candidates = _mu13_person_records_for_project(
+                    person_candidates,
+                    selected_project,
+                )
+
+        if not reminder_candidates:
+            if (
+                action == "acknowledge"
+                and "reminder" not in raw_text.lower()
+                and reminder_id is None
+            ):
+                return False
+            _mu13_send_action_not_found(sender_wa, action)
+            return True
+
+        reference_text = _mu13_strip_project_reference(
+            _mu13_reminder_reference_text(raw_text, action),
+            selected_project,
+        )
+        reminder_resolution = _mu13_resolve_records(
+            reference_text,
+            reminder_candidates,
+            allow_single_unqualified=True,
+        )
+
+        if reminder_resolution["status"] != "resolved":
+            state = _mu13_persist_reminder_state(
+                sender_wa,
+                authorization,
+                message,
+                raw_text,
+                action,
+                "clarification",
+                "reminder_record",
+                structured_context,
+                reminder_candidates,
+                person_candidates,
+                project_candidates,
+            )
+            if state.get("status_result") == "inactive":
+                return True
+            _mu13_send_reminder_choices(
+                sender_wa,
+                reminder_candidates,
+                no_match=(reminder_resolution["status"] == "not_found"),
+            )
+            return True
+
+        selected = _mu13_candidate_by_id(
+            reminder_candidates,
+            reminder_resolution["record_id"],
+        )
+        if not selected:
+            return True
+        structured_context["reminder_id"] = int(selected["id"])
+        structured_context["selected_project_code"] = selected.get("project_code")
+
+        if action == "redirect":
+            scoped_people = _mu13_person_records_for_project(
+                person_candidates,
+                selected.get("project_code"),
+            )
+            target_resolution = _mu13_resolve_person(
+                structured_context.get("recipient_target") or "",
+                scoped_people,
+            )
+            if target_resolution["status"] != "resolved":
+                if not scoped_people:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender_wa,
+                        (
+                            "Name a linked active user or WhatsApp number. "
+                            "For example: Reassign reminder 12 to John Smith."
+                        ),
+                    )
+                    return True
+                state = _mu13_persist_reminder_state(
+                    sender_wa,
+                    authorization,
+                    message,
+                    raw_text,
+                    action,
+                    "clarification",
+                    "recipient_reference",
+                    structured_context,
+                    [selected],
+                    scoped_people,
+                    project_candidates,
+                )
+                if state.get("status_result") == "inactive":
+                    return True
+                _mu13_send_person_choices(
+                    sender_wa,
+                    scoped_people,
+                    no_match=(target_resolution["status"] == "not_found"),
+                )
+                return True
+            structured_context["recipient_wa"] = target_resolution["record_id"]
+            person_candidates = scoped_people
+
+        state = _mu13_persist_reminder_state(
+            sender_wa,
+            authorization,
+            message,
+            raw_text,
+            action,
+            "continuation",
+            "ready",
+            structured_context,
+            [selected],
+            person_candidates,
+            project_candidates,
+        )
+        if state.get("status_result") == "inactive":
+            return True
+        return _mu13_claim_revalidate_execute(
+            state,
+            action,
+            structured_context,
+        )
+
+    def _mu13_existing_reminder_clarification(
+        state: dict,
+        raw_text: str,
+    ) -> bool:
+        continuation = state.get("continuation") or {}
+        if continuation.get("kind") != "reminder_lifecycle":
+            return False
+
+        if has_deterministic_normal_route_recognition(raw_text):
+            return False
+
+        action = str(continuation.get("action") or "").strip()
+        if action not in ("acknowledge", "snooze", "redirect", "cancel"):
+            return True
+
+        candidate_metadata = state.get("candidate_metadata") or {}
+        authorization = _mu13_authorization_within_persisted_scope(
+            state,
+            candidate_metadata,
+            _mu13_sender_authorization(state["sender"]),
+        )
+        if not authorization:
+            return True
+
+        persisted_reminders = candidate_metadata.get("reminder_candidates") or []
+        current_reminders = _mu13_authorized_reminder_records(
+            state["sender"],
+            action,
+            authorization,
+        )
+        available_reminders = _mu13_intersect_persisted_records(
+            persisted_reminders,
+            current_reminders,
+        )
+        structured_context = dict(state.get("structured_context") or {})
+        expected_field = str(state.get("expected_field") or "").strip()
+
+        if expected_field == "reminder_record":
+            persisted_projects = candidate_metadata.get("project_candidates") or []
+            current_projects = _mu13_project_records(authorization)
+            available_projects = _mu13_intersect_persisted_records(
+                persisted_projects,
+                current_projects,
+            )
+            followup_project = _mu13_resolve_records(
+                raw_text,
+                available_projects,
+            )
+            selected_project = None
+            if followup_project["status"] == "resolved":
+                selected_project = str(followup_project["record_id"])
+                available_reminders = [
+                    record
+                    for record in available_reminders
+                    if record.get("project_code") == selected_project
+                ]
+
+            followup_action = classify_pm_reminder_lifecycle(raw_text)
+            reference_text = _mu13_strip_project_reference(
+                _mu13_reminder_reference_text(
+                    raw_text,
+                    action,
+                    strip_command=(followup_action == action),
+                ),
+                selected_project,
+            )
+            resolution = _mu13_resolve_records(
+                reference_text,
+                available_reminders,
+                allow_single_unqualified=bool(selected_project),
+            )
+            if resolution["status"] != "resolved":
+                _mu13_send_reminder_choices(
+                    state["sender"],
+                    available_reminders,
+                    no_match=(resolution["status"] == "not_found"),
+                )
+                return True
+
+            selected = _mu13_candidate_by_id(
+                available_reminders,
+                resolution["record_id"],
+            )
+            if not selected:
+                return True
+            structured_context["reminder_id"] = int(selected["id"])
+            structured_context["selected_project_code"] = selected.get("project_code")
+
+            if action == "redirect":
+                persisted_people = candidate_metadata.get("person_candidates") or []
+                current_people = _mu13_authorized_person_records(
+                    state["sender"],
+                    authorization,
+                )
+                available_people = _mu13_intersect_persisted_records(
+                    persisted_people,
+                    current_people,
+                )
+                available_people = _mu13_person_records_for_project(
+                    available_people,
+                    selected.get("project_code"),
+                )
+                target_resolution = _mu13_resolve_person(
+                    structured_context.get("recipient_target") or "",
+                    available_people,
+                )
+                if target_resolution["status"] != "resolved":
+                    updated = _mu13_refresh_state(
+                        state,
+                        "recipient_reference",
+                        structured_context,
+                    )
+                    if updated.get("status_result") == "inactive":
+                        return True
+                    _mu13_send_person_choices(
+                        state["sender"],
+                        available_people,
+                        no_match=(target_resolution["status"] == "not_found"),
+                    )
+                    return True
+                structured_context["recipient_wa"] = target_resolution["record_id"]
+
+            updated = _mu13_refresh_state(
+                state,
+                expected_field,
+                structured_context,
+            )
+            if updated.get("status_result") == "inactive":
+                return True
+            return _mu13_claim_revalidate_execute(
+                updated,
+                action,
+                structured_context,
+            )
+
+        if expected_field == "recipient_reference" and action == "redirect":
+            selected = _mu13_candidate_by_id(
+                available_reminders,
+                structured_context.get("reminder_id"),
+            )
+            if not selected:
+                _mu13_send_reminder_choices(
+                    state["sender"],
+                    available_reminders,
+                    no_match=True,
+                )
+                return True
+
+            persisted_people = candidate_metadata.get("person_candidates") or []
+            current_people = _mu13_authorized_person_records(
+                state["sender"],
+                authorization,
+            )
+            available_people = _mu13_intersect_persisted_records(
+                persisted_people,
+                current_people,
+            )
+            available_people = _mu13_person_records_for_project(
+                available_people,
+                selected.get("project_code"),
+            )
+            resolution = _mu13_resolve_person(raw_text, available_people)
+            if resolution["status"] != "resolved":
+                _mu13_send_person_choices(
+                    state["sender"],
+                    available_people,
+                    no_match=(resolution["status"] == "not_found"),
+                )
+                return True
+
+            structured_context["recipient_wa"] = resolution["record_id"]
+            updated = _mu13_refresh_state(
+                state,
+                expected_field,
+                structured_context,
+            )
+            if updated.get("status_result") == "inactive":
+                return True
+            return _mu13_claim_revalidate_execute(
+                updated,
+                action,
+                structured_context,
+            )
+
+        return True
+
+    # -----------------------------------------------------------------
     # MAIN MESSAGE LOOP — W2 CLEAN REBUILD
     # -----------------------------------------------------------------
 
@@ -1887,193 +3182,29 @@ def webhook():
         # >>> FEATURE_3_REMINDER_WEBHOOK_START — LIFECYCLE + CREATION V6.1 <<<
 
         if text:
+            active_conversation_state = _get_active_conversation_state(sender)
+            if (
+                active_conversation_state
+                and active_conversation_state.get("state_kind") == "clarification"
+            ):
+                if _mu13_existing_reminder_clarification(
+                    active_conversation_state,
+                    text,
+                ):
+                    return ("", 200)
+
             reminder_action = classify_pm_reminder_lifecycle(text)
             reminder_id = _pm_reminder_id_from_text(text)
 
-            if reminder_action == "acknowledge":
-                result = acknowledge_pm_reminder(
+            if reminder_action:
+                if _mu13_initial_reminder_action(
+                    m,
                     sender,
-                    reminder_id=reminder_id,
-                )
-                if result.get("status") != "not_found":
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        f"Reminder #{result['id']} acknowledged.",
-                    )
-                    return ("", 200)
-
-                # A plain OK remains available to existing workflows when
-                # the sender has no delivered reminder to acknowledge.
-                if "reminder" in text.lower() or reminder_id is not None:
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        "No delivered reminder was found to acknowledge.",
-                    )
-                    return ("", 200)
-
-            elif reminder_action == "snooze":
-                sender_timezone = "America/New_York"
-                with DBSession() as s:
-                    sender_user = (
-                        s.query(User)
-                        .filter(
-                            User.wa_id == sender,
-                            User.active == True,
-                        )
-                        .first()
-                    )
-                    if sender_user and sender_user.timezone:
-                        sender_timezone = sender_user.timezone
-
-                until_utc = parse_pm_reminder_snooze_until(
                     text,
-                    sender_timezone,
-                )
-                if until_utc is None:
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        (
-                            "Include how long to snooze the reminder. "
-                            "For example: Snooze reminder 12 for 30 minutes."
-                        ),
-                    )
+                    reminder_action,
+                    reminder_id,
+                ):
                     return ("", 200)
-
-                result = snooze_pm_reminder(
-                    sender,
-                    until_utc,
-                    reminder_id=reminder_id,
-                )
-                if result.get("status") == "not_found":
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        "No active reminder was found to snooze.",
-                    )
-                    return ("", 200)
-                if result.get("status") == "error":
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        "The reminder could not be snoozed to that time.",
-                    )
-                    return ("", 200)
-
-                send_whatsapp_text(
-                    phone_id,
-                    sender,
-                    f"Reminder #{result['id']} postponed.",
-                )
-                return ("", 200)
-
-            elif reminder_action == "redirect":
-                target_match = re.search(
-                    r"\bto\s+(.+)$",
-                    text,
-                    flags=re.IGNORECASE,
-                )
-                target_text = (
-                    target_match.group(1).strip(" .")
-                    if target_match
-                    else ""
-                )
-                target_wa = None
-
-                digits = re.sub(r"\D", "", target_text)
-                with DBSession() as s:
-                    active_users = (
-                        s.query(User)
-                        .filter(User.active == True)
-                        .all()
-                    )
-
-                    if len(digits) >= 7:
-                        matched_user = next(
-                            (
-                                user
-                                for user in active_users
-                                if re.sub(r"\D", "", user.wa_id or "")
-                                == digits
-                            ),
-                            None,
-                        )
-                        if matched_user:
-                            target_wa = matched_user.wa_id
-                    else:
-                        target_key = target_text.casefold()
-                        matched_user = next(
-                            (
-                                user
-                                for user in active_users
-                                if target_key
-                                and target_key in {
-                                    (user.name or "").strip().casefold(),
-                                    (user.subcontractor_name or "")
-                                    .strip()
-                                    .casefold(),
-                                }
-                            ),
-                            None,
-                        )
-                        if matched_user:
-                            target_wa = matched_user.wa_id
-
-                if not target_wa:
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        (
-                            "Name a linked active user or WhatsApp number. "
-                            "For example: Reassign reminder 12 to John Smith."
-                        ),
-                    )
-                    return ("", 200)
-
-                result = redirect_pm_reminder(
-                    sender,
-                    target_wa,
-                    reminder_id=reminder_id,
-                )
-                if result.get("status") == "not_found":
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        "No active reminder was found to reassign.",
-                    )
-                    return ("", 200)
-
-                send_whatsapp_text(
-                    phone_id,
-                    sender,
-                    (
-                        f"Reminder #{result['id']} reassigned "
-                        f"to {result['recipient_wa']}."
-                    ),
-                )
-                return ("", 200)
-
-            elif reminder_action == "cancel":
-                result = cancel_pm_reminder(
-                    sender,
-                    reminder_id=reminder_id,
-                )
-                if result.get("status") == "not_found":
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        "No active reminder was found to cancel.",
-                    )
-                    return ("", 200)
-
-                send_whatsapp_text(
-                    phone_id,
-                    sender,
-                    f"Reminder #{result['id']} cancelled.",
-                )
-                return ("", 200)
 
             if classify_pm_reminder(text):
                 sender_timezone = "America/New_York"
