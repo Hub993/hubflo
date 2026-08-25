@@ -1042,6 +1042,8 @@ def webhook():
         claim_conversation_state_continuation,
         advance_conversation_state_continuation,
         resolve_conversation_state,
+        touch_conversation_state_activity,
+        retire_conversation_state,
     )
 
     # -----------------------------------------------------------------
@@ -1085,6 +1087,29 @@ def webhook():
                 None,
             )
         return state
+
+    def _conversation_lifecycle_action(raw_text: str) -> Optional[str]:
+        result = _CORE_CONVERSATION.interpret_core(
+            ConversationRequest(
+                capability="conversation_lifecycle",
+                text=raw_text or "",
+                context={"candidate": "control_intent"},
+            )
+        )
+        return result.action if result.handled else None
+
+    def _retire_active_conversation_state(
+        state: dict,
+        action: str,
+    ) -> bool:
+        result = retire_conversation_state(
+            state["id"],
+            state["sender"],
+            state["client_id"],
+            state.get("project_code"),
+            action,
+        )
+        return result.get("status_result") == "retired"
 
     def _await_expected_field(await_text: str) -> Optional[str]:
         match = re.match(
@@ -2978,6 +3003,13 @@ def webhook():
         if has_deterministic_normal_route_recognition(raw_text):
             return False
 
+        touch_conversation_state_activity(
+            state["id"],
+            state["sender"],
+            state["client_id"],
+            state.get("project_code"),
+        )
+
         action = str(continuation.get("action") or "").strip()
         if action not in ("acknowledge", "snooze", "redirect", "cancel"):
             return True
@@ -3183,6 +3215,23 @@ def webhook():
 
         if text:
             active_conversation_state = _get_active_conversation_state(sender)
+            lifecycle_action = _conversation_lifecycle_action(text)
+            if active_conversation_state and lifecycle_action:
+                if _retire_active_conversation_state(
+                    active_conversation_state,
+                    lifecycle_action,
+                ):
+                    lifecycle_messages = {
+                        "cancelled": "Conversation cancelled.",
+                        "restarted": "Started over. Send your new request.",
+                        "abandoned": "Okay, I won't continue that request.",
+                    }
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        lifecycle_messages[lifecycle_action],
+                    )
+                return ("", 200)
             if (
                 active_conversation_state
                 and active_conversation_state.get("state_kind") == "clarification"
@@ -3427,6 +3476,16 @@ def webhook():
                     and arbitration.handled
                     and arbitration.action == "normal_route"
                 )
+
+                if pending_state and not bypass_pending:
+                    touched_state = touch_conversation_state_activity(
+                        pending_state["id"],
+                        pending_state["sender"],
+                        pending_state["client_id"],
+                        pending_state.get("project_code"),
+                    )
+                    if touched_state.get("status_result") == "touched":
+                        pending_state = touched_state
 
                 # A generic pending state that is not backed by a legacy await
                 # is preserved until a later consumer supplies authoritative
@@ -6150,4 +6209,3 @@ def admin_voice_log():
 if __name__=="__main__":
     port=int(os.environ.get("PORT","10000"))
     app.run(host="0.0.0.0",port=port,debug=False)
-

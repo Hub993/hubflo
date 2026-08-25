@@ -45,6 +45,25 @@ class CoreConversation:
             request.context.get("candidate") or ""
         ).strip().lower()
 
+        if request.capability == "conversation_lifecycle":
+            if candidate != "control_intent":
+                return ConversationResult()
+            normalized = str(request.text or "").strip().lower()
+            actions = {
+                "cancel": "cancelled",
+                "start over": "restarted",
+                "never mind": "abandoned",
+            }
+            action = actions.get(normalized, "")
+            if not action:
+                return ConversationResult()
+            return ConversationResult(
+                handled=True,
+                intent="conversation_lifecycle",
+                action=action,
+                object_type="conversation_state",
+            )
+
         if request.capability == "routing_arbitration":
             if candidate not in (
                 "await_vs_normal_route",

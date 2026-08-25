@@ -85,6 +85,8 @@ from storage import (
     claim_conversation_state_continuation,
     advance_conversation_state_continuation,
     resolve_conversation_state,
+    touch_conversation_state_activity,
+    retire_conversation_state,
 
     # Hygiene / system state
     hygiene_pin,

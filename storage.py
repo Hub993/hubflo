@@ -1189,12 +1189,18 @@ class ConversationState(Base):
     status = Column(String(24), nullable=False, default="active", index=True)
     active = Column(Boolean, nullable=False, default=True, index=True)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
+    last_activity_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
     updated_at = Column(
         DateTime,
         default=dt.datetime.utcnow,
         onupdate=dt.datetime.utcnow,
     )
     resolved_at = Column(DateTime, nullable=True)
+    retired_at = Column(DateTime, nullable=True)
+    retirement_reason = Column(String(32), nullable=True)
+
+
+CONVERSATION_STATE_EXPIRY = dt.timedelta(hours=24)
 
 
 def _conversation_state_json(value) -> str:
@@ -1236,8 +1242,11 @@ def _as_conversation_state_dict(state: ConversationState) -> dict:
         "status": state.status,
         "active": bool(state.active),
         "created_at": state.created_at,
+        "last_activity_at": state.last_activity_at or state.created_at,
         "updated_at": state.updated_at,
         "resolved_at": state.resolved_at,
+        "retired_at": state.retired_at,
+        "retirement_reason": state.retirement_reason,
     }
 
 
@@ -1306,6 +1315,7 @@ def save_pending_conversation_state(payload: dict) -> dict:
                 continuation_key=continuation_key,
                 status="active",
                 active=True,
+                last_activity_at=dt.datetime.utcnow(),
             )
             s.add(state)
             s.commit()
@@ -1355,8 +1365,9 @@ def get_pending_conversation_state(
     client_id: int,
     project_code: Optional[str],
     continuation_key: Optional[str] = None,
+    now_utc: Optional[dt.datetime] = None,
 ) -> Optional[dict]:
-    """Retrieve one active state inside exact sender/client/project scope."""
+    """Retrieve one unexpired state inside exact sender/client/project scope."""
     sender = str(sender or "").strip()
     if not sender:
         return None
@@ -1388,7 +1399,38 @@ def get_pending_conversation_state(
             )
 
         state = q.order_by(ConversationState.id.desc()).first()
-        return _as_conversation_state_dict(state) if state else None
+        if state is None:
+            return None
+
+        lifecycle_now = now_utc or dt.datetime.utcnow()
+        last_activity = state.last_activity_at or state.created_at
+        if last_activity is None:
+            last_activity = state.updated_at or lifecycle_now
+        if lifecycle_now >= last_activity + CONVERSATION_STATE_EXPIRY:
+            updated = (
+                s.query(ConversationState)
+                .filter(
+                    ConversationState.id == state.id,
+                    ConversationState.active == True,
+                    ConversationState.status.in_(("active", "continuing")),
+                )
+                .update(
+                    {
+                        ConversationState.status: "expired",
+                        ConversationState.active: False,
+                        ConversationState.retired_at: lifecycle_now,
+                        ConversationState.retirement_reason: "expired",
+                        ConversationState.updated_at: lifecycle_now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                s.commit()
+            else:
+                s.rollback()
+            return None
+        return _as_conversation_state_dict(state)
 
 
 def claim_conversation_state_continuation(
@@ -1396,6 +1438,7 @@ def claim_conversation_state_continuation(
     sender: str,
     client_id: int,
     project_code: Optional[str],
+    now_utc: Optional[dt.datetime] = None,
 ) -> dict:
     """Atomically claim one active continuation before orchestration resumes it."""
     try:
@@ -1424,10 +1467,13 @@ def claim_conversation_state_continuation(
         else:
             q = q.filter(ConversationState.project_code == normalized_project)
 
-        now_utc = dt.datetime.utcnow()
+        now_utc = now_utc or dt.datetime.utcnow()
+        expiry_cutoff = now_utc - CONVERSATION_STATE_EXPIRY
+        q = q.filter(ConversationState.last_activity_at > expiry_cutoff)
         updated = q.update(
             {
                 ConversationState.status: "continuing",
+                ConversationState.last_activity_at: now_utc,
                 ConversationState.updated_at: now_utc,
             },
             synchronize_session=False,
@@ -1449,6 +1495,7 @@ def advance_conversation_state_continuation(
     client_id: int,
     project_code: Optional[str],
     expected_field: Optional[str],
+    now_utc: Optional[dt.datetime] = None,
 ) -> dict:
     """Return a claimed continuation to active state for its next field."""
     try:
@@ -1480,7 +1527,7 @@ def advance_conversation_state_continuation(
         else:
             q = q.filter(ConversationState.project_code == normalized_project)
 
-        now_utc = dt.datetime.utcnow()
+        now_utc = now_utc or dt.datetime.utcnow()
         updated = q.update(
             {
                 ConversationState.status: "active",
@@ -1505,6 +1552,7 @@ def resolve_conversation_state(
     sender: str,
     client_id: int,
     project_code: Optional[str],
+    now_utc: Optional[dt.datetime] = None,
 ) -> dict:
     """Resolve one active state once, within exact identity/scope bounds."""
     try:
@@ -1533,7 +1581,7 @@ def resolve_conversation_state(
         else:
             q = q.filter(ConversationState.project_code == normalized_project)
 
-        now_utc = dt.datetime.utcnow()
+        now_utc = now_utc or dt.datetime.utcnow()
         updated = q.update(
             {
                 ConversationState.status: "resolved",
@@ -1550,6 +1598,114 @@ def resolve_conversation_state(
         state = s.get(ConversationState, state_id)
         result = _as_conversation_state_dict(state)
         result["status_result"] = "resolved"
+        return result
+
+
+def touch_conversation_state_activity(
+    state_id: int,
+    sender: str,
+    client_id: int,
+    project_code: Optional[str],
+    now_utc: Optional[dt.datetime] = None,
+) -> dict:
+    """Record an inbound actually processed as a continuation attempt."""
+    try:
+        state_id = int(state_id)
+        client_id = int(client_id)
+    except (TypeError, ValueError):
+        return {"status": "error", "code": "invalid_state_identity"}
+    sender = str(sender or "").strip()
+    normalized_project = (
+        str(project_code).strip() if project_code is not None else None
+    )
+    if normalized_project == "":
+        normalized_project = None
+    lifecycle_now = now_utc or dt.datetime.utcnow()
+    expiry_cutoff = lifecycle_now - CONVERSATION_STATE_EXPIRY
+    with SessionLocal() as s:
+        q = s.query(ConversationState).filter(
+            ConversationState.id == state_id,
+            ConversationState.client_id == client_id,
+            ConversationState.sender == sender,
+            ConversationState.active == True,
+            ConversationState.status == "active",
+            ConversationState.last_activity_at > expiry_cutoff,
+        )
+        if normalized_project is None:
+            q = q.filter(ConversationState.project_code == None)
+        else:
+            q = q.filter(ConversationState.project_code == normalized_project)
+        updated = q.update(
+            {
+                ConversationState.last_activity_at: lifecycle_now,
+                ConversationState.updated_at: lifecycle_now,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            s.rollback()
+            return {"status": "not_found"}
+        s.commit()
+        state = s.get(ConversationState, state_id)
+        result = _as_conversation_state_dict(state)
+        result["status_result"] = "touched"
+        return result
+
+
+def retire_conversation_state(
+    state_id: int,
+    sender: str,
+    client_id: int,
+    project_code: Optional[str],
+    reason: str,
+    now_utc: Optional[dt.datetime] = None,
+) -> dict:
+    """Atomically retire active conversation state without business mutation."""
+    allowed_reasons = {"cancelled", "restarted", "abandoned", "expired"}
+    reason = str(reason or "").strip().lower()
+    if reason not in allowed_reasons:
+        return {"status": "error", "code": "invalid_retirement_reason"}
+    try:
+        state_id = int(state_id)
+        client_id = int(client_id)
+    except (TypeError, ValueError):
+        return {"status": "error", "code": "invalid_state_identity"}
+    sender = str(sender or "").strip()
+    normalized_project = (
+        str(project_code).strip() if project_code is not None else None
+    )
+    if normalized_project == "":
+        normalized_project = None
+    lifecycle_now = now_utc or dt.datetime.utcnow()
+    with SessionLocal() as s:
+        q = s.query(ConversationState).filter(
+            ConversationState.id == state_id,
+            ConversationState.client_id == client_id,
+            ConversationState.sender == sender,
+            ConversationState.active == True,
+            ConversationState.status.in_(("active", "continuing")),
+        )
+        if normalized_project is None:
+            q = q.filter(ConversationState.project_code == None)
+        else:
+            q = q.filter(ConversationState.project_code == normalized_project)
+        updated = q.update(
+            {
+                ConversationState.status: reason,
+                ConversationState.active: False,
+                ConversationState.retired_at: lifecycle_now,
+                ConversationState.retirement_reason: reason,
+                ConversationState.updated_at: lifecycle_now,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            s.rollback()
+            return {"status": "not_found"}
+        s.commit()
+        state = s.get(ConversationState, state_id)
+        result = _as_conversation_state_dict(state)
+        result["status_result"] = "retired"
         return result
 
 # >>> MU12_CONVERSATION_STATE_STORAGE_END <<<
@@ -1680,6 +1836,30 @@ def _repair_pm_reminders():
 # >>> FEATURE_3_REMINDER_SCHEMA_REPAIR_END <<<
 
 
+def _repair_conversation_states():
+    """Add MU14 lifecycle columns to an existing conversation-state table."""
+    insp = inspect(ENGINE)
+    if "conversation_states" not in insp.get_table_names():
+        return
+    existing = {c["name"] for c in insp.get_columns("conversation_states")}
+    additions = {
+        "last_activity_at": "TIMESTAMP",
+        "retired_at": "TIMESTAMP",
+        "retirement_reason": "VARCHAR(32)",
+    }
+    with ENGINE.begin() as conn:
+        for column_name, column_type in additions.items():
+            if column_name not in existing:
+                conn.execute(text(
+                    f"ALTER TABLE conversation_states "
+                    f"ADD COLUMN {column_name} {column_type}"
+                ))
+        conn.execute(text(
+            "UPDATE conversation_states SET last_activity_at = "
+            "COALESCE(last_activity_at, updated_at, created_at, CURRENT_TIMESTAMP)"
+        ))
+
+
 # ---------------------------------------------------------------------
 # Hygiene helpers (used by /heartbeat and tether checks)
 # ---------------------------------------------------------------------
@@ -1731,6 +1911,11 @@ def init_db():
     except Exception:
         pass
     # >>> FEATURE_3_REMINDER_INIT_END <<<
+
+    try:
+        _repair_conversation_states()
+    except Exception:
+        pass
 
     return True
 
