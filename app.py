@@ -469,6 +469,7 @@ def classify_delay(text: str) -> bool:
 def _resolve_delay_task_reference(
     text: str,
     project_code: Optional[str],
+    client_id: Optional[int] = None,
 ) -> dict:
     project = (
         str(project_code).strip()
@@ -488,6 +489,11 @@ def _resolve_delay_task_reference(
             .order_by(Task.id.desc())
             .all()
         )
+        if client_id is not None:
+            rows = [
+                row for row in rows
+                if int(row.client_id or 1) == int(client_id)
+            ]
 
     records = []
     for row in rows:
@@ -1089,6 +1095,93 @@ def parse_natural_meeting(
     }
 
 
+def interpret_supported_message(
+    text: str,
+    project_code: Optional[str] = None,
+) -> dict:
+    """Converged non-mutating routing and structured meaning for Stage 2."""
+    raw = str(text or "").strip()
+    lower = raw.lower()
+    entities = {}
+    context_patterns = {
+        "project": r"\bproject\s+([a-z0-9_-]+)",
+        "phase": r"\bphase\s+([a-z0-9][a-z0-9 _-]*?)(?=\s+(?:in|on|for|at)\b|$)",
+        "zone": r"\bzone\s+([a-z0-9_-]+)",
+        "trade": r"\btrade\s+([a-z0-9][a-z0-9 _-]*?)(?=\s+(?:in|on|for|at)\b|$)",
+    }
+    for name, pattern in context_patterns.items():
+        match = re.search(pattern, lower, flags=re.IGNORECASE)
+        if match:
+            entities[name] = match.group(1).strip()
+    if project_code and "project" not in entities:
+        entities["project"] = str(project_code)
+
+    lifecycle = classify_pm_reminder_lifecycle(raw)
+    if lifecycle:
+        return {"route": "reminder", "action": lifecycle, "entities": entities}
+    if classify_pm_reminder(raw):
+        return {"route": "reminder", "action": "create", "entities": entities}
+
+    meeting = _CORE_CONVERSATION.interpret_core(ConversationRequest(
+        capability="core_recognition",
+        text=raw,
+        context={"candidate": "meeting_creation"},
+    ))
+    if meeting.handled:
+        return {"route": "meeting", "action": "create", "entities": entities}
+
+    if classify_inspection(raw):
+        return {"route": "inspection", "action": "create", "entities": entities}
+    if classify_delay(raw):
+        return {"route": "delay", "action": "create", "entities": entities}
+
+    order = parse_natural_order(raw, project_code)
+    if order:
+        return {**order, "route": "order", "entities": {**entities, **order["fields"]}}
+
+    approval = re.match(
+        r"^(approve|reject)\s+(?:change\s+)?order\s*#?\s*(\d+)\s*$",
+        lower,
+    )
+    if approval:
+        return {
+            "route": "approval",
+            "action": approval.group(1),
+            "entities": {**entities, "task_id": int(approval.group(2))},
+        }
+
+    if re.match(r"^(?:record|log|confirm)\s+(?:a\s+)?delivery\b", lower):
+        return {"route": "delivery", "action": "create", "entities": entities}
+    if re.match(r"^(?:pin|pinned)\s+note\b", lower):
+        return {"route": "pinned_note", "action": "create", "entities": entities}
+    if re.match(r"^(?:add\s+|create\s+|write\s+)?note\b", lower):
+        return {"route": "note", "action": "create", "entities": entities}
+    if re.match(r"^(?:show|find|search|list)\b", lower):
+        return {"route": "search", "action": "read", "entities": entities}
+    if re.match(r"^(?:what(?:'s| is)\s+)?(?:the\s+)?status\b", lower):
+        return {"route": "status", "action": "read", "entities": entities}
+    if "stock" in lower and re.search(
+        r"\b(?:add|receive|received|remove|use|used|deduct|adjust)\b", lower
+    ):
+        return {"route": "stock", "action": "adjust", "entities": entities}
+
+    assigned = re.match(r"^assign\s+(.+?)\s+to\s+(.+)$", raw, flags=re.IGNORECASE)
+    if assigned:
+        entities.update({
+            "recipient_reference": assigned.group(1).strip(),
+            "task_text": assigned.group(2).strip(),
+        })
+        return {"route": "task", "action": "create", "subtype": "assigned", "entities": entities}
+    if re.match(r"^(?:create|add)\s+(?:a\s+)?task\s+for\s+me\b", lower):
+        return {"route": "task", "action": "create", "subtype": "self", "entities": entities}
+    if re.match(r"^urgent\s*:", lower) or re.search(r"\basap\b", lower):
+        return {"route": "task", "action": "create", "subtype": "urgent", "entities": entities}
+    if re.match(r"^(?:create|add)\s+(?:a\s+)?task\b", lower):
+        return {"route": "task", "action": "create", "subtype": "assigned", "entities": entities}
+
+    return {"route": "ordinary_fallback", "action": "create", "entities": entities}
+
+
 def parse_pm_reminder_snooze_until(
     text: str,
     timezone_name: str,
@@ -1506,7 +1599,9 @@ def webhook():
                 return
 
             role = (u.role or "").lower().strip()
-            q = s.query(Task)
+            q = s.query(Task).filter(
+                Task.client_id == int(u.client_id or 1)
+            )
 
             # ------------------------------------------------------------
             # ROLE SCOPING
@@ -1520,7 +1615,10 @@ def webhook():
                 # PMs = tasks across mapped projects
                 proj_rows = (
                     s.query(PMProjectMap.project_code)
-                    .filter(PMProjectMap.pm_user_id == u.id)
+                    .filter(
+                        PMProjectMap.pm_user_id == u.id,
+                        PMProjectMap.client_id == int(u.client_id or 1),
+                    )
                     .all()
                 )
                 projects = [r.project_code for r in proj_rows]
@@ -1534,7 +1632,10 @@ def webhook():
                 # Directors / Admin roles → same project mapping logic
                 proj_rows = (
                     s.query(PMProjectMap.project_code)
-                    .filter(PMProjectMap.pm_user_id == u.id)
+                    .filter(
+                        PMProjectMap.pm_user_id == u.id,
+                        PMProjectMap.client_id == int(u.client_id or 1),
+                    )
                     .all()
                 )
                 projects = [r.project_code for r in proj_rows]
@@ -1555,7 +1656,10 @@ def webhook():
             if " for " in t:
                 subs = (
                     s.query(Task.subcontractor_name)
-                    .filter(Task.subcontractor_name != None)
+                    .filter(
+                        Task.client_id == int(u.client_id or 1),
+                        Task.subcontractor_name != None,
+                    )
                     .distinct()
                     .all()
                 )
@@ -1574,6 +1678,8 @@ def webhook():
                             s.query(User)
                             .join(PMProjectMap, PMProjectMap.pm_user_id == User.id)
                             .filter(
+                                User.client_id == int(u.client_id or 1),
+                                PMProjectMap.client_id == int(u.client_id or 1),
                                 PMProjectMap.project_code == u.project_code,
                                 User.role == "pm",
                                 User.active == True,
@@ -4200,6 +4306,7 @@ def webhook():
             )
 
             payload = {
+                "client_id": int(user_info.get("client_id") or 1),
                 "project_code": project_code,
                 "phase": (
                     parsed_inspection["phase"]
@@ -4255,6 +4362,7 @@ def webhook():
                 task_resolution = _resolve_delay_task_reference(
                     text,
                     project_code,
+                    user_info.get("client_id"),
                 )
                 resolution_status = task_resolution.get("status")
 
@@ -4444,6 +4552,110 @@ def webhook():
         user_info = get_user_role(sender) or {}
         project_code = user_info.get("project_code")
         subcontractor_name = user_info.get("subcontractor_name")
+        structured_route = interpret_supported_message(text or "", project_code)
+
+        if structured_route["route"] == "status":
+            with DBSession() as s:
+                query = s.query(Task).filter(
+                    Task.client_id == int(user_info.get("client_id") or 1)
+                )
+                if project_code:
+                    query = query.filter(Task.project_code == project_code)
+                rows = query.all()
+            counts = {}
+            for row in rows:
+                counts[row.status] = counts.get(row.status, 0) + 1
+            summary = ", ".join(
+                f"{name}: {count}" for name, count in sorted(counts.items())
+            ) or "no task records"
+            send_whatsapp_text(phone_id, sender, f"Project status — {summary}.")
+            return ("", 200)
+
+        if structured_route["route"] == "approval":
+            task_id = structured_route["entities"]["task_id"]
+            with DBSession() as s:
+                authorized_task = s.get(Task, task_id)
+                if (
+                    authorized_task
+                    and (
+                        int(authorized_task.client_id or 1)
+                        != int(user_info.get("client_id") or 1)
+                        or (
+                            project_code
+                            and authorized_task.project_code != project_code
+                        )
+                    )
+                ):
+                    authorized_task = None
+            if not authorized_task:
+                send_whatsapp_text(
+                    phone_id, sender, "That order is not available in your scope."
+                )
+                return ("", 200)
+            if structured_route["action"] == "approve":
+                approve_task(task_id, actor=sender)
+            else:
+                reject_task(task_id, actor=sender)
+            send_whatsapp_text(
+                phone_id,
+                sender,
+                f"Order {task_id} {structured_route['action']}d.",
+            )
+            return ("", 200)
+
+        assignee_wa = None
+        if (
+            structured_route["route"] == "task"
+            and structured_route.get("subtype") == "assigned"
+            and structured_route["entities"].get("recipient_reference")
+        ):
+            reference = structured_route["entities"]["recipient_reference"]
+            with DBSession() as s:
+                people = s.query(User).filter(
+                    User.client_id == int(user_info.get("client_id") or 1),
+                    User.active == True,
+                ).all()
+            records = [
+                {
+                    "id": person.wa_id,
+                    "label": person.name or person.wa_id,
+                    "labels": [person.name or "", person.wa_id or ""],
+                }
+                for person in people
+                if not project_code or not person.project_code
+                or person.project_code == project_code
+            ]
+            resolution = _CORE_CONVERSATION.interpret_core(
+                ConversationRequest(
+                    capability="record_resolution",
+                    text=reference,
+                    context={
+                        "candidate": "text_reference",
+                        "records": records,
+                    },
+                )
+            )
+            if resolution.metadata.get("resolution") != "resolved":
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    "Name one uniquely authorized person for that task.",
+                )
+                return ("", 200)
+            assignee_wa = str(resolution.entities["record_id"])
+
+        route_overrides = {
+            "task": (
+                "urgent" if structured_route.get("subtype") == "urgent" else "task",
+                structured_route.get("subtype") or "assigned",
+            ),
+            "note": ("note", "note"),
+            "pinned_note": ("note", "pinned"),
+            "delivery": ("delivery", "assigned"),
+        }
+        if structured_route["route"] in route_overrides:
+            tag, subtype = route_overrides[structured_route["route"]]
+            order_state = None
 
         new_row = create_task(
             sender=sender,
@@ -4454,6 +4666,7 @@ def webhook():
             order_state=order_state,
             attachment=attachment,
             subtype=subtype,
+            assignee_wa=assignee_wa,
         )
 
         # -------------------------------------------------------------

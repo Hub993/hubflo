@@ -48,6 +48,18 @@ def current_client_id() -> int:
     # Future toggle will override this.
     return DEFAULT_CLIENT_ID
 
+
+def client_id_for_sender(sender: Optional[str]) -> int:
+    """Resolve canonical tenant identity from the authenticated sender record."""
+    if not sender:
+        return DEFAULT_CLIENT_ID
+    with SessionLocal() as s:
+        row = s.query(User.client_id).filter(User.wa_id == str(sender)).first()
+        try:
+            return int(row[0]) if row and row[0] is not None else DEFAULT_CLIENT_ID
+        except (TypeError, ValueError):
+            return DEFAULT_CLIENT_ID
+
 # >>> PATCH_4_STORAGE_END <<<
 
 # --- NEW: People & Role Model (Hierarchy Lookup) ----------------------
@@ -127,6 +139,7 @@ class Inspection(Base):
     __tablename__ = "inspections"
 
     id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     project_code = Column(String, index=True)
     phase = Column(String)
     required_date = Column(DateTime)
@@ -139,6 +152,7 @@ class Inspection(Base):
 def create_inspection(payload: dict) -> dict:
     with SessionLocal() as s:
         ins = Inspection(
+            client_id=int(payload.get("client_id") or DEFAULT_CLIENT_ID),
             project_code=payload.get("project_code"),
             phase=payload.get("phase"),
             required_date=payload.get("required_date"),
@@ -159,6 +173,7 @@ class DelayLog(Base):
     __tablename__ = "delay_logs"
 
     id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     task_id = Column(Integer, index=True)
     project_code = Column(String, index=True)
     reporter = Column(String)
@@ -227,12 +242,20 @@ def log_delay(payload: dict) -> dict:
 
     with SessionLocal() as s:
         task = s.get(Task, task_id)
+        reporter_client_id = client_id_for_sender(reporter)
 
         if not task:
             return {
                 "status": "error",
                 "code": "task_not_found",
                 "message": f"Task {task_id} was not found.",
+            }
+
+        if int(task.client_id or DEFAULT_CLIENT_ID) != reporter_client_id:
+            return {
+                "status": "error",
+                "code": "client_mismatch",
+                "message": "The task is outside the sender's client scope.",
             }
 
         task_project_code = (
@@ -263,6 +286,7 @@ def log_delay(payload: dict) -> dict:
             }
 
         delay = DelayLog(
+            client_id=reporter_client_id,
             task_id=task.id,
             project_code=task_project_code,
             reporter=reporter,
@@ -1731,10 +1755,35 @@ def _repair_system_state():
 # --- HOTFIX: ensure tasks table matches model ---
 def _repair_tasks():
     insp = inspect(ENGINE)
+    if "tasks" not in insp.get_table_names():
+        return
     cols = [c['name'] for c in insp.get_columns("tasks")]
-    if "client_id" in cols:
-        with ENGINE.connect() as conn:
-            conn.execute(text("ALTER TABLE tasks DROP COLUMN client_id"))
+    with ENGINE.begin() as conn:
+        if "client_id" not in cols:
+            conn.execute(text(
+                "ALTER TABLE tasks ADD COLUMN client_id INTEGER DEFAULT 1"
+            ))
+        conn.execute(text(
+            "UPDATE tasks SET client_id = 1 WHERE client_id IS NULL"
+        ))
+
+
+def _repair_stage2_client_columns():
+    """Backfill client ownership for Stage 2 business evidence tables."""
+    insp = inspect(ENGINE)
+    for table_name in ("inspections", "delay_logs", "stock_items"):
+        if table_name not in insp.get_table_names():
+            continue
+        columns = {c["name"] for c in insp.get_columns(table_name)}
+        with ENGINE.begin() as conn:
+            if "client_id" not in columns:
+                conn.execute(text(
+                    f"ALTER TABLE {table_name} "
+                    "ADD COLUMN client_id INTEGER DEFAULT 1"
+                ))
+            conn.execute(text(
+                f"UPDATE {table_name} SET client_id = 1 WHERE client_id IS NULL"
+            ))
 
 def _repair_pm_project_map():
     """Ensure existing pm_project_map tables contain client_id + expected index."""
@@ -1935,6 +1984,11 @@ def init_db():
         pass
 
     try:
+        _repair_stage2_client_columns()
+    except Exception:
+        pass
+
+    try:
         _repair_pm_project_map()
     except Exception:
         pass
@@ -2011,7 +2065,10 @@ def _as_meeting_dict(m: Meeting) -> dict:
 
 def log_audit(actor: Optional[str], action: str, ref_type: str, ref_id: int, details: Optional[str] = None):
     with SessionLocal() as s:
-        s.add(Audit(actor=actor, action=action, ref_type=ref_type, ref_id=ref_id, details=details))
+        s.add(Audit(
+            client_id=client_id_for_sender(actor), actor=actor,
+            action=action, ref_type=ref_type, ref_id=ref_id, details=details,
+        ))
         s.commit()
 
 # ---------------------------------------------------------------------
@@ -2094,13 +2151,16 @@ def create_task(sender: str, text: str, tag: Optional[str] = None,
                 project_code: Optional[str] = None,
                 due_date: Optional[dt.datetime] = None,
                 order_state: Optional[str] = None,
-                subtype: Optional[str] = None) -> dict:
+                subtype: Optional[str] = None,
+                assignee_wa: Optional[str] = None) -> dict:
     with SessionLocal() as s:
         t = Task(
+            client_id=client_id_for_sender(sender),
             sender=sender, text=text or "", tag=tag,
             subcontractor_name=subcontractor_name, project_code=project_code,
             due_date=due_date, order_state=order_state, subtype=subtype
         )
+        t.pm_wa_id = assignee_wa
         if attachment:
             t.attachment_name = attachment.get("name")
             t.attachment_mime = attachment.get("mime")
@@ -2273,6 +2333,7 @@ def create_meeting(title: str, project_code: Optional[str],
                    created_by: Optional[str]) -> dict:
     with SessionLocal() as s:
         m = Meeting(
+            client_id=client_id_for_sender(created_by),
             title=title or "Site Meeting",
             project_code=project_code,
             subcontractor_name=subcontractor_name,
@@ -2412,6 +2473,7 @@ class StockItem(Base):
     __tablename__ = "stock_items"
 
     id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, default=DEFAULT_CLIENT_ID, index=True)
     name = Column(String(200), nullable=False, index=True)
     project_code = Column(String(128), index=True, nullable=True)
     supplier_name = Column(String(200), nullable=True)
@@ -2451,18 +2513,23 @@ def _get_or_create_stock_item(
     project_code: Optional[str] = None,
     supplier_name: Optional[str] = None,
     unit: Optional[str] = None,
+    client_id: int = DEFAULT_CLIENT_ID,
 ) -> StockItem:
     name_norm = (name or "").strip()
     if not name_norm:
         raise ValueError("stock name required")
 
-    q = s.query(StockItem).filter(StockItem.name == name_norm)
+    q = s.query(StockItem).filter(
+        StockItem.client_id == int(client_id),
+        StockItem.name == name_norm,
+    )
     if project_code:
         q = q.filter(StockItem.project_code == project_code)
 
     item = q.first()
     if not item:
         item = StockItem(
+            client_id=int(client_id),
             name=name_norm,
             project_code=project_code,
             supplier_name=supplier_name,
@@ -2504,6 +2571,7 @@ def create_stock_item(data: dict) -> dict:
             project_code=project_code,
             supplier_name=supplier_name,
             unit=unit,
+            client_id=client_id_for_sender(data.get("actor")),
         )
 
         if min_days_cover is not None:
@@ -2560,6 +2628,7 @@ def adjust_stock(data: dict) -> dict:
                 project_code=project_code,
                 supplier_name=supplier_name,
                 unit=unit,
+                client_id=client_id_for_sender(data.get("actor")),
             )
         except ValueError as e:
             return {"status": "error", "message": str(e)}
