@@ -37,33 +37,34 @@ class MU14LifecycleStorageTests(unittest.TestCase):
             session.commit()
 
     def test_expiry_boundary_is_exact_and_retires_stale_state(self):
-        state = self._state()
-        base = dt.datetime(2026, 8, 25, 12, 0, 0)
-        self._set_activity(state["id"], base)
+        for index, kind in enumerate(("await", "clarification")):
+            state = self._state(sender=f"155500009{index}", kind=kind)
+            base = dt.datetime(2026, 8, 25, 12, 0, 0)
+            self._set_activity(state["id"], base)
 
-        active = storage.get_pending_conversation_state(
-            state["sender"], 7, "PROJECT_A1",
-            now_utc=base + dt.timedelta(hours=23, minutes=59, seconds=59),
-        )
-        self.assertIsNotNone(active)
+            active = storage.get_pending_conversation_state(
+                state["sender"], 7, "PROJECT_A1",
+                now_utc=base + dt.timedelta(hours=23, minutes=59, seconds=59),
+            )
+            self.assertIsNotNone(active)
 
-        expired = storage.get_pending_conversation_state(
-            state["sender"], 7, "PROJECT_A1",
-            now_utc=base + dt.timedelta(hours=24),
-        )
-        self.assertIsNone(expired)
-        with storage.SessionLocal() as session:
-            row = session.get(storage.ConversationState, state["id"])
-            self.assertFalse(row.active)
-            self.assertEqual(row.status, "expired")
-            self.assertEqual(row.retirement_reason, "expired")
-            self.assertEqual(row.candidate_metadata_json, '{"ids":[11,12]}')
+            expired = storage.get_pending_conversation_state(
+                state["sender"], 7, "PROJECT_A1",
+                now_utc=base + dt.timedelta(hours=24),
+            )
+            self.assertIsNone(expired)
+            with storage.SessionLocal() as session:
+                row = session.get(storage.ConversationState, state["id"])
+                self.assertFalse(row.active)
+                self.assertEqual(row.status, "expired")
+                self.assertEqual(row.retirement_reason, "expired")
+                self.assertEqual(row.candidate_metadata_json, '{"ids":[11,12]}')
 
-        still_expired = storage.get_pending_conversation_state(
-            state["sender"], 7, "PROJECT_A1",
-            now_utc=base + dt.timedelta(days=2),
-        )
-        self.assertIsNone(still_expired)
+            still_expired = storage.get_pending_conversation_state(
+                state["sender"], 7, "PROJECT_A1",
+                now_utc=base + dt.timedelta(days=2),
+            )
+            self.assertIsNone(still_expired)
 
     def test_continuation_activity_extends_expiry_but_reads_do_not(self):
         state = self._state()

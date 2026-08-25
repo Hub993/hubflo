@@ -2102,9 +2102,11 @@ def webhook():
     def _run_natural_order_continuation(
         awaiting,
         raw_txt: str,
-        pending_state: dict,
+        pending_state: Optional[dict],
         session,
     ) -> bool:
+        if not pending_state:
+            return False
         context = dict(pending_state.get("structured_context") or {})
         if context.get("kind") != "natural_order":
             return False

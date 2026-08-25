@@ -2564,6 +2564,7 @@ def create_stock_item(data: dict) -> dict:
         supplier_name = data.get("supplier_name")
         unit = data.get("unit")
         min_days_cover = data.get("min_days_cover")
+        opening_qty = data.get("opening_qty")
 
         item = _get_or_create_stock_item(
             s,
@@ -2579,6 +2580,24 @@ def create_stock_item(data: dict) -> dict:
                 item.min_days_cover = float(min_days_cover)
             except (TypeError, ValueError):
                 item.min_days_cover = None
+
+        if opening_qty is not None:
+            try:
+                opening_value = float(opening_qty)
+            except (TypeError, ValueError):
+                return {"status": "error", "message": "invalid opening quantity"}
+            if opening_value < 0:
+                return {"status": "error", "message": "invalid opening quantity"}
+            existing_movements = s.query(StockMovement.id).filter(
+                StockMovement.stock_item_id == item.id
+            ).first()
+            if existing_movements is None and float(item.current_qty or 0) == 0:
+                item.current_qty = opening_value
+                if opening_value:
+                    s.add(StockMovement(
+                        stock_item_id=item.id,
+                        qty_change=opening_value,
+                    ))
 
         s.commit()
         s.refresh(item)
