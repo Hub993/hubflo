@@ -329,6 +329,7 @@ def parse_inspection_request(
     text: str,
     today: Optional[dt.date] = None,
     timezone_name: str = "America/New_York",
+    date_order: Optional[str] = "month_first",
 ) -> Optional[dict]:
     """
     Parse inspection scheduling messages such as:
@@ -388,6 +389,7 @@ def parse_inspection_request(
                 context={
                     "candidate": "calendar_date",
                     "reference_date": today.isoformat(),
+                    "date_order": date_order,
                     "relative_date_selection": "first_textual",
                     "month_date_year_separator": "optional",
                 },
@@ -653,6 +655,7 @@ def parse_pm_reminder_request(
     text: str,
     timezone_name: str = "America/New_York",
     now_local: Optional[dt.datetime] = None,
+    date_order: Optional[str] = "month_first",
 ) -> Optional[dict]:
     """Parse initial schedule metadata without altering the stored text."""
     raw = text or ""
@@ -752,6 +755,7 @@ def parse_pm_reminder_request(
             context={
                 "candidate": "calendar_date",
                 "reference_date": now_local.date().isoformat(),
+                "date_order": date_order,
             },
         )
     )
@@ -886,6 +890,68 @@ def parse_pm_reminder_request(
         "recurrence_anchor_day": recurrence_anchor_day,
         "timezone": timezone_name,
     }
+
+
+def ambiguous_calendar_date_options(
+    text: str,
+    reference_date: dt.date,
+) -> list[dict]:
+    """Return the bounded month-first/day-first meanings for numeric ambiguity."""
+    result = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="shared_datetime",
+            text=text or "",
+            context={
+                "candidate": "calendar_date",
+                "reference_date": reference_date.isoformat(),
+            },
+        )
+    )
+    metadata = result.metadata if result.handled else {}
+    if not metadata.get("ambiguous"):
+        return []
+    first = int(metadata["first"])
+    second = int(metadata["second"])
+    year = int(metadata["year"])
+    if year < 100:
+        year += 2000
+    options = []
+    for date_order, month, day in (
+        ("month_first", first, second),
+        ("day_first", second, first),
+    ):
+        try:
+            value = dt.date(year, month, day)
+        except ValueError:
+            continue
+        if value < reference_date and not metadata.get("year_supplied"):
+            value = value.replace(year=year + 1)
+        options.append({
+            "id": value.isoformat(),
+            "label": value.strftime("%B %d, %Y"),
+            "date_order": date_order,
+        })
+    return options
+
+
+def format_configured_datetime(
+    value_utc: dt.datetime,
+    timezone_name: str,
+    date_display: str = "month_first",
+    time_format: str = "12h",
+) -> str:
+    """Display a canonical naive-UTC value using sender configuration."""
+    try:
+        owner_tz = ZoneInfo(timezone_name or "America/New_York")
+    except Exception:
+        owner_tz = ZoneInfo("America/New_York")
+    aware_utc = value_utc
+    if aware_utc.tzinfo is None:
+        aware_utc = aware_utc.replace(tzinfo=dt.timezone.utc)
+    local_value = aware_utc.astimezone(owner_tz)
+    date_pattern = "%d/%m/%Y" if date_display == "day_first" else "%m/%d/%Y"
+    time_pattern = "%H:%M" if time_format == "24h" else "%I:%M %p"
+    return local_value.strftime(f"{date_pattern} {time_pattern}")
 
 
 def parse_pm_reminder_snooze_until(
@@ -2332,6 +2398,9 @@ def webhook():
         )
 
     def _mu13_sender_timezone(sender_wa: str) -> str:
+        return _mu15_sender_datetime_configuration(sender_wa)["timezone"]
+
+    def _mu15_sender_datetime_configuration(sender_wa: str) -> dict:
         with DBSession() as s:
             sender_user = (
                 s.query(User)
@@ -2341,9 +2410,200 @@ def webhook():
                 )
                 .first()
             )
-            if sender_user and sender_user.timezone:
-                return sender_user.timezone
-        return "America/New_York"
+            if sender_user:
+                date_order = str(sender_user.date_order or "").strip().lower()
+                time_format = str(sender_user.time_format or "").strip().lower()
+                date_display = str(sender_user.date_display or "").strip().lower()
+                return {
+                    "timezone": sender_user.timezone or "America/New_York",
+                    "date_order": (
+                        date_order
+                        if date_order in ("month_first", "day_first")
+                        else None
+                    ),
+                    "time_format": time_format if time_format in ("12h", "24h") else "12h",
+                    "date_display": (
+                        date_display
+                        if date_display in ("month_first", "day_first")
+                        else "month_first"
+                    ),
+                }
+        return {
+            "timezone": "America/New_York",
+            "date_order": "month_first",
+            "time_format": "12h",
+            "date_display": "month_first",
+        }
+
+    def _mu15_execute_reminder_creation(
+        sender_wa: str,
+        raw_text: str,
+        parsed_reminder: dict,
+    ) -> bool:
+        user_info = get_user_role(sender_wa) or {}
+        payload = {
+            "pm_wa": sender_wa,
+            "recipient_wa": sender_wa,
+            "project_code": user_info.get("project_code"),
+            "text": raw_text,
+            "rule": parsed_reminder["rule"],
+            "timezone": parsed_reminder["timezone"],
+            "next_run": parsed_reminder["next_run"],
+            "recurring": parsed_reminder["recurring"],
+            "recurrence_rule": parsed_reminder["recurrence_rule"],
+            "recurrence_interval": parsed_reminder["recurrence_interval"],
+            "recurrence_seconds": parsed_reminder["recurrence_seconds"],
+            "recurrence_anchor_day": parsed_reminder["recurrence_anchor_day"],
+        }
+        result = create_pm_reminder(payload)
+        if result.get("status") != "ok":
+            send_whatsapp_text(
+                phone_id, sender_wa, "The reminder could not be created."
+            )
+            return False
+        config = _mu15_sender_datetime_configuration(sender_wa)
+        displayed = format_configured_datetime(
+            result["next_run"],
+            config["timezone"],
+            config["date_display"],
+            config["time_format"],
+        )
+        recurrence_note = (
+            f" Recurs {result['recurrence_rule']}."
+            if result.get("recurring")
+            else ""
+        )
+        send_whatsapp_text(
+            phone_id,
+            sender_wa,
+            f"Reminder #{result['id']} scheduled for {displayed}.{recurrence_note}",
+        )
+        return True
+
+    def _mu15_persist_datetime_clarification(
+        message: dict,
+        sender_wa: str,
+        raw_text: str,
+        config: dict,
+        options: list[dict],
+        match_span: tuple[int, int],
+    ) -> dict:
+        client_id, project_code = _conversation_scope(sender_wa)
+        identity = str(message.get("id") or message.get("timestamp") or raw_text)
+        key = "reminder-datetime:" + hashlib.sha256(
+            f"{sender_wa}|{identity}".encode("utf-8")
+        ).hexdigest()
+        return save_pending_conversation_state({
+            "client_id": client_id,
+            "sender": sender_wa,
+            "project_code": project_code,
+            "state_kind": "clarification",
+            "expected_field": "calendar_date",
+            "original_request": raw_text,
+            "structured_context": {
+                "timezone": config["timezone"],
+                "match_start": match_span[0],
+                "match_end": match_span[1],
+            },
+            "candidate_metadata": {"date_candidates": options},
+            "continuation": {"kind": "reminder_datetime"},
+            "continuation_key": key,
+        })
+
+    def _mu15_send_date_choices(sender_wa: str, options: list[dict]) -> None:
+        lines = ["That date is ambiguous. Reply with the intended date:"]
+        lines.extend(f"- {option['label']}" for option in options)
+        send_whatsapp_text(phone_id, sender_wa, "\n".join(lines))
+
+    def _mu15_existing_datetime_clarification(
+        state: dict,
+        raw_text: str,
+    ) -> bool:
+        continuation = state.get("continuation") or {}
+        if continuation.get("kind") != "reminder_datetime":
+            return False
+        if has_deterministic_normal_route_recognition(raw_text):
+            return False
+        touched = touch_conversation_state_activity(
+            state["id"], state["sender"], state["client_id"],
+            state.get("project_code"),
+        )
+        if touched.get("status_result") != "touched":
+            return True
+        options = (state.get("candidate_metadata") or {}).get("date_candidates") or []
+        normalized = str(raw_text or "").strip().lower()
+        selected = next(
+            (
+                option for option in options
+                if normalized == option.get("date_order", "").replace("_", " ")
+            ),
+            None,
+        )
+        if selected is None:
+            reference_date = _inspection_reference_date(
+                (state.get("structured_context") or {}).get("timezone")
+            )
+            result = _CORE_CONVERSATION.interpret_core(
+                ConversationRequest(
+                    capability="shared_datetime",
+                    text=raw_text or "",
+                    context={
+                        "candidate": "calendar_date",
+                        "reference_date": reference_date.isoformat(),
+                    },
+                )
+            )
+            if result.handled and result.metadata.get("valid"):
+                selected_id = dt.date(
+                    result.metadata["year"],
+                    result.metadata["month"],
+                    result.metadata["day"],
+                ).isoformat()
+                selected = next(
+                    (option for option in options if option.get("id") == selected_id),
+                    None,
+                )
+        if selected is None:
+            _mu15_send_date_choices(state["sender"], options)
+            return True
+
+        claimed = claim_conversation_state_continuation(
+            state["id"], state["sender"], state["client_id"],
+            state.get("project_code"),
+        )
+        if claimed.get("status_result") != "claimed":
+            return True
+        context = claimed.get("structured_context") or {}
+        original = claimed.get("original_request") or ""
+        try:
+            start = int(context["match_start"])
+            end = int(context["match_end"])
+        except (KeyError, TypeError, ValueError):
+            advance_conversation_state_continuation(
+                claimed["id"], claimed["sender"], claimed["client_id"],
+                claimed.get("project_code"), claimed.get("expected_field"),
+            )
+            return True
+        completed_text = original[:start] + selected["id"] + original[end:]
+        config = _mu15_sender_datetime_configuration(claimed["sender"])
+        parsed = parse_pm_reminder_request(
+            completed_text,
+            timezone_name=config["timezone"],
+            date_order=config["date_order"],
+        )
+        if parsed and _mu15_execute_reminder_creation(
+            claimed["sender"], original, parsed,
+        ):
+            resolve_conversation_state(
+                claimed["id"], claimed["sender"], claimed["client_id"],
+                claimed.get("project_code"),
+            )
+        else:
+            advance_conversation_state_continuation(
+                claimed["id"], claimed["sender"], claimed["client_id"],
+                claimed.get("project_code"), claimed.get("expected_field"),
+            )
+        return True
 
     def _mu13_message_continuation_key(
         message: dict,
@@ -3235,6 +3495,15 @@ def webhook():
             if (
                 active_conversation_state
                 and active_conversation_state.get("state_kind") == "clarification"
+                and _mu15_existing_datetime_clarification(
+                    active_conversation_state,
+                    text,
+                )
+            ):
+                return ("", 200)
+            if (
+                active_conversation_state
+                and active_conversation_state.get("state_kind") == "clarification"
             ):
                 if _mu13_existing_reminder_clarification(
                     active_conversation_state,
@@ -3256,22 +3525,42 @@ def webhook():
                     return ("", 200)
 
             if classify_pm_reminder(text):
-                sender_timezone = "America/New_York"
-                with DBSession() as s:
-                    sender_user = (
-                        s.query(User)
-                        .filter(
-                            User.wa_id == sender,
-                            User.active == True,
+                datetime_config = _mu15_sender_datetime_configuration(sender)
+                sender_timezone = datetime_config["timezone"]
+                reference_date = _inspection_reference_date(sender_timezone)
+                date_options = (
+                    ambiguous_calendar_date_options(text, reference_date)
+                    if datetime_config["date_order"] is None
+                    else []
+                )
+                if date_options:
+                    ambiguous_result = _CORE_CONVERSATION.interpret_core(
+                        ConversationRequest(
+                            capability="shared_datetime",
+                            text=text,
+                            context={
+                                "candidate": "calendar_date",
+                                "reference_date": reference_date.isoformat(),
+                            },
                         )
-                        .first()
                     )
-                    if sender_user and sender_user.timezone:
-                        sender_timezone = sender_user.timezone
+                    metadata = ambiguous_result.metadata
+                    state = _mu15_persist_datetime_clarification(
+                        m,
+                        sender,
+                        text,
+                        datetime_config,
+                        date_options,
+                        (int(metadata["match_start"]), int(metadata["match_end"])),
+                    )
+                    if state.get("active"):
+                        _mu15_send_date_choices(sender, date_options)
+                    return ("", 200)
 
                 parsed_reminder = parse_pm_reminder_request(
                     text,
                     timezone_name=sender_timezone,
+                    date_order=datetime_config["date_order"],
                 )
                 if not parsed_reminder:
                     send_whatsapp_text(
@@ -3285,63 +3574,7 @@ def webhook():
                     )
                     return ("", 200)
 
-                user_info = get_user_role(sender) or {}
-                payload = {
-                    "pm_wa": sender,
-                    "recipient_wa": sender,
-                    "project_code": user_info.get("project_code"),
-                    # Store the inbound text without stripping or rewriting.
-                    "text": text,
-                    "rule": parsed_reminder["rule"],
-                    "timezone": parsed_reminder["timezone"],
-                    "next_run": parsed_reminder["next_run"],
-                    "recurring": parsed_reminder["recurring"],
-                    "recurrence_rule": parsed_reminder[
-                        "recurrence_rule"
-                    ],
-                    "recurrence_interval": parsed_reminder[
-                        "recurrence_interval"
-                    ],
-                    "recurrence_seconds": parsed_reminder[
-                        "recurrence_seconds"
-                    ],
-                    "recurrence_anchor_day": parsed_reminder[
-                        "recurrence_anchor_day"
-                    ],
-                }
-                result = create_pm_reminder(payload)
-
-                if result.get("status") != "ok":
-                    send_whatsapp_text(
-                        phone_id,
-                        sender,
-                        "The reminder could not be created.",
-                    )
-                    return ("", 200)
-
-                try:
-                    owner_tz = ZoneInfo(sender_timezone)
-                except Exception:
-                    owner_tz = ZoneInfo("America/New_York")
-
-                next_local = result["next_run"].replace(
-                    tzinfo=dt.timezone.utc
-                ).astimezone(owner_tz)
-
-                recurrence_note = (
-                    f" Recurs {result['recurrence_rule']}."
-                    if result.get("recurring")
-                    else ""
-                )
-                send_whatsapp_text(
-                    phone_id,
-                    sender,
-                    (
-                        f"Reminder #{result['id']} scheduled for "
-                        f"{next_local.strftime('%A, %B %d, %Y at %I:%M %p')}."
-                        f"{recurrence_note}"
-                    ),
-                )
+                _mu15_execute_reminder_creation(sender, text, parsed_reminder)
                 return ("", 200)
 
         # >>> FEATURE_3_REMINDER_WEBHOOK_END <<<
@@ -3663,30 +3896,14 @@ def webhook():
         # >>> PATCH_1_INSPECTION_WEBHOOK_START — INSPECTOR SCHEDULING V6.1 <<<
 
         if text and classify_inspection(text):
-            sender_timezone = "America/New_York"
-
-            with DBSession() as s:
-                sender_user = (
-                    s.query(User)
-                    .filter(
-                        User.wa_id == sender,
-                        User.active == True,
-                    )
-                    .first()
-                )
-
-                if (
-                    sender_user
-                    and sender_user.timezone
-                ):
-                    sender_timezone = (
-                        sender_user.timezone
-                    )
+            datetime_config = _mu15_sender_datetime_configuration(sender)
+            sender_timezone = datetime_config["timezone"]
 
             parsed_inspection = (
                 parse_inspection_request(
                     text,
                     timezone_name=sender_timezone,
+                    date_order=datetime_config["date_order"],
                 )
             )
 

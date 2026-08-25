@@ -420,13 +420,56 @@ class CoreConversation:
                     )
 
                 numeric_match = re.search(
-                    r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b",
+                    r"(?<!\d)(\d{1,2})([/.-])(\d{1,2})"
+                    r"(?:\2(\d{2,4}))?(?!\d)",
                     text,
                 )
                 if numeric_match:
-                    month = int(numeric_match.group(1))
-                    day = int(numeric_match.group(2))
-                    year_text = numeric_match.group(3)
+                    first = int(numeric_match.group(1))
+                    second = int(numeric_match.group(3))
+                    year_text = numeric_match.group(4)
+                    configured_order = str(
+                        request.context.get("date_order") or ""
+                    ).strip().lower()
+                    if configured_order not in ("month_first", "day_first"):
+                        configured_order = ""
+
+                    if first > 12 and second <= 12:
+                        day, month = first, second
+                    elif second > 12 and first <= 12:
+                        month, day = first, second
+                    elif first <= 12 and second <= 12:
+                        if not configured_order:
+                            metadata = calendar_date_metadata(
+                                numeric_match,
+                                valid=False,
+                            )
+                            metadata.update({
+                                "ambiguous": True,
+                                "first": first,
+                                "second": second,
+                                "year": int(year_text) if year_text else reference_date.year,
+                                "year_supplied": bool(year_text),
+                                "separator": numeric_match.group(2),
+                            })
+                            return ConversationResult(
+                                handled=True,
+                                object_type="date",
+                                metadata=metadata,
+                            )
+                        if configured_order == "day_first":
+                            day, month = first, second
+                        else:
+                            month, day = first, second
+                    else:
+                        return ConversationResult(
+                            handled=True,
+                            object_type="date",
+                            metadata=calendar_date_metadata(
+                                numeric_match,
+                                valid=False,
+                            ),
+                        )
                     year = (
                         int(year_text)
                         if year_text
@@ -472,6 +515,38 @@ class CoreConversation:
                     "december": 12,
                 }
                 month_names = "|".join(month_numbers)
+                day_month_match = re.search(
+                    rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+"
+                    rf"({month_names})(?:,?\s+(\d{{4}}))?\b",
+                    text,
+                )
+                if day_month_match:
+                    day = int(day_month_match.group(1))
+                    month = month_numbers[day_month_match.group(2)]
+                    year_text = day_month_match.group(3)
+                    year = int(year_text) if year_text else reference_date.year
+                    try:
+                        target_date = dt.date(year, month, day)
+                    except ValueError:
+                        return ConversationResult(
+                            handled=True,
+                            object_type="date",
+                            metadata=calendar_date_metadata(
+                                day_month_match,
+                                valid=False,
+                            ),
+                        )
+                    if not year_text and target_date < reference_date:
+                        target_date = dt.date(year + 1, month, day)
+                    return ConversationResult(
+                        handled=True,
+                        object_type="date",
+                        metadata=calendar_date_metadata(
+                            day_month_match,
+                            target_date=target_date,
+                        ),
+                    )
+
                 month_date_year_separator = str(
                     request.context.get("month_date_year_separator") or ""
                 ).strip().lower()
@@ -623,15 +698,43 @@ class CoreConversation:
                 hour, minute = 0, 0
             else:
                 match = re.search(
-                    r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+                    r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))\s*(am|pm)?\b"
+                    r"|\b(?:at\s+)?(\d{1,2})\s*(am|pm)\b"
+                    r"|\bat\s+(\d{1,2})\b",
                     text,
                 )
                 if not match:
-                    return ConversationResult()
+                    number_words = {
+                        "one": 1, "two": 2, "three": 3, "four": 4,
+                        "five": 5, "six": 6, "seven": 7, "eight": 8,
+                        "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+                    }
+                    word_match = re.search(
+                        r"\b(?:at\s+)(one|two|three|four|five|six|seven|"
+                        r"eight|nine|ten|eleven|twelve)\b",
+                        text,
+                    )
+                    quarter_match = re.search(
+                        r"\bquarter\s+past\s+(one|two|three|four|five|six|"
+                        r"seven|eight|nine|ten|eleven|twelve)\b",
+                        text,
+                    )
+                    selected = quarter_match or word_match
+                    if not selected:
+                        return ConversationResult()
+                    hour = number_words[selected.group(1)]
+                    minute = 15 if quarter_match else 0
+                    meridiem = None
+                else:
+                    hour = int(match.group(1) or match.group(4) or match.group(6))
+                    minute = int(match.group(2) or 0)
+                    meridiem = match.group(3) or match.group(5)
 
-                hour = int(match.group(1))
-                minute = int(match.group(2) or 0)
-                meridiem = match.group(3)
+                if not meridiem:
+                    if re.search(r"\b(?:afternoon|evening|tonight)\b", text):
+                        meridiem = "pm"
+                    elif re.search(r"\bmorning\b", text):
+                        meridiem = "am"
 
                 if minute > 59:
                     return ConversationResult()

@@ -66,6 +66,9 @@ class User(Base):
     active = Column(Boolean, default=True)
 
     timezone = Column(String(64), default="America/New_York")  # default timezone
+    date_order = Column(String(16), default="month_first")
+    time_format = Column(String(8), default="12h")
+    date_display = Column(String(16), default="month_first")
 
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow,
@@ -1763,6 +1766,31 @@ def _repair_pm_project_map():
                 "ON pm_project_map (client_id)"
             ))
 
+
+def _repair_users_datetime_configuration():
+    """Add MU15 sender date/time configuration without breaking US defaults."""
+    insp = inspect(ENGINE)
+    if "users" not in insp.get_table_names():
+        return
+    existing = {c["name"] for c in insp.get_columns("users")}
+    additions = {
+        "date_order": "VARCHAR(16)",
+        "time_format": "VARCHAR(8)",
+        "date_display": "VARCHAR(16)",
+    }
+    with ENGINE.begin() as conn:
+        for column_name, column_type in additions.items():
+            if column_name not in existing:
+                conn.execute(text(
+                    f"ALTER TABLE users ADD COLUMN {column_name} {column_type}"
+                ))
+        conn.execute(text(
+            "UPDATE users SET "
+            "date_order = COALESCE(NULLIF(date_order, ''), 'month_first'), "
+            "time_format = COALESCE(NULLIF(time_format, ''), '12h'), "
+            "date_display = COALESCE(NULLIF(date_display, ''), 'month_first')"
+        ))
+
 # >>> FEATURE_3_REMINDER_SCHEMA_REPAIR_START — BACKWARD COMPATIBILITY V6.1 <<<
 
 def _repair_pm_reminders():
@@ -1902,6 +1930,11 @@ def init_db():
 
     try:
         _repair_pm_project_map()
+    except Exception:
+        pass
+
+    try:
+        _repair_users_datetime_configuration()
     except Exception:
         pass
 
