@@ -954,6 +954,141 @@ def format_configured_datetime(
     return local_value.strftime(f"{date_pattern} {time_pattern}")
 
 
+_NATURAL_ORDER_REQUIRED_FIELDS = (
+    "item",
+    "quantity",
+    "delivery_date",
+    "drop_location",
+)
+
+
+def parse_natural_order(
+    text: str,
+    project_code: Optional[str] = None,
+) -> Optional[dict]:
+    """Extract natural order meaning without performing business mutation."""
+    raw = str(text or "").strip()
+    command = re.match(
+        r"^(?:please\s+)?(?:order|get\s+me|arrange\s+delivery\s+of)\s+",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not command:
+        return None
+    body = raw[command.end():].strip()
+    if project_code:
+        body = re.sub(
+            rf"\s+for\s+(?:project\s+)?{re.escape(str(project_code))}\b",
+            " ",
+            body,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    fields = {
+        "item": None,
+        "quantity": None,
+        "supplier": None,
+        "delivery_date": None,
+        "drop_location": None,
+    }
+    drop_match = re.search(
+        r"\bto\s+(?:the\s+)?(.+?)\s*$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if drop_match:
+        fields["drop_location"] = drop_match.group(1).strip(" .,")
+        body = body[:drop_match.start()].strip()
+
+    delivery_match = re.search(
+        r"\bfor\s+delivery\s+(?:on\s+)?(.+?)\s*$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if delivery_match:
+        fields["delivery_date"] = delivery_match.group(1).strip(" .,")
+        body = body[:delivery_match.start()].strip()
+
+    supplier_match = re.search(
+        r"\bfrom\s+(.+?)\s*$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if supplier_match:
+        fields["supplier"] = supplier_match.group(1).strip(" .,")
+        body = body[:supplier_match.start()].strip()
+
+    quantity_match = re.match(
+        r"^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?(?:\s+of)?\s+(.+)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if quantity_match:
+        number = quantity_match.group(1)
+        unit = quantity_match.group(2)
+        fields["quantity"] = f"{number} {unit}".strip() if unit else number
+        fields["item"] = quantity_match.group(3).strip(" .,")
+    elif body:
+        fields["item"] = body.strip(" .,")
+
+    missing = [
+        field for field in _NATURAL_ORDER_REQUIRED_FIELDS
+        if not fields.get(field)
+    ]
+    return {
+        "intent": "order",
+        "action": "create",
+        "fields": fields,
+        "missing_fields": missing,
+    }
+
+
+def parse_natural_meeting(
+    text: str,
+    timezone_name: str = "America/New_York",
+    date_order: Optional[str] = "month_first",
+    now_local: Optional[dt.datetime] = None,
+) -> Optional[dict]:
+    """Return structured Meeting meaning for the existing Meeting handler."""
+    recognized = _CORE_CONVERSATION.interpret_core(
+        ConversationRequest(
+            capability="core_recognition",
+            text=text or "",
+            context={"candidate": "meeting_creation"},
+        )
+    )
+    if not recognized.handled:
+        return None
+    parsed_schedule = parse_pm_reminder_request(
+        f"Remind me {text}",
+        timezone_name=timezone_name,
+        now_local=now_local,
+        date_order=date_order,
+    )
+    if not parsed_schedule:
+        return None
+    title_body = re.sub(
+        r"^(?:please\s+)?(?:schedule|book|set\s+up|arrange|create)\s+",
+        "",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    title_body = re.split(
+        r"\b(?:today|tomorrow|on\s+\d|on\s+(?:monday|tuesday|wednesday|"
+        r"thursday|friday|saturday|sunday)|at\s+)\b",
+        title_body,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" .,")
+    return {
+        "intent": "meeting",
+        "action": "create",
+        "title": title_body or "Site Meeting",
+        "scheduled_for": parsed_schedule["next_run"],
+        "timezone": parsed_schedule["timezone"],
+    }
+
+
 def parse_pm_reminder_snooze_until(
     text: str,
     timezone_name: str,
@@ -1829,6 +1964,100 @@ def webhook():
                 out[k.strip()] = v.strip()
         return out
 
+    def _natural_order_task_text(
+        fields: dict,
+        expected_field: Optional[str] = None,
+    ) -> str:
+        labels = {
+            "item": "Item",
+            "quantity": "Quantity",
+            "supplier": "Supplier",
+            "delivery_date": "Delivery Date",
+            "drop_location": "Drop Location",
+        }
+        lines = []
+        if expected_field:
+            lines.append(f"[await:{expected_field}]")
+        for field in (
+            "item", "quantity", "supplier", "delivery_date", "drop_location"
+        ):
+            if fields.get(field):
+                lines.append(f"{labels[field]}: {fields[field]}")
+        return "\n".join(lines)
+
+    def _natural_order_prompt(field: str) -> str:
+        return {
+            "item": "What item should be ordered?",
+            "quantity": "What quantity is required?",
+            "delivery_date": "What delivery date is required?",
+            "drop_location": "Where should it be delivered on site?",
+        }.get(field, "What information is missing?")
+
+    def _run_natural_order_continuation(
+        awaiting,
+        raw_txt: str,
+        pending_state: dict,
+        session,
+    ) -> bool:
+        context = dict(pending_state.get("structured_context") or {})
+        if context.get("kind") != "natural_order":
+            return False
+        claimed = claim_conversation_state_continuation(
+            pending_state["id"], pending_state["sender"],
+            pending_state["client_id"], pending_state.get("project_code"),
+        )
+        if claimed.get("status_result") != "claimed":
+            return True
+        expected_field = str(claimed.get("expected_field") or "").strip()
+        fields = dict((claimed.get("structured_context") or {}).get("order_fields") or {})
+        value = str(raw_txt or "").strip()
+        if expected_field not in _NATURAL_ORDER_REQUIRED_FIELDS or not value:
+            advance_conversation_state_continuation(
+                claimed["id"], claimed["sender"], claimed["client_id"],
+                claimed.get("project_code"), expected_field,
+                structured_context=claimed.get("structured_context") or {},
+            )
+            send_whatsapp_text(
+                phone_id, claimed["sender"], _natural_order_prompt(expected_field)
+            )
+            return True
+        fields[expected_field] = value
+        missing = [
+            field for field in _NATURAL_ORDER_REQUIRED_FIELDS
+            if not fields.get(field)
+        ]
+        next_context = dict(claimed.get("structured_context") or {})
+        next_context["order_fields"] = fields
+        next_context["missing_fields"] = missing
+        if missing:
+            next_field = missing[0]
+            awaiting.text = _natural_order_task_text(fields, next_field)
+            awaiting.last_updated = dt.datetime.utcnow()
+            session.commit()
+            advance_conversation_state_continuation(
+                claimed["id"], claimed["sender"], claimed["client_id"],
+                claimed.get("project_code"), next_field,
+                structured_context=next_context,
+            )
+            send_whatsapp_text(
+                phone_id, claimed["sender"], _natural_order_prompt(next_field)
+            )
+            return True
+        awaiting.text = _natural_order_task_text(fields)
+        awaiting.status = "pending_approval"
+        awaiting.last_updated = dt.datetime.utcnow()
+        session.commit()
+        resolve_conversation_state(
+            claimed["id"], claimed["sender"], claimed["client_id"],
+            claimed.get("project_code"),
+        )
+        send_whatsapp_text(
+            phone_id,
+            claimed["sender"],
+            "✅ Order details captured. Awaiting PM approval.",
+        )
+        return True
+
     # -----------------------------------------------------------------
     # END OF BLOCK 4 — NEXT: ORDER BUTTON ENGINE (BLOCK 5)
     # -----------------------------------------------------------------
@@ -1954,6 +2183,15 @@ def webhook():
         if classify_inspection(t):
             return True
         if classify_delay(t):
+            return True
+        meeting_recognition = _CORE_CONVERSATION.interpret_core(
+            ConversationRequest(
+                capability="core_recognition",
+                text=t,
+                context={"candidate": "meeting_creation"},
+            )
+        )
+        if meeting_recognition.handled:
             return True
 
         return False
@@ -3731,6 +3969,11 @@ def webhook():
                     raw_txt = (text or "").strip()
                     await_lower = (awaiting.text or "").lower()
 
+                    if _run_natural_order_continuation(
+                        awaiting, raw_txt, pending_state, s,
+                    ):
+                        return ("", 200)
+
                     # ------------------------------
                     # ORDER AWAIT CHAINS
                     # ------------------------------
@@ -3892,6 +4135,34 @@ def webhook():
         if text and is_search_request(text):
             run_search(sender, text)
             return ("", 200)
+
+        # -------------------------------------------------------------
+        # NATURAL MEETING ROUTING
+        # -------------------------------------------------------------
+        if text:
+            datetime_config = _mu15_sender_datetime_configuration(sender)
+            meeting_meaning = parse_natural_meeting(
+                text,
+                timezone_name=datetime_config["timezone"],
+                date_order=datetime_config["date_order"],
+            )
+            if meeting_meaning:
+                user_info = get_user_role(sender) or {}
+                result = create_meeting(
+                    meeting_meaning["title"],
+                    user_info.get("project_code"),
+                    user_info.get("subcontractor_name"),
+                    None,
+                    meeting_meaning["scheduled_for"],
+                    [],
+                    sender,
+                )
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    f"Meeting #{result['id']} scheduled.",
+                )
+                return ("", 200)
 
         # >>> PATCH_1_INSPECTION_WEBHOOK_START — INSPECTOR SCHEDULING V6.1 <<<
 
@@ -4196,9 +4467,47 @@ def webhook():
                     pass
                 return ("", 200)
 
-            # No buttons → start await:item
+            natural_order = parse_natural_order(text or "", project_code)
+
+            # No buttons → preserve supplied fields and ask only for missing.
             with DBSession() as s:
                 t = s.get(Task, new_row["id"])
+                if t and natural_order:
+                    fields = natural_order["fields"]
+                    missing = natural_order["missing_fields"]
+                    if not missing:
+                        t.text = _natural_order_task_text(fields)
+                        t.status = "pending_approval"
+                        t.last_updated = dt.datetime.utcnow()
+                        s.commit()
+                        send_whatsapp_text(
+                            phone_id,
+                            sender,
+                            "✅ Order details captured. Awaiting PM approval.",
+                        )
+                        return ("", 200)
+                    expected_field = missing[0]
+                    original_request = t.text or ""
+                    t.text = _natural_order_task_text(fields, expected_field)
+                    s.commit()
+                    _save_await_conversation_state(
+                        t.id,
+                        t.sender,
+                        t.project_code,
+                        t.text or "",
+                        original_request,
+                        structured_context={
+                            "source_record_id": t.id,
+                            "classification": cls,
+                            "kind": "natural_order",
+                            "order_fields": fields,
+                            "missing_fields": missing,
+                        },
+                    )
+                    send_whatsapp_text(
+                        phone_id, sender, _natural_order_prompt(expected_field)
+                    )
+                    return ("", 200)
                 if t and not (t.text or "").lower().startswith("[await:item]"):
                     original_request = t.text or ""
                     t.text = f"[await:item]\n{original_request}"

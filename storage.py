@@ -1499,6 +1499,7 @@ def advance_conversation_state_continuation(
     project_code: Optional[str],
     expected_field: Optional[str],
     now_utc: Optional[dt.datetime] = None,
+    structured_context: Optional[dict] = None,
 ) -> dict:
     """Return a claimed continuation to active state for its next field."""
     try:
@@ -1531,12 +1532,17 @@ def advance_conversation_state_continuation(
             q = q.filter(ConversationState.project_code == normalized_project)
 
         now_utc = now_utc or dt.datetime.utcnow()
+        updates = {
+            ConversationState.status: "active",
+            ConversationState.expected_field: expected_field,
+            ConversationState.updated_at: now_utc,
+        }
+        if structured_context is not None:
+            updates[ConversationState.structured_context_json] = (
+                _conversation_state_json(structured_context)
+            )
         updated = q.update(
-            {
-                ConversationState.status: "active",
-                ConversationState.expected_field: expected_field,
-                ConversationState.updated_at: now_utc,
-            },
+            updates,
             synchronize_session=False,
         )
         if updated != 1:

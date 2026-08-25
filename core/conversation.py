@@ -758,6 +758,20 @@ class CoreConversation:
         if request.capability != "core_recognition":
             return ConversationResult()
 
+        if candidate == "meeting_creation":
+            text = str(request.text or "").strip().lower()
+            handled = bool(re.match(
+                r"^(?:please\s+)?(?:schedule|book|set\s+up|arrange|create)\s+"
+                r"(?:an?\s+)?(?:site\s+|project\s+)?meeting\b",
+                text,
+            ))
+            return ConversationResult(
+                handled=handled,
+                intent="meeting" if handled else "",
+                action="create" if handled else "",
+                object_type="meeting" if handled else "",
+            )
+
         if candidate == "pm_reminder_lifecycle":
             text = (request.text or "").lower().strip()
             if not text:
