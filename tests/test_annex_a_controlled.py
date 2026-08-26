@@ -139,6 +139,67 @@ class AnnexAControlledFixture(unittest.TestCase):
             self.assertEqual(item.current_qty, 5)
             self.assertEqual(item.client_id, 20)
 
+    def test_stock_await_compatibility_paths_complete_once(self):
+        stock_unit = self.make_await(
+            "stock_unit",
+            "kind=add;qty=4;material=Mixed Case Await Cement",
+        )
+        self.send("bags", "legacy-stock-unit")
+        with storage.SessionLocal() as session:
+            row = session.get(storage.Task, stock_unit["id"])
+            self.assertEqual(row.status, "done")
+            item = session.query(storage.StockItem).filter(
+                storage.StockItem.client_id == 20,
+                storage.StockItem.name == "Mixed Case Await Cement",
+            ).one()
+            self.assertEqual(item.current_qty, 4.0)
+            movements = session.query(storage.StockMovement).filter(
+                storage.StockMovement.stock_item_id == item.id
+            ).all()
+            self.assertEqual(len(movements), 1)
+            self.assertEqual(movements[0].qty_change, 4.0)
+
+        self.send(
+            "Add new stock item: RTW6 Await Aggregate",
+            "new-stock-await-start",
+        )
+        with storage.SessionLocal() as session:
+            pending = session.query(storage.Task).filter(
+                storage.Task.status == "open",
+                storage.Task.text.ilike("[await:new_stock_unit]%"),
+            ).one()
+            state = session.query(storage.ConversationState).filter(
+                storage.ConversationState.active == True
+            ).one()
+            self.assertEqual(state.expected_field, "new_stock_unit")
+            state_id = state.id
+
+        self.send("bags", "new-stock-await-unit")
+        with storage.SessionLocal() as session:
+            row = session.get(storage.Task, pending.id)
+            self.assertTrue(row.text.startswith("[await:new_stock_qty]"))
+            state = session.get(storage.ConversationState, state_id)
+            self.assertTrue(state.active)
+            self.assertEqual(state.expected_field, "new_stock_qty")
+
+        self.send("6", "new-stock-await-quantity")
+        with storage.SessionLocal() as session:
+            row = session.get(storage.Task, pending.id)
+            self.assertEqual(row.status, "done")
+            state = session.get(storage.ConversationState, state_id)
+            self.assertFalse(state.active)
+            self.assertEqual(state.status, "resolved")
+            item = session.query(storage.StockItem).filter(
+                storage.StockItem.client_id == 20,
+                storage.StockItem.name == "rtw6 await aggregate",
+            ).one()
+            self.assertEqual(item.current_qty, 6.0)
+            movements = session.query(storage.StockMovement).filter(
+                storage.StockMovement.stock_item_id == item.id
+            ).all()
+            self.assertEqual(len(movements), 1)
+            self.assertEqual(movements[0].qty_change, 6.0)
+
     def test_await_bypass_resume_cancel_restart_and_abandonment(self):
         stock = self.make_await(
             "new_stock_qty", "material=grout;unit=bags"
@@ -318,8 +379,28 @@ class AnnexAControlledFixture(unittest.TestCase):
             self.assertEqual(cancelled.status, "cancelled")
         self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
 
-    def test_retired_await_bypass_new_stock_item_route(self):
+    def test_retired_await_bypass_stock_routes(self):
+        existing = storage.create_stock_item({
+            "name": "Retained Await Mixed Case Cement",
+            "unit": "bags",
+            "actor": self.sender,
+            "project_code": "PROJECT_A1",
+        })
         legacy, retired = self.make_retired_legacy_order_await()
+        self.send(
+            "Add 2 bags of retained await mixed case cement to stock",
+            "retired-await-direct-stock",
+        )
+        with storage.SessionLocal() as session:
+            item = session.get(storage.StockItem, existing["id"])
+            self.assertEqual(item.current_qty, 2.0)
+            movements = session.query(storage.StockMovement).filter(
+                storage.StockMovement.stock_item_id == existing["id"]
+            ).all()
+            self.assertEqual(len(movements), 1)
+            self.assertEqual(movements[0].qty_change, 2.0)
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
+
         self.send("Add new stock item: grout", "retired-await-new-stock")
         with storage.SessionLocal() as session:
             stock_await = session.query(storage.Task).filter(

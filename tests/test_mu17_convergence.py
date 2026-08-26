@@ -169,6 +169,72 @@ class MU17WebhookConvergenceTests(unittest.TestCase):
             self.assertEqual([(row.client_id, row.current_qty) for row in rows],
                              [(10, 10.0), (11, 3.0)])
 
+    def test_natural_stock_case_variants_reuse_client_catalogue_identity(self):
+        mixed_name = "RTW6-50AA0DF STOCK FIXTURE CEMENT"
+        own = storage.create_stock_item({
+            "name": mixed_name,
+            "unit": "bags",
+            "opening_qty": 100,
+            "actor": self.sender_a,
+            "project_code": "PROJECT_A1",
+        })
+        foreign = storage.create_stock_item({
+            "name": mixed_name,
+            "unit": "bags",
+            "opening_qty": 40,
+            "actor": self.sender_b,
+            "project_code": "PROJECT_A1",
+        })
+
+        with storage.SessionLocal() as session:
+            task_count = session.query(storage.Task).count()
+            own_movements = session.query(storage.StockMovement).filter(
+                storage.StockMovement.stock_item_id == own["id"]
+            ).count()
+
+        commands = (
+            "Add 2 bags of rtw6-50aa0df stock fixture cement to stock",
+            "Add 3 bags of RTW6-50AA0DF STOCK FIXTURE CEMENT to stock",
+        )
+        for index, command in enumerate(commands):
+            self.assertEqual(self.send(
+                self.sender_a, command, f"stock-case-{index}"
+            ).status_code, 200)
+            with storage.SessionLocal() as session:
+                own_row = session.get(storage.StockItem, own["id"])
+                foreign_row = session.get(storage.StockItem, foreign["id"])
+                self.assertEqual(session.query(storage.StockItem).filter(
+                    storage.StockItem.client_id == 10
+                ).count(), 1)
+                self.assertEqual(own_row.current_qty, 102.0 + (3.0 * index))
+                self.assertEqual(foreign_row.current_qty, 40.0)
+                movements = session.query(storage.StockMovement).filter(
+                    storage.StockMovement.stock_item_id == own["id"]
+                ).order_by(storage.StockMovement.id.asc()).all()
+                self.assertEqual(len(movements), own_movements + index + 1)
+                self.assertEqual(movements[-1].qty_change, 2.0 + index)
+                self.assertEqual(session.query(storage.Task).count(), task_count)
+
+        self.assertEqual(self.send(
+            self.sender_a,
+            "Add 4 bags of rtw6-50aa0df genuinely new aggregate to stock",
+            "stock-new-name",
+        ).status_code, 200)
+        with storage.SessionLocal() as session:
+            own_rows = session.query(storage.StockItem).filter(
+                storage.StockItem.client_id == 10
+            ).all()
+            self.assertEqual(len(own_rows), 2)
+            created = next(row for row in own_rows if row.id != own["id"])
+            self.assertEqual(created.name, "rtw6-50aa0df genuinely new aggregate")
+            self.assertEqual(created.current_qty, 4.0)
+            movements = session.query(storage.StockMovement).filter(
+                storage.StockMovement.stock_item_id == created.id
+            ).all()
+            self.assertEqual(len(movements), 1)
+            self.assertEqual(movements[0].qty_change, 4.0)
+            self.assertEqual(session.query(storage.Task).count(), task_count)
+
     def test_cross_client_delay_numeric_id_is_denied(self):
         foreign = storage.create_task(
             self.sender_b, "Framing", tag="task", project_code="PROJECT_A1"

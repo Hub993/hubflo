@@ -11,7 +11,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, text
 
 # ---------------------------------------------------------------------
 # DB bootstrap
@@ -2521,7 +2521,7 @@ def _get_or_create_stock_item(
 
     q = s.query(StockItem).filter(
         StockItem.client_id == int(client_id),
-        StockItem.name == name_norm,
+        func.lower(StockItem.name) == name_norm.lower(),
     )
     if project_code:
         q = q.filter(StockItem.project_code == project_code)

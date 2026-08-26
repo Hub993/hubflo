@@ -1886,7 +1886,7 @@ def webhook():
         # Apply delta
         delta = qty_val if kind == "add" else -qty_val
         adjust_stock({
-            "material": material,
+            "name": material,
             "unit": unit,
             "delta": delta,
             "actor": sender,
@@ -4270,7 +4270,7 @@ def webhook():
             delta = qty_val if stock_cmd["kind"] == "add" else -qty_val
 
             adjust_stock({
-                "material": stock_cmd["material"],
+                "name": stock_cmd["material"],
                 "unit": stock_cmd["unit"],
                 "delta": delta,
                 "actor": sender,
