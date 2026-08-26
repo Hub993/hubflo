@@ -103,6 +103,33 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             state = session.query(storage.ConversationState).one()
             return original, order.id, state.id
 
+    def make_retired_legacy_order_await(self):
+        task = storage.create_task(
+            self.sender,
+            "[await:item]\nRetained legacy order",
+            tag="order",
+            project_code="PROJECT_A1",
+        )
+        state = storage.save_pending_conversation_state({
+            "client_id": 9,
+            "sender": self.sender,
+            "project_code": "PROJECT_A1",
+            "state_kind": "await",
+            "expected_field": "item",
+            "original_request": "Retained legacy order",
+            "structured_context": {"source_record_id": task["id"]},
+            "candidate_metadata": {},
+            "continuation": {
+                "source_record_id": task["id"],
+                "source_record_type": "pending_business_state",
+            },
+            "continuation_key": f"business-state:{task['id']}",
+        })
+        storage.retire_conversation_state(
+            state["id"], self.sender, 9, "PROJECT_A1", "cancelled"
+        )
+        return task, state
+
     def test_complete_order_mutates_once_without_clarification(self):
         text = (
             "Order 20 bags of cement from Buildit for PROJECT_A1 "
@@ -125,19 +152,9 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             self.assertIn("Drop Location: north gate", orders[0].text)
             self.assertEqual(session.query(storage.ConversationState).count(), 0)
 
-    def test_complete_orders_bypass_unrelated_pending_clarification(self):
-        state = storage.save_pending_conversation_state({
-            "client_id": 9,
-            "sender": self.sender,
-            "project_code": "PROJECT_A1",
-            "state_kind": "clarification",
-            "expected_field": "person_reference",
-            "original_request": "Assign Alex to inspect the gate",
-            "structured_context": {"kind": "fixture"},
-            "candidate_metadata": {},
-            "continuation": {"kind": "fixture"},
-            "continuation_key": "complete-order-routing",
-        })
+    def test_complete_orders_bypass_retired_legacy_await(self):
+        legacy, retired_state = self.make_retired_legacy_order_await()
+        created_order_ids = []
         messages = (
             (
                 "Order 16 bags of sand from Buildit for delivery Tuesday "
@@ -170,19 +187,87 @@ class MU16WebhookFeatureTests(unittest.TestCase):
                 self.assertIn("Supplier: Buildit", order.text)
                 self.assertIn(delivery, order.text)
                 self.assertIn(location, order.text)
+                created_order_ids.append(order.id)
 
         with storage.SessionLocal() as session:
-            preserved = session.get(storage.ConversationState, state["id"])
-            self.assertTrue(preserved.active)
-            self.assertEqual(preserved.status, "active")
-            self.assertEqual(preserved.expected_field, "person_reference")
+            preserved = session.get(
+                storage.ConversationState, retired_state["id"]
+            )
+            retained_task = session.get(storage.Task, legacy["id"])
+            self.assertFalse(preserved.active)
+            self.assertEqual(preserved.status, "cancelled")
+            self.assertEqual(preserved.expected_field, "item")
+            self.assertEqual(retained_task.status, "open")
+            self.assertTrue(retained_task.text.startswith("[await:item]"))
+            self.assertEqual(session.query(storage.ConversationState).filter(
+                storage.ConversationState.active == True
+            ).count(), 0)
             self.assertEqual(session.query(storage.Task).filter(
-                storage.Task.tag == "order"
+                storage.Task.tag == "order",
+                storage.Task.status == "pending_approval",
             ).count(), 2)
             self.assertEqual(session.query(storage.Audit).filter(
                 storage.Audit.action == "create",
                 storage.Audit.ref_type == "task",
+                storage.Audit.ref_id.in_(created_order_ids),
             ).count(), 2)
+
+    def test_incomplete_order_bypasses_retired_legacy_await_and_continues(self):
+        legacy, retired_state = self.make_retired_legacy_order_await()
+        original = (
+            "Order 10 bags of grout for delivery Saturday to the west gate."
+        )
+        self.assertEqual(self.send(
+            original, "incomplete-order-retired-await"
+        ).status_code, 200)
+
+        with storage.SessionLocal() as session:
+            order = session.query(storage.Task).filter(
+                storage.Task.tag == "order",
+                storage.Task.id != legacy["id"],
+            ).one()
+            pending = session.query(storage.ConversationState).filter(
+                storage.ConversationState.active == True
+            ).one()
+            retired = session.get(
+                storage.ConversationState, retired_state["id"]
+            )
+            self.assertEqual(order.status, "open")
+            self.assertTrue(order.text.startswith("[await:supplier]"))
+            self.assertIn("Item: grout", order.text)
+            self.assertIn("Quantity: 10 bags", order.text)
+            self.assertIn("Delivery Date: Saturday", order.text)
+            self.assertIn("Drop Location: west gate", order.text)
+            self.assertEqual(pending.expected_field, "supplier")
+            self.assertEqual(pending.original_request, original)
+            self.assertFalse(retired.active)
+            self.assertEqual(retired.status, "cancelled")
+            order_id = order.id
+            pending_id = pending.id
+
+        self.assertEqual(self.send(
+            "Buildit", "incomplete-order-supplier-followup"
+        ).status_code, 200)
+        with storage.SessionLocal() as session:
+            order = session.get(storage.Task, order_id)
+            pending = session.get(storage.ConversationState, pending_id)
+            retired = session.get(
+                storage.ConversationState, retired_state["id"]
+            )
+            retained_task = session.get(storage.Task, legacy["id"])
+            self.assertEqual(order.status, "pending_approval")
+            self.assertIn("Supplier: Buildit", order.text)
+            self.assertIn("Delivery Date: Saturday", order.text)
+            self.assertNotIn("[await:", order.text)
+            self.assertFalse(pending.active)
+            self.assertEqual(pending.status, "resolved")
+            self.assertFalse(retired.active)
+            self.assertEqual(retired.status, "cancelled")
+            self.assertEqual(retained_task.status, "open")
+            self.assertTrue(retained_task.text.startswith("[await:item]"))
+            self.assertEqual(session.query(storage.Task).filter(
+                storage.Task.id == order_id
+            ).count(), 1)
 
     def test_incomplete_order_preserves_fields_and_asks_only_missing(self):
         text = "Order 20 bags of cement from Buildit for delivery Friday"

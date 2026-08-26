@@ -2318,7 +2318,7 @@ def webhook():
             return True
 
         natural_order = parse_natural_order(t)
-        if natural_order and not natural_order.get("missing_fields"):
+        if natural_order:
             return True
 
         # Probe only existing authoritative recognition. These helpers do not
