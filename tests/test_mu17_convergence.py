@@ -15,6 +15,7 @@ class MU17RoutingMatrixTests(unittest.TestCase):
             "Create a task to fix the door": "task",
             "Assign Jordan Unique to fix the door": "task",
             "Create a task for me to check the door": "task",
+            "Urgent fix the kitchen door": "task",
             "Urgent: fix the kitchen door": "task",
             "Note for PROJECT_A1: opening is 32 inches": "note",
             "Pin note for PROJECT_A1: opening is 32 inches": "pinned_note",
@@ -39,6 +40,9 @@ class MU17RoutingMatrixTests(unittest.TestCase):
         self.assertEqual(self.route(
             "Create a task for me to check the door"
         )["subtype"], "self")
+        self.assertEqual(self.route(
+            "Urgent fix the kitchen door"
+        )["subtype"], "urgent")
         self.assertEqual(self.route(
             "Urgent: fix the kitchen door"
         )["subtype"], "urgent")
@@ -89,30 +93,44 @@ class MU17WebhookConvergenceTests(unittest.TestCase):
 
     def test_task_note_delivery_and_assignment_routes_use_task_handler(self):
         messages = (
+            ("Create a task to check the door", "task", "assigned"),
             ("Create a task for me to check the door", "task", "self"),
+            ("Urgent fix the kitchen door", "urgent", "urgent"),
             ("Urgent: fix the kitchen door", "urgent", "urgent"),
             ("Note for PROJECT_A1: opening is 32 inches", "note", "note"),
             ("Pin note for PROJECT_A1: opening is 32 inches", "note", "pinned"),
             ("Record delivery of cement at north gate", "delivery", "assigned"),
         )
         for index, (text, tag, subtype) in enumerate(messages):
+            with storage.SessionLocal() as session:
+                before = session.query(storage.Task).count()
             self.assertEqual(self.send(
                 self.sender_a, text, f"route-{index}"
             ).status_code, 200)
             with storage.SessionLocal() as session:
+                self.assertEqual(session.query(storage.Task).count(), before + 1)
                 row = session.query(storage.Task).order_by(
                     storage.Task.id.desc()
                 ).first()
                 self.assertEqual(row.tag, tag)
                 self.assertEqual(row.subtype, subtype)
                 self.assertEqual(row.client_id, 10)
+                self.assertEqual(row.project_code, "PROJECT_A1")
+                self.assertEqual(session.query(storage.Audit).filter(
+                    storage.Audit.action == "create",
+                    storage.Audit.ref_type == "task",
+                    storage.Audit.ref_id == row.id,
+                ).count(), 1)
 
+        with storage.SessionLocal() as session:
+            before = session.query(storage.Task).count()
         self.assertEqual(self.send(
             self.sender_a,
             "Assign Jordan Unique to fix the kitchen door",
             "assigned-task",
         ).status_code, 200)
         with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), before + 1)
             assigned = session.query(storage.Task).order_by(
                 storage.Task.id.desc()
             ).first()

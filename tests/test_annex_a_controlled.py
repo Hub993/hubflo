@@ -216,6 +216,8 @@ class AnnexAControlledFixture(unittest.TestCase):
         legacy, retired = self.make_retired_legacy_order_await()
         cases = (
             ("Create a task to check the east gate", "task", "assigned"),
+            ("Urgent fix the roof leak", "urgent", "urgent"),
+            ("Urgent: fix the roof leak", "urgent", "urgent"),
             ("Note for PROJECT_A1: east gate checked", "note", "note"),
             ("Pin note for PROJECT_A1: keep east gate clear", "note", "pinned"),
             ("Record delivery of cement at north gate", "delivery", "assigned"),

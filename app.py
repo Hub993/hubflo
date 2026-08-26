@@ -1175,7 +1175,7 @@ def interpret_supported_message(
         return {"route": "task", "action": "create", "subtype": "assigned", "entities": entities}
     if re.match(r"^(?:create|add)\s+(?:a\s+)?task\s+for\s+me\b", lower):
         return {"route": "task", "action": "create", "subtype": "self", "entities": entities}
-    if re.match(r"^urgent\s*:", lower) or re.search(r"\basap\b", lower):
+    if re.match(r"^urgent\b\s*:?", lower) or re.search(r"\basap\b", lower):
         return {"route": "task", "action": "create", "subtype": "urgent", "entities": entities}
     if re.match(r"^(?:create|add)\s+(?:a\s+)?task\b", lower):
         return {"route": "task", "action": "create", "subtype": "assigned", "entities": entities}
