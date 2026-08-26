@@ -963,6 +963,7 @@ def format_configured_datetime(
 _NATURAL_ORDER_REQUIRED_FIELDS = (
     "item",
     "quantity",
+    "supplier",
     "delivery_date",
     "drop_location",
 )
@@ -2095,9 +2096,23 @@ def webhook():
         return {
             "item": "What item should be ordered?",
             "quantity": "What quantity is required?",
+            "supplier": "Who should we source this from?",
             "delivery_date": "What delivery date is required?",
             "drop_location": "Where should it be delivered on site?",
         }.get(field, "What information is missing?")
+
+    def _natural_order_followup_value(
+        expected_field: str,
+        raw_text: str,
+    ) -> Optional[str]:
+        value = str(raw_text or "").strip()
+        if not value or not re.search(r"[a-z0-9]", value, re.IGNORECASE):
+            return None
+        if expected_field == "quantity":
+            quantity = re.match(r"^(\d+(?:\.\d+)?)(?:\s+.+)?$", value)
+            if not quantity or float(quantity.group(1)) <= 0:
+                return None
+        return value
 
     def _run_natural_order_continuation(
         awaiting,
@@ -2118,8 +2133,30 @@ def webhook():
             return True
         expected_field = str(claimed.get("expected_field") or "").strip()
         fields = dict((claimed.get("structured_context") or {}).get("order_fields") or {})
-        value = str(raw_txt or "").strip()
-        if expected_field not in _NATURAL_ORDER_REQUIRED_FIELDS or not value:
+        current_client_id, current_project = _conversation_scope(
+            claimed["sender"]
+        )
+        task_project = str(awaiting.project_code or "").strip() or None
+        state_project = str(claimed.get("project_code") or "").strip() or None
+        if (
+            int(awaiting.client_id or 1) != int(claimed["client_id"])
+            or int(current_client_id) != int(claimed["client_id"])
+            or task_project != state_project
+            or current_project != state_project
+        ):
+            advance_conversation_state_continuation(
+                claimed["id"], claimed["sender"], claimed["client_id"],
+                claimed.get("project_code"), expected_field,
+                structured_context=claimed.get("structured_context") or {},
+            )
+            send_whatsapp_text(
+                phone_id,
+                claimed["sender"],
+                "That pending order is no longer available in your scope.",
+            )
+            return True
+        value = _natural_order_followup_value(expected_field, raw_txt)
+        if expected_field not in _NATURAL_ORDER_REQUIRED_FIELDS or value is None:
             advance_conversation_state_continuation(
                 claimed["id"], claimed["sender"], claimed["client_id"],
                 claimed.get("project_code"), expected_field,
@@ -3970,6 +4007,7 @@ def webhook():
                             .filter(
                                 Task.id == source_record_id,
                                 Task.sender == sender,
+                                Task.client_id == pending_state["client_id"],
                                 Task.status == "open",
                                 Task.text.ilike("[await:%]%"),
                             )
@@ -3997,13 +4035,18 @@ def webhook():
                     )
 
                     if awaiting and not deterministic_recognition:
-                        _, current_project = _conversation_scope(sender)
+                        current_client_id, current_project = _conversation_scope(
+                            sender
+                        )
                         await_project = awaiting.project_code
                         if await_project is not None:
                             await_project = str(await_project).strip() or None
                         if (
-                            await_project is None
-                            or await_project == current_project
+                            int(awaiting.client_id or 1) == int(current_client_id)
+                            and (
+                                await_project is None
+                                or await_project == current_project
+                            )
                         ):
                             pending_state = _ensure_await_conversation_state(
                                 awaiting

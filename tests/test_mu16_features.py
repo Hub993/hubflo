@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import unittest
 from zoneinfo import ZoneInfo
 
@@ -10,24 +11,37 @@ from tests.test_mu14_webhook import inbound
 class MU16StructuredInterpretationTests(unittest.TestCase):
     def test_complete_natural_order_extracts_supplied_fields(self):
         result = hubflo_app.parse_natural_order(
-            "Order 20 bags of cement for PROJECT_A1 for delivery Friday to the north gate",
+            "Order 20 bags of cement from Buildit for PROJECT_A1 "
+            "for delivery Friday to the north gate",
             "PROJECT_A1",
         )
         self.assertEqual(result["intent"], "order")
         self.assertEqual(result["fields"]["quantity"], "20 bags")
         self.assertEqual(result["fields"]["item"], "cement")
+        self.assertEqual(result["fields"]["supplier"], "Buildit")
         self.assertEqual(result["fields"]["delivery_date"], "Friday")
         self.assertEqual(result["fields"]["drop_location"], "north gate")
         self.assertEqual(result["missing_fields"], [])
 
     def test_order_reports_only_fields_actually_missing(self):
         result = hubflo_app.parse_natural_order(
-            "Order 20 bags of cement for delivery Friday",
+            "Order 20 bags of cement from Buildit for delivery Friday",
         )
         self.assertEqual(result["missing_fields"], ["drop_location"])
         self.assertEqual(result["fields"]["item"], "cement")
         self.assertEqual(result["fields"]["quantity"], "20 bags")
+        self.assertEqual(result["fields"]["supplier"], "Buildit")
         self.assertEqual(result["fields"]["delivery_date"], "Friday")
+
+    def test_order_reports_supplier_as_only_missing(self):
+        result = hubflo_app.parse_natural_order(
+            "Order 12 bags of mortar for delivery Saturday to the south gate.",
+        )
+        self.assertEqual(result["missing_fields"], ["supplier"])
+        self.assertEqual(result["fields"]["item"], "mortar")
+        self.assertEqual(result["fields"]["quantity"], "12 bags")
+        self.assertEqual(result["fields"]["delivery_date"], "Saturday")
+        self.assertEqual(result["fields"]["drop_location"], "south gate")
 
     def test_natural_meeting_has_structured_schedule(self):
         now = dt.datetime(2026, 8, 25, 8, 0, tzinfo=ZoneInfo("America/New_York"))
@@ -70,9 +84,28 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             ))
             session.commit()
 
+    def send(self, text, message_id):
+        return self.client.post(
+            "/webhook", json=inbound(self.sender, text, message_id)
+        )
+
+    def start_supplier_missing_order(self, message_id="supplier-missing"):
+        original = (
+            "Order 12 bags of mortar for delivery Saturday "
+            "to the south gate."
+        )
+        response = self.send(original, message_id)
+        self.assertEqual(response.status_code, 200)
+        with storage.SessionLocal() as session:
+            order = session.query(storage.Task).filter(
+                storage.Task.tag == "order"
+            ).one()
+            state = session.query(storage.ConversationState).one()
+            return original, order.id, state.id
+
     def test_complete_order_mutates_once_without_clarification(self):
         text = (
-            "Order 20 bags of cement for PROJECT_A1 "
+            "Order 20 bags of cement from Buildit for PROJECT_A1 "
             "for delivery Friday to the north gate"
         )
         response = self.client.post(
@@ -87,12 +120,13 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             self.assertEqual(orders[0].status, "pending_approval")
             self.assertIn("Item: cement", orders[0].text)
             self.assertIn("Quantity: 20 bags", orders[0].text)
+            self.assertIn("Supplier: Buildit", orders[0].text)
             self.assertIn("Delivery Date: Friday", orders[0].text)
             self.assertIn("Drop Location: north gate", orders[0].text)
             self.assertEqual(session.query(storage.ConversationState).count(), 0)
 
     def test_incomplete_order_preserves_fields_and_asks_only_missing(self):
-        text = "Order 20 bags of cement for delivery Friday"
+        text = "Order 20 bags of cement from Buildit for delivery Friday"
         first = self.client.post(
             "/webhook", json=inbound(self.sender, text, "incomplete-order")
         )
@@ -105,7 +139,9 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             self.assertTrue(order.text.startswith("[await:drop_location]"))
             self.assertIn("Item: cement", order.text)
             self.assertIn("Quantity: 20 bags", order.text)
+            self.assertIn("Supplier: Buildit", order.text)
             self.assertIn("Delivery Date: Friday", order.text)
+            self.assertEqual(order.status, "open")
             self.assertEqual(state.expected_field, "drop_location")
             order_id = order.id
             state_id = state.id
@@ -119,6 +155,7 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             order = session.get(storage.Task, order_id)
             state = session.get(storage.ConversationState, state_id)
             self.assertEqual(order.status, "pending_approval")
+            self.assertIn("Supplier: Buildit", order.text)
             self.assertIn("Drop Location: north gate", order.text)
             self.assertNotIn("[await:", order.text)
             self.assertFalse(state.active)
@@ -126,6 +163,132 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             self.assertEqual(session.query(storage.Task).filter(
                 storage.Task.tag == "order"
             ).count(), 1)
+
+    def test_supplier_missing_persists_only_supplier_and_original_meaning(self):
+        original, order_id, state_id = self.start_supplier_missing_order()
+        with storage.SessionLocal() as session:
+            order = session.get(storage.Task, order_id)
+            state = session.get(storage.ConversationState, state_id)
+            context = json.loads(state.structured_context_json)
+            self.assertEqual(order.status, "open")
+            self.assertEqual(order.order_state, "requested")
+            self.assertTrue(order.text.startswith("[await:supplier]"))
+            self.assertIn("Item: mortar", order.text)
+            self.assertIn("Quantity: 12 bags", order.text)
+            self.assertIn("Delivery Date: Saturday", order.text)
+            self.assertIn("Drop Location: south gate", order.text)
+            self.assertNotIn("Supplier:", order.text)
+            self.assertTrue(state.active)
+            self.assertEqual(state.status, "active")
+            self.assertEqual(state.expected_field, "supplier")
+            self.assertEqual(state.original_request, original)
+            self.assertEqual(context["missing_fields"], ["supplier"])
+            self.assertEqual(context["order_fields"], {
+                "item": "mortar",
+                "quantity": "12 bags",
+                "supplier": None,
+                "delivery_date": "Saturday",
+                "drop_location": "south gate",
+            })
+
+    def test_direct_supplier_followup_completes_once_and_preserves_fields(self):
+        _, order_id, state_id = self.start_supplier_missing_order()
+        before = None
+        with storage.SessionLocal() as session:
+            before = session.get(storage.Task, order_id).text
+
+        response = self.send("Buildit", "supplier-followup")
+        self.assertEqual(response.status_code, 200)
+        with storage.SessionLocal() as session:
+            order = session.get(storage.Task, order_id)
+            state = session.get(storage.ConversationState, state_id)
+            self.assertEqual(order.status, "pending_approval")
+            self.assertIn("Item: mortar", order.text)
+            self.assertIn("Quantity: 12 bags", order.text)
+            self.assertIn("Supplier: Buildit", order.text)
+            self.assertIn("Delivery Date: Saturday", order.text)
+            self.assertIn("Drop Location: south gate", order.text)
+            self.assertNotIn("[await:", order.text)
+            self.assertFalse(state.active)
+            self.assertEqual(state.status, "resolved")
+            self.assertEqual(session.query(storage.Task).filter(
+                storage.Task.tag == "order"
+            ).count(), 1)
+            self.assertNotEqual(order.text, before)
+
+    def test_invalid_supplier_followup_does_not_mutate_or_finalize(self):
+        _, order_id, state_id = self.start_supplier_missing_order()
+        with storage.SessionLocal() as session:
+            before = session.get(storage.Task, order_id).text
+
+        response = self.send("???", "invalid-supplier-followup")
+        self.assertEqual(response.status_code, 200)
+        with storage.SessionLocal() as session:
+            order = session.get(storage.Task, order_id)
+            state = session.get(storage.ConversationState, state_id)
+            self.assertEqual(order.text, before)
+            self.assertEqual(order.status, "open")
+            self.assertTrue(state.active)
+            self.assertEqual(state.status, "active")
+            self.assertEqual(state.expected_field, "supplier")
+
+    def test_unrelated_deterministic_command_bypasses_supplier_state(self):
+        _, order_id, state_id = self.start_supplier_missing_order()
+        with storage.SessionLocal() as session:
+            before = session.get(storage.Task, order_id).text
+
+        response = self.send("Search for mortar tasks", "supplier-bypass")
+        self.assertEqual(response.status_code, 200)
+        with storage.SessionLocal() as session:
+            order = session.get(storage.Task, order_id)
+            state = session.get(storage.ConversationState, state_id)
+            self.assertEqual(order.text, before)
+            self.assertEqual(order.status, "open")
+            self.assertTrue(state.active)
+            self.assertEqual(state.expected_field, "supplier")
+            self.assertEqual(session.query(storage.Task).filter(
+                storage.Task.tag == "order"
+            ).count(), 1)
+
+    def test_replayed_supplier_continuation_does_not_duplicate_order(self):
+        _, order_id, state_id = self.start_supplier_missing_order()
+        self.send("Buildit", "supplier-replay")
+        self.send("Buildit", "supplier-replay")
+        with storage.SessionLocal() as session:
+            order = session.get(storage.Task, order_id)
+            state = session.get(storage.ConversationState, state_id)
+            self.assertEqual(order.status, "pending_approval")
+            self.assertEqual(order.text.count("Supplier: Buildit"), 1)
+            self.assertFalse(state.active)
+            self.assertEqual(session.query(storage.Task).filter(
+                storage.Task.tag == "order"
+            ).count(), 1)
+
+    def test_client_change_blocks_pending_order_continuation(self):
+        _, order_id, state_id = self.start_supplier_missing_order()
+        with storage.SessionLocal() as session:
+            sender = session.query(storage.User).filter(
+                storage.User.wa_id == self.sender
+            ).one()
+            sender.client_id = 99
+            session.commit()
+        self.send("Buildit", "supplier-client-change")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.get(storage.Task, order_id).status, "open")
+            self.assertTrue(session.get(storage.ConversationState, state_id).active)
+
+    def test_project_change_blocks_pending_order_continuation(self):
+        _, order_id, state_id = self.start_supplier_missing_order()
+        with storage.SessionLocal() as session:
+            sender = session.query(storage.User).filter(
+                storage.User.wa_id == self.sender
+            ).one()
+            sender.project_code = "PROJECT_A2"
+            session.commit()
+        self.send("Buildit", "supplier-project-change")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.get(storage.Task, order_id).status, "open")
+            self.assertTrue(session.get(storage.ConversationState, state_id).active)
 
     def test_natural_meeting_routes_to_existing_meeting_handler(self):
         response = self.client.post(
