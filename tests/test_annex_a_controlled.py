@@ -53,6 +53,38 @@ class AnnexAControlledFixture(unittest.TestCase):
         )
         return task
 
+    def make_retired_legacy_order_await(self):
+        task = self.make_await("item", "Retained legacy order")
+        state = storage.save_pending_conversation_state({
+            "client_id": 20,
+            "sender": self.sender,
+            "project_code": "PROJECT_A1",
+            "state_kind": "await",
+            "expected_field": "item",
+            "original_request": "Retained legacy order",
+            "structured_context": {"source_record_id": task["id"]},
+            "candidate_metadata": {},
+            "continuation": {
+                "source_record_id": task["id"],
+                "source_record_type": "pending_business_state",
+            },
+            "continuation_key": f"business-state:{task['id']}",
+        })
+        storage.retire_conversation_state(
+            state["id"], self.sender, 20, "PROJECT_A1", "cancelled"
+        )
+        return task, state
+
+    def assert_retired_legacy_order_await(self, task_id, state_id):
+        with storage.SessionLocal() as session:
+            task = session.get(storage.Task, task_id)
+            state = session.get(storage.ConversationState, state_id)
+            self.assertEqual(task.status, "open")
+            self.assertTrue(task.text.startswith("[await:item]"))
+            self.assertFalse(state.active)
+            self.assertEqual(state.status, "cancelled")
+            self.assertEqual(state.expected_field, "item")
+
     def make_reminder(self, label, project="PROJECT_A1"):
         return storage.create_pm_reminder({
             "pm_wa": self.sender,
@@ -179,6 +211,126 @@ class AnnexAControlledFixture(unittest.TestCase):
             self.assertEqual(session.get(storage.PMReminder, alpha["id"]).status, "cancelled")
             self.assertEqual(session.get(storage.PMReminder, beta["id"]).status, "active")
             self.assertFalse(session.get(storage.ConversationState, state_id).active)
+
+    def test_retired_await_bypass_task_note_delivery_search_and_status_routes(self):
+        legacy, retired = self.make_retired_legacy_order_await()
+        cases = (
+            ("Create a task to check the east gate", "task", "assigned"),
+            ("Note for PROJECT_A1: east gate checked", "note", "note"),
+            ("Pin note for PROJECT_A1: keep east gate clear", "note", "pinned"),
+            ("Record delivery of cement at north gate", "delivery", "assigned"),
+            ("Log a delivery of grout at west gate", "delivery", "assigned"),
+        )
+        for index, (text, tag, subtype) in enumerate(cases):
+            before = None
+            with storage.SessionLocal() as session:
+                before = session.query(storage.Task).count()
+            self.assertEqual(self.send(
+                text, f"retired-await-route-{index}"
+            ).status_code, 200)
+            with storage.SessionLocal() as session:
+                self.assertEqual(session.query(storage.Task).count(), before + 1)
+                created = session.query(storage.Task).order_by(
+                    storage.Task.id.desc()
+                ).first()
+                self.assertEqual(created.tag, tag)
+                self.assertEqual(created.subtype, subtype)
+                self.assertEqual(created.client_id, 20)
+                self.assertEqual(created.project_code, "PROJECT_A1")
+                self.assertEqual(session.query(storage.Audit).filter(
+                    storage.Audit.action == "create",
+                    storage.Audit.ref_type == "task",
+                    storage.Audit.ref_id == created.id,
+                ).count(), 1)
+            self.assert_retired_legacy_order_await(
+                legacy["id"], retired["id"]
+            )
+
+        with storage.SessionLocal() as session:
+            before = session.query(storage.Task).count()
+        self.send("Search for cement tasks", "retired-await-search")
+        self.send("What is the status for PROJECT_A1", "retired-await-status")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), before)
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
+
+    def test_retired_await_bypass_inspection_delay_and_meeting_routes(self):
+        source = storage.create_task(
+            self.sender,
+            "Framing crew",
+            tag="task",
+            project_code="PROJECT_A1",
+        )
+        legacy, retired = self.make_retired_legacy_order_await()
+
+        self.send(
+            "Book inspection for drywall tomorrow",
+            "retired-await-inspection",
+        )
+        with storage.SessionLocal() as session:
+            inspection = session.query(storage.Inspection).one()
+            self.assertEqual(inspection.client_id, 20)
+            self.assertEqual(inspection.project_code, "PROJECT_A1")
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
+
+        self.send(
+            "Framing crew is delayed by 2 days - weather",
+            "retired-await-delay",
+        )
+        with storage.SessionLocal() as session:
+            delay = session.query(storage.DelayLog).one()
+            self.assertEqual(delay.task_id, source["id"])
+            self.assertEqual(delay.client_id, 20)
+            self.assertEqual(delay.project_code, "PROJECT_A1")
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
+
+        self.send(
+            "Schedule site meeting tomorrow at 2 PM",
+            "retired-await-meeting",
+        )
+        with storage.SessionLocal() as session:
+            meeting = session.query(storage.Meeting).one()
+            self.assertEqual(meeting.client_id, 20)
+            self.assertEqual(meeting.project_code, "PROJECT_A1")
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
+
+    def test_retired_await_preserved_during_reminder_routes(self):
+        reminder = self.make_reminder("Retired-await lifecycle reminder")
+        legacy, retired = self.make_retired_legacy_order_await()
+
+        self.send(
+            "Remind me tomorrow at 9 AM to call the inspector",
+            "retired-await-reminder-create",
+        )
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.PMReminder).count(), 2)
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
+
+        self.send(
+            f"Cancel reminder {reminder['id']}",
+            "retired-await-reminder-cancel",
+        )
+        with storage.SessionLocal() as session:
+            cancelled = session.get(storage.PMReminder, reminder["id"])
+            self.assertFalse(cancelled.active)
+            self.assertEqual(cancelled.status, "cancelled")
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
+
+    def test_retired_await_bypass_new_stock_item_route(self):
+        legacy, retired = self.make_retired_legacy_order_await()
+        self.send("Add new stock item: grout", "retired-await-new-stock")
+        with storage.SessionLocal() as session:
+            stock_await = session.query(storage.Task).filter(
+                storage.Task.id != legacy["id"],
+                storage.Task.tag == "stock",
+            ).one()
+            self.assertTrue(stock_await.text.startswith("[await:new_stock_unit]"))
+            stock_state = session.query(storage.ConversationState).filter(
+                storage.ConversationState.id != retired["id"],
+                storage.ConversationState.active == True,
+            ).one()
+            self.assertEqual(stock_state.expected_field, "new_stock_unit")
+        self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
 
     def test_persisted_candidate_universe_cannot_broaden(self):
         alpha, beta, state_id = self.create_ambiguous_reminder_state()

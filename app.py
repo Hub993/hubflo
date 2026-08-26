@@ -2317,8 +2317,8 @@ def webhook():
         )):
             return True
 
-        natural_order = parse_natural_order(t)
-        if natural_order:
+        supported_route = interpret_supported_message(t).get("route")
+        if supported_route not in ("ordinary_fallback", "search"):
             return True
 
         # Probe only existing authoritative recognition. These helpers do not
