@@ -19,6 +19,8 @@ class MU17RoutingMatrixTests(unittest.TestCase):
             "Urgent: fix the kitchen door": "task",
             "Note for PROJECT_A1: opening is 32 inches": "note",
             "Pin note for PROJECT_A1: opening is 32 inches": "pinned_note",
+            "Pin note: scaffold inspection booked for tomorrow": "pinned_note",
+            "PIN NOTE scaffold inspection booked for tomorrow": "pinned_note",
             "Order 20 bags of cement for delivery Friday to north gate": "order",
             "Record delivery of cement at north gate": "delivery",
             "Approve change order 12": "approval",
@@ -136,6 +138,33 @@ class MU17WebhookConvergenceTests(unittest.TestCase):
             ).first()
             self.assertEqual(assigned.pm_wa_id, self.jordan)
             self.assertEqual(assigned.client_id, 10)
+
+    def test_pinned_note_precedence_preserves_content_and_isolation(self):
+        text = "Pin note: scaffold inspection booked for tomorrow"
+        self.assertEqual(self.send(
+            self.sender_a, text, "pinned-inspection-note"
+        ).status_code, 200)
+
+        with storage.SessionLocal() as session:
+            notes = session.query(storage.Task).filter(
+                storage.Task.tag == "note",
+                storage.Task.subtype == "pinned",
+            ).all()
+            self.assertEqual(len(notes), 1)
+            note = notes[0]
+            self.assertEqual(note.text, text)
+            self.assertEqual(note.client_id, 10)
+            self.assertEqual(note.project_code, "PROJECT_A1")
+            self.assertEqual(session.query(storage.Audit).filter(
+                storage.Audit.action == "create",
+                storage.Audit.ref_type == "task",
+                storage.Audit.ref_id == note.id,
+            ).count(), 1)
+            self.assertEqual(session.query(storage.Inspection).count(), 0)
+            self.assertEqual(session.query(storage.DelayLog).count(), 0)
+            self.assertEqual(session.query(storage.StockItem).count(), 0)
+            self.assertEqual(session.query(storage.PMReminder).count(), 0)
+            self.assertEqual(session.query(storage.Meeting).count(), 0)
 
     def test_approval_enforces_client_and_project_before_handler(self):
         own = storage.create_task(

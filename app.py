@@ -1135,6 +1135,11 @@ def interpret_supported_message(
     if project_code and "project" not in entities:
         entities["project"] = str(project_code)
 
+    if re.match(r"^(?:pin|pinned)\s+note\b", lower):
+        return {"route": "pinned_note", "action": "create", "entities": entities}
+    if re.match(r"^(?:add\s+|create\s+|write\s+)?note\b", lower):
+        return {"route": "note", "action": "create", "entities": entities}
+
     lifecycle = classify_pm_reminder_lifecycle(raw)
     if lifecycle:
         return {"route": "reminder", "action": lifecycle, "entities": entities}
@@ -1171,10 +1176,6 @@ def interpret_supported_message(
 
     if re.match(r"^(?:record|log|confirm)\s+(?:a\s+)?delivery\b", lower):
         return {"route": "delivery", "action": "create", "entities": entities}
-    if re.match(r"^(?:pin|pinned)\s+note\b", lower):
-        return {"route": "pinned_note", "action": "create", "entities": entities}
-    if re.match(r"^(?:add\s+|create\s+|write\s+)?note\b", lower):
-        return {"route": "note", "action": "create", "entities": entities}
     if re.match(r"^(?:show|find|search|list)\b", lower):
         return {"route": "search", "action": "read", "entities": entities}
     if re.match(r"^(?:what(?:'s| is)\s+)?(?:the\s+)?status\b", lower):
@@ -3876,6 +3877,12 @@ def webhook():
             }
             text = meta.get("caption")
 
+        message_route = (
+            interpret_supported_message(text).get("route")
+            if text
+            else None
+        )
+
         # >>> FEATURE_3_REMINDER_WEBHOOK_START — LIFECYCLE + CREATION V6.1 <<<
 
         if text:
@@ -4217,7 +4224,11 @@ def webhook():
         # -------------------------------------------------------------
         # NEW STOCK ITEM REQUEST
         # -------------------------------------------------------------
-        if text and is_new_stock_item_request(text):
+        if (
+            text
+            and message_route == "stock"
+            and is_new_stock_item_request(text)
+        ):
             material = parse_new_stock_item(text)
             pending_row = create_task(
                 sender=sender,
@@ -4246,7 +4257,11 @@ def webhook():
         # -------------------------------------------------------------
         # DIRECT STOCK COMMANDS
         # -------------------------------------------------------------
-        stock_cmd = parse_stock_command(text) if text else None
+        stock_cmd = (
+            parse_stock_command(text)
+            if text and message_route == "stock"
+            else None
+        )
         if stock_cmd:
             if stock_cmd.get("needs_prompt") or not stock_cmd.get("unit"):
                 # Ask user for missing unit
@@ -4305,14 +4320,14 @@ def webhook():
         # -------------------------------------------------------------
         # SEARCH ENGINE
         # -------------------------------------------------------------
-        if text and is_search_request(text):
+        if text and message_route == "search" and is_search_request(text):
             run_search(sender, text)
             return ("", 200)
 
         # -------------------------------------------------------------
         # NATURAL MEETING ROUTING
         # -------------------------------------------------------------
-        if text:
+        if text and message_route == "meeting":
             datetime_config = _mu15_sender_datetime_configuration(sender)
             meeting_meaning = parse_natural_meeting(
                 text,
@@ -4339,7 +4354,7 @@ def webhook():
 
         # >>> PATCH_1_INSPECTION_WEBHOOK_START — INSPECTOR SCHEDULING V6.1 <<<
 
-        if text and classify_inspection(text):
+        if text and message_route == "inspection":
             datetime_config = _mu15_sender_datetime_configuration(sender)
             sender_timezone = datetime_config["timezone"]
 
@@ -4414,7 +4429,7 @@ def webhook():
 
         # >>> PATCH_2_DELAY_WEBHOOK_START — CRITICAL-PATH DELAY TRACKING V6.1 <<<
 
-        if text and classify_delay(text):
+        if text and message_route == "delay":
             user_info = get_user_role(sender) or {}
             project_code = user_info.get("project_code")
 

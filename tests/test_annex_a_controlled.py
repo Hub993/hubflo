@@ -281,6 +281,7 @@ class AnnexAControlledFixture(unittest.TestCase):
             ("Urgent: fix the roof leak", "urgent", "urgent"),
             ("Note for PROJECT_A1: east gate checked", "note", "note"),
             ("Pin note for PROJECT_A1: keep east gate clear", "note", "pinned"),
+            ("Pin note: scaffold inspection booked for tomorrow", "note", "pinned"),
             ("Record delivery of cement at north gate", "delivery", "assigned"),
             ("Log a delivery of grout at west gate", "delivery", "assigned"),
         )
