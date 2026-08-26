@@ -320,7 +320,7 @@ class AnnexAControlledFixture(unittest.TestCase):
     def test_retired_await_bypass_inspection_delay_and_meeting_routes(self):
         source = storage.create_task(
             self.sender,
-            "Framing crew",
+            "Framing phase",
             tag="task",
             project_code="PROJECT_A1",
         )
@@ -337,7 +337,7 @@ class AnnexAControlledFixture(unittest.TestCase):
         self.assert_retired_legacy_order_await(legacy["id"], retired["id"])
 
         self.send(
-            "Framing crew is delayed by 2 days - weather",
+            "Framing crew is delayed by 2 days due to materials",
             "retired-await-delay",
         )
         with storage.SessionLocal() as session:
@@ -567,22 +567,93 @@ class AnnexAControlledFixture(unittest.TestCase):
 
     def test_natural_delay_and_inspection_persist_tenant_scoped_results(self):
         task = storage.create_task(
-            self.sender, "Framing crew", tag="task", project_code="PROJECT_A1"
+            self.sender, "Framing phase", tag="task", project_code="PROJECT_A1"
         )
         self.send(
-            "Framing crew is delayed by 2 days - weather", "natural-delay"
+            "Framing crew is delayed by 2 days due to materials", "natural-delay"
+        )
+        self.send(
+            "Framing phase is delayed by 3 days due to weather",
+            "canonical-natural-delay",
         )
         self.send(
             "Book inspection for drywall tomorrow", "controlled-inspection"
         )
         with storage.SessionLocal() as session:
-            delay = session.query(storage.DelayLog).one()
+            delays = session.query(storage.DelayLog).order_by(
+                storage.DelayLog.id.asc()
+            ).all()
             inspection = session.query(storage.Inspection).one()
-            self.assertEqual(delay.task_id, task["id"])
-            self.assertEqual(delay.client_id, 20)
+            self.assertEqual(len(delays), 2)
+            self.assertEqual([delay.task_id for delay in delays], [task["id"], task["id"]])
+            self.assertEqual([delay.days for delay in delays], [2.0, 3.0])
+            self.assertTrue(all(delay.client_id == 20 for delay in delays))
             self.assertEqual(inspection.client_id, 20)
             self.assertEqual(inspection.project_code, "PROJECT_A1")
             self.assertEqual(inspection.phase, "drywall")
+
+    def test_construction_delay_terminology_preserves_resolution_guards(self):
+        drywall = storage.create_task(
+            self.sender, "Drywall phase", tag="task", project_code="PROJECT_A1"
+        )
+        roofing = storage.create_task(
+            self.sender, "Roofing phase", tag="task", project_code="PROJECT_A1"
+        )
+        concrete = storage.create_task(
+            self.sender, "Concrete phase", tag="task", project_code="PROJECT_A1"
+        )
+        cases = (
+            ("Drywall team is delayed by 1 day due to access", drywall["id"]),
+            ("Roofers are delayed by 2 days due to rain", roofing["id"]),
+            ("Concrete crew is delayed by 3 days due to materials", concrete["id"]),
+        )
+        for index, (text, task_id) in enumerate(cases):
+            before = None
+            with storage.SessionLocal() as session:
+                before = session.query(storage.DelayLog).count()
+            self.send(text, f"terminology-delay-{index}")
+            with storage.SessionLocal() as session:
+                self.assertEqual(session.query(storage.DelayLog).count(), before + 1)
+                delay = session.query(storage.DelayLog).order_by(
+                    storage.DelayLog.id.desc()
+                ).first()
+                self.assertEqual(delay.task_id, task_id)
+                self.assertEqual(delay.client_id, 20)
+                self.assertEqual(delay.project_code, "PROJECT_A1")
+
+        storage.create_task(
+            self.sender, "Roofing phase south", tag="task",
+            project_code="PROJECT_A1",
+        )
+        foreign_sender = "15550000598"
+        with storage.SessionLocal() as session:
+            session.add(storage.User(
+                client_id=21,
+                wa_id=foreign_sender,
+                name="Foreign PM",
+                role="pm",
+                project_code="PROJECT_A1",
+                active=True,
+            ))
+            session.commit()
+        storage.create_task(
+            foreign_sender, "Masonry phase", tag="task",
+            project_code="PROJECT_A1",
+        )
+        storage.create_task(
+            self.sender, "Excavation phase", tag="task",
+            project_code="PROJECT_A2",
+        )
+
+        with storage.SessionLocal() as session:
+            before = session.query(storage.DelayLog).count()
+        self.send("Roofing team is delayed by 2 days", "terminology-ambiguous")
+        self.send("Plastering crew is delayed by 2 days", "terminology-no-match")
+        self.send("Masonry crew is delayed by 2 days", "terminology-foreign")
+        self.send("Excavation crew is delayed by 2 days", "terminology-project")
+        self.send("Framing crew completed work today", "terminology-not-delay")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.DelayLog).count(), before)
 
     def test_search_and_status_are_scoped_read_only_controlled_results(self):
         own = storage.create_task(

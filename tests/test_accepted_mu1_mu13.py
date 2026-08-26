@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import app as hubflo_app
 from core.conversation import ConversationRequest, CoreConversation
+from core.industry import IndustryRequest
 from industries.construction import ConstructionIndustryModule
 
 
@@ -33,6 +34,32 @@ class AcceptedMU1ToMU13Regression(unittest.TestCase):
             "Framing crew is delayed by 2 days - weather"
         ))
         self.assertFalse(hubflo_app.classify_delay("There is no delay"))
+
+    def test_construction_work_reference_terminology_is_bounded(self):
+        cases = {
+            "Framing crew is delayed by 2 days": "framing",
+            "Framing team is delayed by 2 days": "framing",
+            "Framers are delayed by 2 days": "framing",
+            "Drywall crew is delayed by 2 days": "drywall",
+            "Roofers are delayed by 2 days": "roofing",
+            "Concrete team is delayed by 2 days": "concrete",
+        }
+        industry = ConstructionIndustryModule()
+        for text, expected in cases.items():
+            result = industry.interpret(IndustryRequest(
+                capability="domain_recognition",
+                text=text,
+                context={"candidate": "work_reference_terminology"},
+            ))
+            self.assertTrue(result.handled, text)
+            self.assertEqual(result.entities["canonical_reference"], expected)
+
+        unrelated = industry.interpret(IndustryRequest(
+            capability="domain_recognition",
+            text="The site is delayed by 2 days",
+            context={"candidate": "work_reference_terminology"},
+        ))
+        self.assertFalse(unrelated.handled)
 
     def test_reminder_creation_time_date_duration_and_recurrence(self):
         now = dt.datetime(2026, 8, 25, 8, 0, tzinfo=ZoneInfo("America/New_York"))

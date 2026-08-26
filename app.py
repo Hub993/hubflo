@@ -508,10 +508,28 @@ def _resolve_delay_task_reference(
             }
         )
 
+    terminology = _CORE_CONVERSATION.interpret(
+        IndustryRequest(
+            capability="domain_recognition",
+            text=text or "",
+            context={"candidate": "work_reference_terminology"},
+        )
+    )
+    resolution_text = text or ""
+    if (
+        terminology.handled
+        and terminology.classification == "construction_work_reference"
+    ):
+        canonical_reference = str(
+            terminology.entities.get("canonical_reference") or ""
+        ).strip()
+        if canonical_reference:
+            resolution_text = canonical_reference
+
     result = _CORE_CONVERSATION.interpret_core(
         ConversationRequest(
             capability="record_resolution",
-            text=text or "",
+            text=resolution_text,
             context={
                 "candidate": "text_reference",
                 "records": records,

@@ -25,7 +25,46 @@ class ConstructionIndustryModule:
         if candidate == "critical_path_delay":
             return self._recognize_critical_path_delay(request.text)
 
+        if candidate == "work_reference_terminology":
+            return self._interpret_work_reference(request.text)
+
         return IndustryResult()
+
+    @staticmethod
+    def _interpret_work_reference(text: str) -> IndustryResult:
+        """Normalize bounded everyday Construction work-group terminology."""
+        leading_reference = re.match(
+            r"^\s*(.+?)\s+\b(?:is|are|was|were|has|have|had)\b",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+        if not leading_reference:
+            return IndustryResult()
+
+        reference = leading_reference.group(1).strip(" ,.-").lower()
+        reference = re.sub(r"^the\s+", "", reference)
+        canonical = re.sub(
+            r"\s+(?:crew|team|phase|trade)\s*$",
+            "",
+            reference,
+        ).strip()
+        canonical = {
+            "framers": "framing",
+            "roofers": "roofing",
+        }.get(canonical, canonical)
+
+        if not canonical or canonical == reference:
+            return IndustryResult()
+
+        return IndustryResult(
+            handled=True,
+            classification="construction_work_reference",
+            entities={"canonical_reference": canonical},
+            metadata={
+                "domain": "construction",
+                "concept": "work_reference_terminology",
+            },
+        )
 
     @staticmethod
     def _recognize_inspection(text: str) -> IndustryResult:
