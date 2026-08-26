@@ -2317,6 +2317,10 @@ def webhook():
         )):
             return True
 
+        natural_order = parse_natural_order(t)
+        if natural_order and not natural_order.get("missing_fields"):
+            return True
+
         # Probe only existing authoritative recognition. These helpers do not
         # execute handlers or mutate the pending await.
         if is_new_stock_item_request(t):

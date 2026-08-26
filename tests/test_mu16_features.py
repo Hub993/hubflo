@@ -125,6 +125,65 @@ class MU16WebhookFeatureTests(unittest.TestCase):
             self.assertIn("Drop Location: north gate", orders[0].text)
             self.assertEqual(session.query(storage.ConversationState).count(), 0)
 
+    def test_complete_orders_bypass_unrelated_pending_clarification(self):
+        state = storage.save_pending_conversation_state({
+            "client_id": 9,
+            "sender": self.sender,
+            "project_code": "PROJECT_A1",
+            "state_kind": "clarification",
+            "expected_field": "person_reference",
+            "original_request": "Assign Alex to inspect the gate",
+            "structured_context": {"kind": "fixture"},
+            "candidate_metadata": {},
+            "continuation": {"kind": "fixture"},
+            "continuation_key": "complete-order-routing",
+        })
+        messages = (
+            (
+                "Order 16 bags of sand from Buildit for delivery Tuesday "
+                "to the east gate.",
+                "complete-order-east",
+                "Item: sand",
+                "Quantity: 16 bags",
+                "Delivery Date: Tuesday",
+                "Drop Location: east gate",
+            ),
+            (
+                "Order 9 pallets of block from Buildit for delivery Thursday "
+                "to the west gate.",
+                "complete-order-west",
+                "Item: block",
+                "Quantity: 9 pallets",
+                "Delivery Date: Thursday",
+                "Drop Location: west gate",
+            ),
+        )
+        for text, message_id, item, quantity, delivery, location in messages:
+            self.assertEqual(self.send(text, message_id).status_code, 200)
+            with storage.SessionLocal() as session:
+                order = session.query(storage.Task).filter(
+                    storage.Task.tag == "order"
+                ).order_by(storage.Task.id.desc()).first()
+                self.assertEqual(order.status, "pending_approval")
+                self.assertIn(item, order.text)
+                self.assertIn(quantity, order.text)
+                self.assertIn("Supplier: Buildit", order.text)
+                self.assertIn(delivery, order.text)
+                self.assertIn(location, order.text)
+
+        with storage.SessionLocal() as session:
+            preserved = session.get(storage.ConversationState, state["id"])
+            self.assertTrue(preserved.active)
+            self.assertEqual(preserved.status, "active")
+            self.assertEqual(preserved.expected_field, "person_reference")
+            self.assertEqual(session.query(storage.Task).filter(
+                storage.Task.tag == "order"
+            ).count(), 2)
+            self.assertEqual(session.query(storage.Audit).filter(
+                storage.Audit.action == "create",
+                storage.Audit.ref_type == "task",
+            ).count(), 2)
+
     def test_incomplete_order_preserves_fields_and_asks_only_missing(self):
         text = "Order 20 bags of cement from Buildit for delivery Friday"
         first = self.client.post(
