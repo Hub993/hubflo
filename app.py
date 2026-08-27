@@ -3402,6 +3402,225 @@ def webhook():
             lines.append(f"- {record.get('label') or record.get('id')}")
         send_whatsapp_text(phone_id, sender_wa, "\n".join(lines))
 
+    def _mu13_send_task_assignee_choices(
+        sender_wa: str,
+        records: list[dict],
+        no_match: bool = False,
+    ) -> None:
+        heading = (
+            "I couldn't match that person. Reply with one authorized "
+            "person's name:"
+            if no_match
+            else "More than one person matches. Reply with a distinguishing "
+            "name:"
+        )
+        lines = [heading]
+        for record in records[:10]:
+            labels = [
+                str(label or "").strip()
+                for label in (record.get("labels") or [])
+                if str(label or "").strip()
+            ]
+            display = " / ".join(labels[:2])
+            lines.append(f"- {display or record.get('label') or record.get('id')}")
+        send_whatsapp_text(phone_id, sender_wa, "\n".join(lines))
+
+    def _mu13_persist_task_assignment_clarification(
+        message: dict,
+        sender_wa: str,
+        raw_text: str,
+        project_code: Optional[str],
+        subcontractor_name: Optional[str],
+        structured_route: dict,
+        authorization: dict,
+        person_candidates: list[dict],
+    ) -> dict:
+        identity = str(
+            message.get("id") or message.get("timestamp") or raw_text
+        ).strip()
+        digest = hashlib.sha256(
+            f"{sender_wa}|{identity}".encode("utf-8")
+        ).hexdigest()
+        continuation_key = f"task-assignment:{digest}"
+        existing = get_pending_conversation_state(
+            sender_wa,
+            int(authorization["client_id"]),
+            project_code,
+            continuation_key=continuation_key,
+        )
+        if existing:
+            return existing
+        entities = structured_route.get("entities") or {}
+        structured_context = {
+            "route": "task",
+            "action": "create",
+            "subtype": "assigned",
+            "task_text": str(entities.get("task_text") or "").strip(),
+            "recipient_reference": str(
+                entities.get("recipient_reference") or ""
+            ).strip(),
+            "subcontractor_name": subcontractor_name,
+        }
+        candidate_metadata = {
+            "person_candidates": person_candidates,
+            "authorization_scope": {
+                "sender": sender_wa,
+                "client_id": int(authorization["client_id"]),
+                "project_codes": list(
+                    authorization.get("project_codes") or []
+                ),
+            },
+        }
+        return save_pending_conversation_state({
+            "client_id": int(authorization["client_id"]),
+            "sender": sender_wa,
+            "project_code": project_code,
+            "state_kind": "clarification",
+            "expected_field": "recipient_reference",
+            "original_request": raw_text or "",
+            "structured_context": structured_context,
+            "candidate_metadata": candidate_metadata,
+            "continuation": {"kind": "task_assignment"},
+            "continuation_key": continuation_key,
+        })
+
+    def _mu13_existing_task_assignment_clarification(
+        state: dict,
+        raw_text: str,
+    ) -> bool:
+        continuation = state.get("continuation") or {}
+        if continuation.get("kind") != "task_assignment":
+            return False
+        if has_deterministic_normal_route_recognition(raw_text):
+            return False
+
+        candidate_metadata = state.get("candidate_metadata") or {}
+        authorization = _mu13_authorization_within_persisted_scope(
+            state,
+            candidate_metadata,
+            _mu13_sender_authorization(state["sender"]),
+        )
+        persisted_people = candidate_metadata.get("person_candidates") or []
+        current_people = (
+            _mu13_authorized_person_records(state["sender"], authorization)
+            if authorization
+            else []
+        )
+        available_people = _mu13_intersect_persisted_records(
+            persisted_people,
+            current_people,
+        )
+        available_people = _mu13_person_records_for_project(
+            available_people,
+            state.get("project_code"),
+        )
+        resolution = _mu13_resolve_person(raw_text, available_people)
+        if resolution["status"] != "resolved":
+            touched = touch_conversation_state_activity(
+                state["id"],
+                state["sender"],
+                state["client_id"],
+                state.get("project_code"),
+            )
+            if touched.get("status_result") != "touched":
+                return True
+            _mu13_send_task_assignee_choices(
+                state["sender"],
+                available_people,
+                no_match=(resolution["status"] == "not_found"),
+            )
+            return True
+
+        claimed = claim_conversation_state_continuation(
+            state["id"],
+            state["sender"],
+            state["client_id"],
+            state.get("project_code"),
+        )
+        if claimed.get("status_result") != "claimed":
+            return True
+
+        claimed_metadata = claimed.get("candidate_metadata") or {}
+        current_authorization = _mu13_authorization_within_persisted_scope(
+            claimed,
+            claimed_metadata,
+            _mu13_sender_authorization(claimed["sender"]),
+        )
+        current_people = (
+            _mu13_authorized_person_records(
+                claimed["sender"], current_authorization
+            )
+            if current_authorization
+            else []
+        )
+        available_people = _mu13_intersect_persisted_records(
+            claimed_metadata.get("person_candidates") or [],
+            current_people,
+        )
+        available_people = _mu13_person_records_for_project(
+            available_people,
+            claimed.get("project_code"),
+        )
+        selected = _mu13_candidate_by_id(
+            available_people,
+            resolution.get("record_id"),
+        )
+        context = claimed.get("structured_context") or {}
+        if (
+            not selected
+            or context.get("route") != "task"
+            or context.get("action") != "create"
+            or context.get("subtype") != "assigned"
+            or not str(context.get("task_text") or "").strip()
+        ):
+            advance_conversation_state_continuation(
+                claimed["id"],
+                claimed["sender"],
+                claimed["client_id"],
+                claimed.get("project_code"),
+                claimed.get("expected_field"),
+            )
+            _mu13_send_task_assignee_choices(
+                claimed["sender"],
+                available_people,
+                no_match=True,
+            )
+            return True
+
+        try:
+            created = create_task(
+                sender=claimed["sender"],
+                text=claimed.get("original_request") or context["task_text"],
+                tag="task",
+                project_code=claimed.get("project_code"),
+                subcontractor_name=context.get("subcontractor_name"),
+                subtype="assigned",
+                assignee_wa=str(selected["id"]),
+            )
+        except Exception:
+            log.exception("Task assignment continuation failed")
+            advance_conversation_state_continuation(
+                claimed["id"],
+                claimed["sender"],
+                claimed["client_id"],
+                claimed.get("project_code"),
+                claimed.get("expected_field"),
+            )
+            return True
+
+        resolve_conversation_state(
+            claimed["id"],
+            claimed["sender"],
+            claimed["client_id"],
+            claimed.get("project_code"),
+        )
+        send_whatsapp_text(
+            phone_id,
+            claimed["sender"],
+            f"Task #{created['id']} assigned to {selected.get('label') or selected['id']}.",
+        )
+        return True
+
     def _mu13_send_action_not_found(sender_wa: str, action: str) -> None:
         messages = {
             "acknowledge": "No delivered reminder was found to acknowledge.",
@@ -4167,6 +4386,15 @@ def webhook():
                         sender,
                         lifecycle_messages[lifecycle_action],
                     )
+                return ("", 200)
+            if (
+                active_conversation_state
+                and active_conversation_state.get("state_kind") == "clarification"
+                and _mu13_existing_task_assignment_clarification(
+                    active_conversation_state,
+                    text,
+                )
+            ):
                 return ("", 200)
             if (
                 active_conversation_state
@@ -5033,11 +5261,32 @@ def webhook():
                 )
             )
             if resolution.metadata.get("resolution") != "resolved":
-                send_whatsapp_text(
-                    phone_id,
+                if not authorization:
+                    send_whatsapp_text(
+                        phone_id,
+                        sender,
+                        "No authorized assignment scope is available.",
+                    )
+                    return ("", 200)
+                state = _mu13_persist_task_assignment_clarification(
+                    m,
                     sender,
-                    "Name one uniquely authorized person for that task.",
+                    text or "",
+                    project_code,
+                    subcontractor_name,
+                    structured_route,
+                    authorization,
+                    records,
                 )
+                if state.get("status_result") != "inactive":
+                    _mu13_send_task_assignee_choices(
+                        sender,
+                        records,
+                        no_match=(
+                            resolution.metadata.get("resolution")
+                            == "not_found"
+                        ),
+                    )
                 return ("", 200)
             assignee_wa = str(resolution.entities["record_id"])
 

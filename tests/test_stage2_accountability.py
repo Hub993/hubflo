@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import unittest
 from unittest.mock import patch
 
@@ -148,6 +149,187 @@ class Stage2AccountabilityTests(unittest.TestCase):
         pm_digest = self.client.get(f"/admin/digest/pm?pm={self.sender}")
         self.assertEqual(pm_digest.status_code, 200)
         self.assertEqual(pm_digest.get_json()["total_open"], 4)
+
+    def test_zero_match_assignment_persists_and_completes_once(self):
+        with storage.SessionLocal() as session:
+            session.add_all([
+                storage.User(
+                    client_id=31,
+                    wa_id="15550000790",
+                    name="Nobody Zulu",
+                    role="sub",
+                    project_code="PROJECT_A1",
+                    active=True,
+                ),
+                storage.User(
+                    client_id=30,
+                    wa_id="15550000791",
+                    name="Outside Person",
+                    role="sub",
+                    project_code="PROJECT_B1",
+                    active=True,
+                ),
+            ])
+            session.commit()
+
+        original = "Assign Nobody Zulu to check the west gate"
+        self.send(original, "assignment-zero-match")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            state = session.query(storage.ConversationState).one()
+            self.assertTrue(state.active)
+            self.assertEqual(state.status, "active")
+            self.assertEqual(state.expected_field, "recipient_reference")
+            self.assertEqual(state.original_request, original)
+            self.assertEqual(state.client_id, 30)
+            self.assertEqual(state.project_code, "PROJECT_A1")
+            context = json.loads(state.structured_context_json)
+            candidates = json.loads(state.candidate_metadata_json)
+            self.assertEqual(context["task_text"], "check the west gate")
+            self.assertEqual(context["recipient_reference"], "Nobody Zulu")
+            candidate_ids = {
+                record["id"] for record in candidates["person_candidates"]
+            }
+            self.assertEqual(candidate_ids, {self.sender, self.jordan})
+            self.assertNotIn("15550000790", state.candidate_metadata_json)
+            self.assertNotIn("15550000791", state.candidate_metadata_json)
+            state_id = state.id
+
+        # A person authorized only after persistence cannot broaden the
+        # original candidate universe.
+        with storage.SessionLocal() as session:
+            session.add(storage.User(
+                client_id=30,
+                wa_id="15550000792",
+                name="Later Authorized",
+                role="sub",
+                project_code="PROJECT_A1",
+                active=True,
+            ))
+            session.commit()
+        self.send(original, "assignment-zero-match")
+        with storage.SessionLocal() as session:
+            replayed_state = session.get(storage.ConversationState, state_id)
+            replayed_candidates = json.loads(
+                replayed_state.candidate_metadata_json
+            )
+            self.assertNotIn(
+                "15550000792",
+                {
+                    record["id"]
+                    for record in replayed_candidates["person_candidates"]
+                },
+            )
+        self.send("15550000792", "assignment-expanded-person")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            self.assertTrue(
+                session.get(storage.ConversationState, state_id).active
+            )
+
+        self.send("Jordan Unique", "assignment-zero-followup")
+        self.send("Jordan Unique", "assignment-zero-followup")
+        with storage.SessionLocal() as session:
+            tasks = session.query(storage.Task).all()
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].text, original)
+            self.assertIn("check the west gate", tasks[0].text)
+            self.assertEqual(tasks[0].pm_wa_id, self.jordan)
+            state = session.get(storage.ConversationState, state_id)
+            self.assertFalse(state.active)
+            self.assertEqual(state.status, "resolved")
+
+    def test_many_match_assignment_clarifies_bypasses_and_resumes(self):
+        with storage.SessionLocal() as session:
+            session.add_all([
+                storage.User(
+                    client_id=30,
+                    wa_id="15550000710",
+                    name="Alex Shared",
+                    subcontractor_name="Alex North",
+                    role="sub",
+                    project_code="PROJECT_A1",
+                    active=True,
+                ),
+                storage.User(
+                    client_id=30,
+                    wa_id="15550000711",
+                    name="Alex Shared",
+                    subcontractor_name="Alex South",
+                    role="sub",
+                    project_code="PROJECT_A1",
+                    active=True,
+                ),
+            ])
+            session.commit()
+
+        original = "Assign Alex to check the loading area"
+        self.send(original, "assignment-many-match")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            state = session.query(storage.ConversationState).one()
+            state_id = state.id
+            candidates = json.loads(state.candidate_metadata_json)
+            candidate_ids = {
+                record["id"] for record in candidates["person_candidates"]
+            }
+            self.assertTrue({
+                "15550000710", "15550000711"
+            }.issubset(candidate_ids))
+
+        self.send("Alex", "assignment-still-ambiguous")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            self.assertTrue(
+                session.get(storage.ConversationState, state_id).active
+            )
+
+        self.send(
+            "Book inspection for drywall tomorrow",
+            "assignment-deterministic-bypass",
+        )
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Inspection).count(), 1)
+            self.assertTrue(
+                session.get(storage.ConversationState, state_id).active
+            )
+
+        self.send("Alex North", "assignment-many-followup")
+        with storage.SessionLocal() as session:
+            tasks = session.query(storage.Task).all()
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].text, original)
+            self.assertEqual(tasks[0].pm_wa_id, "15550000710")
+            state = session.get(storage.ConversationState, state_id)
+            self.assertFalse(state.active)
+            self.assertEqual(state.status, "resolved")
+
+    def test_out_of_project_named_person_remains_unresolved_and_hidden(self):
+        outside_wa = "15550000791"
+        with storage.SessionLocal() as session:
+            session.add(storage.User(
+                client_id=30,
+                wa_id=outside_wa,
+                name="Outside Person",
+                role="sub",
+                project_code="PROJECT_B1",
+                active=True,
+            ))
+            session.commit()
+
+        original = "Assign Outside Person to check the west gate"
+        self.send(original, "assignment-outside-project")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            state = session.query(storage.ConversationState).one()
+            self.assertTrue(state.active)
+            self.assertEqual(state.original_request, original)
+            candidates = json.loads(state.candidate_metadata_json)
+            candidate_ids = {
+                record["id"] for record in candidates["person_candidates"]
+            }
+            self.assertNotIn(outside_wa, candidate_ids)
+            self.assertNotIn(outside_wa, state.candidate_metadata_json)
 
     def test_factual_default_does_not_bypass_await_or_clarification(self):
         awaiting = storage.create_task(
