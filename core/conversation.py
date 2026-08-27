@@ -510,6 +510,7 @@ class CoreConversation:
                     "july": 7,
                     "august": 8,
                     "september": 9,
+                    "sept": 9,
                     "october": 10,
                     "november": 11,
                     "december": 12,
@@ -719,11 +720,16 @@ class CoreConversation:
                         r"seven|eight|nine|ten|eleven|twelve)\b",
                         text,
                     )
-                    selected = quarter_match or word_match
+                    half_match = re.search(
+                        r"\bhalf\s+past\s+(one|two|three|four|five|six|"
+                        r"seven|eight|nine|ten|eleven|twelve)\b",
+                        text,
+                    )
+                    selected = quarter_match or half_match or word_match
                     if not selected:
                         return ConversationResult()
                     hour = number_words[selected.group(1)]
-                    minute = 15 if quarter_match else 0
+                    minute = 15 if quarter_match else 30 if half_match else 0
                     meridiem = None
                 else:
                     hour = int(match.group(1) or match.group(4) or match.group(6))

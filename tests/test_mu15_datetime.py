@@ -50,6 +50,9 @@ class MU15SharedDateTimeTests(unittest.TestCase):
             self.calendar("25/08/2026", "day_first"), self.reference,
         )
         self.assert_date(self.calendar("25 August 2026"), self.reference)
+        self.assert_date(
+            self.calendar("Sept 1 2026"), dt.date(2026, 9, 1)
+        )
 
     def test_ambiguous_numeric_requires_or_obeys_policy(self):
         unresolved = self.calendar("04/05/2027")
@@ -92,6 +95,67 @@ class MU15SharedDateTimeTests(unittest.TestCase):
             self.clock("tomorrow evening at quarter past nine"),
             {"hour": 21, "minute": 15},
         )
+        self.assertEqual(
+            self.clock("at half past four"),
+            {"hour": 4, "minute": 30},
+        )
+
+    def test_reminder_date_time_composition_forms(self):
+        now_local = dt.datetime(
+            2026, 8, 27, 10, 0,
+            tzinfo=ZoneInfo("America/New_York"),
+        )
+        cases = (
+            (
+                "Remind me on 31 August at 16:30 to check the generator",
+                dt.datetime(2026, 8, 31, 16, 30),
+            ),
+            (
+                "Remind me Friday at 18:45 to check the generator",
+                dt.datetime(2026, 8, 28, 18, 45),
+            ),
+            (
+                "Remind me on August 31 at 4 PM to check the generator",
+                dt.datetime(2026, 8, 31, 16, 0),
+            ),
+            (
+                "Remind me on Sept 1 at 4:30 PM to check the generator",
+                dt.datetime(2026, 9, 1, 16, 30),
+            ),
+            (
+                "Remind me on September 1 at half past four "
+                "to check the generator",
+                dt.datetime(2026, 9, 1, 4, 30),
+            ),
+            (
+                "Remind me at half past four on Sept 1 "
+                "to check the generator",
+                dt.datetime(2026, 9, 1, 4, 30),
+            ),
+        )
+        for text_value, expected_local in cases:
+            parsed = hubflo_app.parse_pm_reminder_request(
+                text_value,
+                timezone_name="America/New_York",
+                now_local=now_local,
+            )
+            self.assertIsNotNone(parsed, text_value)
+            actual_local = parsed["next_run"].replace(
+                tzinfo=dt.timezone.utc
+            ).astimezone(ZoneInfo("America/New_York"))
+            self.assertEqual(
+                actual_local.replace(tzinfo=None), expected_local, text_value
+            )
+
+        for invalid in (
+            "Remind me on Sept 32 at half past four to check the generator",
+            "Remind me on Sept 1 at half past thirteen to check the generator",
+        ):
+            self.assertIsNone(hubflo_app.parse_pm_reminder_request(
+                invalid,
+                timezone_name="America/New_York",
+                now_local=now_local,
+            ))
 
     def test_timezone_controls_relative_day_at_boundary(self):
         instant = dt.datetime(2026, 8, 26, 3, 30, tzinfo=dt.timezone.utc)
@@ -189,6 +253,34 @@ class MU15PersistentClarificationTests(unittest.TestCase):
         self.assertEqual(replay.status_code, 200)
         with storage.SessionLocal() as session:
             self.assertEqual(session.query(storage.PMReminder).count(), 1)
+
+    def test_spoken_time_and_abbreviated_month_persist_one_reminder(self):
+        original = (
+            "Remind me at half past four on Sept 1 to check the generator"
+        )
+        response = self.client.post(
+            "/webhook",
+            json=inbound(self.sender, original, "sept-half-past-reminder"),
+        )
+        self.assertEqual(response.status_code, 200)
+        with storage.SessionLocal() as session:
+            reminders = session.query(storage.PMReminder).all()
+            self.assertEqual(len(reminders), 1)
+            self.assertEqual(reminders[0].text, original)
+            self.assertEqual(session.query(storage.Task).count(), 0)
+
+        invalid = self.client.post(
+            "/webhook",
+            json=inbound(
+                self.sender,
+                "Remind me on Sept 32 at half past four to check the generator",
+                "invalid-sept-half-past-reminder",
+            ),
+        )
+        self.assertEqual(invalid.status_code, 200)
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.PMReminder).count(), 1)
+            self.assertEqual(session.query(storage.Task).count(), 0)
 
 
 if __name__ == "__main__":
