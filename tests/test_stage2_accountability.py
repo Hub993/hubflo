@@ -50,6 +50,34 @@ class Stage2AccountabilityTests(unittest.TestCase):
             accountable_wa, 30, projects
         )
 
+    def retired_legacy_await(self, reason, marker="drop_location"):
+        task = storage.create_task(
+            self.sender,
+            f"[await:{marker}]\nLegacy compatibility fixture",
+            tag="order",
+            project_code="PROJECT_A1",
+        )
+        state = storage.save_pending_conversation_state({
+            "client_id": 30,
+            "sender": self.sender,
+            "project_code": "PROJECT_A1",
+            "state_kind": "await",
+            "expected_field": marker,
+            "original_request": "Legacy compatibility fixture",
+            "structured_context": {"source_record_id": task["id"]},
+            "candidate_metadata": {},
+            "continuation": {
+                "source_record_id": task["id"],
+                "source_record_type": "pending_business_state",
+            },
+            "continuation_key": f"business-state:{task['id']}",
+        })
+        retired = storage.retire_conversation_state(
+            state["id"], self.sender, 30, "PROJECT_A1", reason
+        )
+        self.assertEqual(retired["status_result"], "retired")
+        return task, state
+
     def test_ordinary_actionable_is_sender_owned_and_factual_is_not_task(self):
         self.assertEqual(self.send(
             "Check the generator", "accountability-ordinary"
@@ -142,10 +170,15 @@ class Stage2AccountabilityTests(unittest.TestCase):
         before = awaiting["text"]
         self.send("Crew discussed tomorrow's access", "factual-await")
         self.send("Check the generator", "actionable-default-await")
+        self.send(
+            "Book inspection for drywall tomorrow",
+            "deterministic-specialized-await-bypass",
+        )
         with storage.SessionLocal() as session:
             self.assertEqual(session.get(storage.Task, awaiting["id"]).text, before)
             self.assertTrue(session.get(storage.ConversationState, state["id"]).active)
             self.assertEqual(session.query(storage.Task).count(), 1)
+            self.assertEqual(session.query(storage.Inspection).count(), 1)
 
         storage.retire_conversation_state(
             state["id"], self.sender, 30, "PROJECT_A1", "cancelled"
@@ -168,6 +201,43 @@ class Stage2AccountabilityTests(unittest.TestCase):
             current = session.get(storage.ConversationState, clarification["id"])
             self.assertTrue(current.active)
             self.assertEqual(session.query(storage.Task).count(), 1)
+
+    def test_retired_legacy_await_tombstones_cannot_consume_normal_tasks(self):
+        for index, reason in enumerate(("abandoned", "cancelled", "restarted")):
+            legacy, state = self.retired_legacy_await(reason)
+            message = f"Check the generator {index + 1}"
+            self.send(message, f"retired-await-actionable-{reason}")
+            with storage.SessionLocal() as session:
+                compatibility = session.get(storage.Task, legacy["id"])
+                lifecycle = session.get(storage.ConversationState, state["id"])
+                created = session.query(storage.Task).filter(
+                    storage.Task.text == message
+                ).one()
+                self.assertEqual(compatibility.status, "open")
+                self.assertTrue(compatibility.text.startswith("[await:drop_location]"))
+                self.assertFalse(lifecycle.active)
+                self.assertEqual(lifecycle.status, reason)
+                self.assertEqual(created.tag, "task")
+                self.assertEqual(created.pm_wa_id, self.sender)
+
+        legacy, state = self.retired_legacy_await("abandoned")
+        before_count = None
+        with storage.SessionLocal() as session:
+            before_count = session.query(storage.Task).count()
+        self.send(
+            "Crew discussed tomorrow's access",
+            "retired-await-factual",
+        )
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), before_count)
+            self.assertTrue(
+                session.get(storage.Task, legacy["id"]).text.startswith(
+                    "[await:drop_location]"
+                )
+            )
+            lifecycle = session.get(storage.ConversationState, state["id"])
+            self.assertFalse(lifecycle.active)
+            self.assertEqual(lifecycle.status, "abandoned")
 
     def test_order_continuation_and_change_order_keep_originating_owner(self):
         self.send(

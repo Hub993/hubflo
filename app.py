@@ -1687,7 +1687,7 @@ def webhook():
                 "continuation_key": continuation_key,
             }
         )
-        return state if state.get("active") else None
+        return state
 
     def _get_await_conversation_state(awaiting) -> Optional[dict]:
         return get_pending_conversation_state(
@@ -4341,9 +4341,21 @@ def webhook():
                                 or await_project == current_project
                             )
                         ):
-                            pending_state = _ensure_await_conversation_state(
+                            migrated_state = _ensure_await_conversation_state(
                                 awaiting
                             )
+                            if (
+                                migrated_state
+                                and migrated_state.get("active")
+                                and migrated_state.get("status") == "active"
+                            ):
+                                pending_state = migrated_state
+                            else:
+                                # An inactive state with this continuation key
+                                # is the lifecycle tombstone for the retained
+                                # compatibility Task. It must never become an
+                                # actionable await again.
+                                awaiting = None
 
                 pending_reply_valid = False
                 pending_reply_invalid = False
