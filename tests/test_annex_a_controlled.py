@@ -687,6 +687,115 @@ class AnnexAControlledFixture(unittest.TestCase):
         with storage.SessionLocal() as session:
             self.assertEqual(session.query(storage.Task).count(), 2)
 
+    def test_search_emits_scoped_read_only_execution_evidence(self):
+        own = storage.create_task(
+            self.sender, "Kitchen evidence fixture", tag="task",
+            project_code="PROJECT_A1",
+        )
+        outside = storage.create_task(
+            self.sender, "Kitchen outside mapped project", tag="task",
+            project_code="PROJECT_A2",
+        )
+        foreign_sender = "15550000610"
+        with storage.SessionLocal() as session:
+            session.add(storage.User(
+                client_id=21, wa_id=foreign_sender, name="Foreign Search PM",
+                role="pm", project_code="PROJECT_A1", active=True,
+            ))
+            session.commit()
+        foreign = storage.create_task(
+            foreign_sender, "Kitchen foreign-client fixture", tag="task",
+            project_code="PROJECT_A1",
+        )
+
+        def snapshot():
+            with storage.SessionLocal() as session:
+                tasks = [
+                    (row.id, row.client_id, row.project_code, row.status, row.text)
+                    for row in session.query(storage.Task).order_by(storage.Task.id)
+                ]
+                audits = [
+                    (row.id, row.client_id, row.action, row.ref_type, row.ref_id)
+                    for row in session.query(storage.Audit).order_by(storage.Audit.id)
+                ]
+            return tasks, audits
+
+        before = snapshot()
+        with patch.object(hubflo_app, "send_whatsapp_text", return_value=(True, {})), \
+                patch.object(hubflo_app.log, "info") as info:
+            response = self.send("Search for kitchen", "search-evidence")
+        self.assertEqual(response.status_code, 200)
+        messages = [call.args[0] % call.args[1:] for call in info.call_args_list]
+        evidence = [
+            message for message in messages
+            if "stage2_read_evidence route=search" in message
+        ]
+        self.assertEqual(len(evidence), 1)
+        self.assertIn("client_id=20", evidence[0])
+        self.assertIn("project_codes=['PROJECT_A1']", evidence[0])
+        self.assertIn("normalized_query='search for kitchen'", evidence[0])
+        self.assertIn("result_count=1", evidence[0])
+        self.assertIn(f"result_ids=[{own['id']}]", evidence[0])
+        self.assertNotIn(str(outside["id"]), evidence[0].split("result_ids=", 1)[1])
+        self.assertNotIn(str(foreign["id"]), evidence[0].split("result_ids=", 1)[1])
+        self.assertEqual(snapshot(), before)
+        self.assertFalse(any("route=status" in message for message in messages))
+
+    def test_status_emits_scoped_read_only_execution_evidence(self):
+        storage.create_task(
+            self.sender, "Scoped status one", tag="task",
+            project_code="PROJECT_A1",
+        )
+        storage.create_task(
+            self.sender, "Scoped status two", tag="task",
+            project_code="PROJECT_A1",
+        )
+        storage.create_task(
+            self.sender, "Outside project status", tag="task",
+            project_code="PROJECT_A2",
+        )
+        foreign_sender = "15550000611"
+        with storage.SessionLocal() as session:
+            session.add(storage.User(
+                client_id=21, wa_id=foreign_sender, name="Foreign Status PM",
+                role="pm", project_code="PROJECT_A1", active=True,
+            ))
+            session.commit()
+        storage.create_task(
+            foreign_sender, "Foreign status fixture", tag="task",
+            project_code="PROJECT_A1",
+        )
+
+        def snapshot():
+            with storage.SessionLocal() as session:
+                tasks = [
+                    (row.id, row.client_id, row.project_code, row.status, row.text)
+                    for row in session.query(storage.Task).order_by(storage.Task.id)
+                ]
+                audits = [
+                    (row.id, row.client_id, row.action, row.ref_type, row.ref_id)
+                    for row in session.query(storage.Audit).order_by(storage.Audit.id)
+                ]
+            return tasks, audits
+
+        before = snapshot()
+        with patch.object(hubflo_app, "send_whatsapp_text", return_value=(True, {})), \
+                patch.object(hubflo_app.log, "info") as info:
+            response = self.send("What is the status", "status-evidence")
+        self.assertEqual(response.status_code, 200)
+        messages = [call.args[0] % call.args[1:] for call in info.call_args_list]
+        evidence = [
+            message for message in messages
+            if "stage2_read_evidence route=status" in message
+        ]
+        self.assertEqual(len(evidence), 1)
+        self.assertIn("client_id=20", evidence[0])
+        self.assertIn("project_code='PROJECT_A1'", evidence[0])
+        self.assertIn("status_counts={'open': 2}", evidence[0])
+        self.assertIn("summary='open: 2'", evidence[0])
+        self.assertEqual(snapshot(), before)
+        self.assertFalse(any("route=search" in message for message in messages))
+
     def test_unauthorized_project_approval_arrives_but_does_not_mutate(self):
         outside = storage.create_task(
             self.sender, "Outside project order", tag="order",

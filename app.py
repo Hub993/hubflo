@@ -1619,6 +1619,7 @@ def webhook():
                 return
 
             role = (u.role or "").lower().strip()
+            authorized_projects = []
             q = s.query(Task).filter(
                 Task.client_id == int(u.client_id or 1)
             )
@@ -1630,6 +1631,8 @@ def webhook():
             if role == "sub":
                 # Subs only see their own tasks
                 q = q.filter(Task.sender == sender_wa)
+                if u.project_code:
+                    authorized_projects = [u.project_code]
 
             elif role == "pm":
                 # PMs = tasks across mapped projects
@@ -1647,6 +1650,7 @@ def webhook():
                     return
 
                 q = q.filter(Task.project_code.in_(projects))
+                authorized_projects = sorted(set(projects))
 
             else:
                 # Directors / Admin roles → same project mapping logic
@@ -1668,6 +1672,7 @@ def webhook():
                     return
 
                 q = q.filter(Task.project_code.in_(projects))
+                authorized_projects = sorted(set(projects))
 
             # ------------------------------------------------------------
             # SUB CONTRACTOR-SPECIFIC SCOPING
@@ -1758,6 +1763,17 @@ def webhook():
             # EXECUTE QUERY
             # ------------------------------------------------------------
             rows = q.order_by(Task.id.desc()).limit(25).all()
+            normalized_query = " ".join(t.split())
+            log.info(
+                "stage2_read_evidence route=search client_id=%s "
+                "project_codes=%s normalized_query=%r result_count=%s "
+                "result_ids=%s",
+                int(u.client_id or 1),
+                authorized_projects,
+                normalized_query,
+                len(rows),
+                [int(row.id) for row in rows],
+            )
 
             if not rows:
                 send_whatsapp_text(
@@ -4650,6 +4666,17 @@ def webhook():
             summary = ", ".join(
                 f"{name}: {count}" for name, count in sorted(counts.items())
             ) or "no task records"
+            ordered_counts = {
+                name: counts[name] for name in sorted(counts)
+            }
+            log.info(
+                "stage2_read_evidence route=status client_id=%s "
+                "project_code=%r status_counts=%s summary=%r",
+                int(user_info.get("client_id") or 1),
+                project_code,
+                ordered_counts,
+                summary,
+            )
             send_whatsapp_text(phone_id, sender, f"Project status — {summary}.")
             return ("", 200)
 
