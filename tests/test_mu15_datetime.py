@@ -100,6 +100,71 @@ class MU15SharedDateTimeTests(unittest.TestCase):
             {"hour": 4, "minute": 30},
         )
 
+    def test_rule_based_spoken_clock_offsets_across_hours(self):
+        cases = {
+            "five past four": (4, 5),
+            "ten past four": (4, 10),
+            "twenty past four": (4, 20),
+            "twenty-five past four": (4, 25),
+            "quarter past four": (4, 15),
+            "half past four": (4, 30),
+            "twenty-five to five": (4, 35),
+            "twenty to five": (4, 40),
+            "quarter to five": (4, 45),
+            "ten to five": (4, 50),
+            "five to five": (4, 55),
+            "five past eleven": (11, 5),
+            "twenty to one": (12, 40),
+        }
+        for phrase, (hour, minute) in cases.items():
+            self.assertEqual(
+                self.clock(phrase),
+                {"hour": hour, "minute": minute},
+                phrase,
+            )
+
+        # No accepted user/locale authority currently distinguishes the UK
+        # convention from other regional meanings, so this remains unresolved.
+        self.assertEqual(self.clock("half four"), {})
+
+    def test_spoken_clock_composes_with_supported_calendar_forms(self):
+        now_local = dt.datetime(
+            2026, 8, 27, 10, 0,
+            tzinfo=ZoneInfo("America/New_York"),
+        )
+        cases = (
+            (
+                "Remind me on Sept 1 at five past four to check access",
+                dt.datetime(2026, 9, 1, 4, 5),
+            ),
+            (
+                "Remind me on September 1 at twenty-five to five "
+                "to check access",
+                dt.datetime(2026, 9, 1, 4, 35),
+            ),
+            (
+                "Remind me on 31 August at quarter to five to check access",
+                dt.datetime(2026, 8, 31, 4, 45),
+            ),
+            (
+                "Remind me Friday at ten past four to check access",
+                dt.datetime(2026, 8, 28, 4, 10),
+            ),
+        )
+        for text_value, expected_local in cases:
+            parsed = hubflo_app.parse_pm_reminder_request(
+                text_value,
+                timezone_name="America/New_York",
+                now_local=now_local,
+            )
+            self.assertIsNotNone(parsed, text_value)
+            actual_local = parsed["next_run"].replace(
+                tzinfo=dt.timezone.utc
+            ).astimezone(ZoneInfo("America/New_York"))
+            self.assertEqual(
+                actual_local.replace(tzinfo=None), expected_local, text_value
+            )
+
     def test_reminder_date_time_composition_forms(self):
         now_local = dt.datetime(
             2026, 8, 27, 10, 0,
@@ -278,6 +343,27 @@ class MU15PersistentClarificationTests(unittest.TestCase):
             ),
         )
         self.assertEqual(invalid.status_code, 200)
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.PMReminder).count(), 1)
+            self.assertEqual(session.query(storage.Task).count(), 0)
+
+        for message_id, invalid_text in (
+            (
+                "unsupported-regional-half-four",
+                "Remind me on Sept 1 at half four to check the generator",
+            ),
+            (
+                "invalid-spoken-offset",
+                "Remind me on Sept 1 at thirty-five past four "
+                "to check the generator",
+            ),
+        ):
+            response = self.client.post(
+                "/webhook",
+                json=inbound(self.sender, invalid_text, message_id),
+            )
+            self.assertEqual(response.status_code, 200)
+
         with storage.SessionLocal() as session:
             self.assertEqual(session.query(storage.PMReminder).count(), 1)
             self.assertEqual(session.query(storage.Task).count(), 0)

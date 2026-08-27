@@ -715,21 +715,42 @@ class CoreConversation:
                         r"eight|nine|ten|eleven|twelve)\b",
                         text,
                     )
-                    quarter_match = re.search(
-                        r"\bquarter\s+past\s+(one|two|three|four|five|six|"
-                        r"seven|eight|nine|ten|eleven|twelve)\b",
+                    spoken_offset_match = re.search(
+                        r"(?:^|\bat\s+)"
+                        r"(five|ten|quarter|twenty(?:[\s-]+five)?|half)"
+                        r"\s+(past|to)\s+"
+                        r"(one|two|three|four|five|six|seven|eight|nine|"
+                        r"ten|eleven|twelve)\b",
                         text,
                     )
-                    half_match = re.search(
-                        r"\bhalf\s+past\s+(one|two|three|four|five|six|"
-                        r"seven|eight|nine|ten|eleven|twelve)\b",
-                        text,
-                    )
-                    selected = quarter_match or half_match or word_match
+                    selected = spoken_offset_match or word_match
                     if not selected:
                         return ConversationResult()
-                    hour = number_words[selected.group(1)]
-                    minute = 15 if quarter_match else 30 if half_match else 0
+                    if spoken_offset_match:
+                        minute_words = {
+                            "five": 5,
+                            "ten": 10,
+                            "quarter": 15,
+                            "twenty": 20,
+                            "twenty five": 25,
+                            "half": 30,
+                        }
+                        minute_text = re.sub(
+                            r"[\s-]+", " ", spoken_offset_match.group(1)
+                        )
+                        offset = minute_words[minute_text]
+                        direction = spoken_offset_match.group(2)
+                        target_hour = number_words[
+                            spoken_offset_match.group(3)
+                        ]
+                        if direction == "past":
+                            hour, minute = target_hour, offset
+                        else:
+                            hour = target_hour - 1 or 12
+                            minute = 60 - offset
+                    else:
+                        hour = number_words[word_match.group(1)]
+                        minute = 0
                     meridiem = None
                 else:
                     hour = int(match.group(1) or match.group(4) or match.group(6))
