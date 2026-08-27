@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import unittest
 from unittest.mock import patch
 
@@ -49,6 +50,42 @@ class Stage2AccountabilityTests(unittest.TestCase):
         return storage.get_personal_responsibilities(
             accountable_wa, 30, projects
         )
+
+    def add_person(
+        self,
+        wa_id,
+        name,
+        project_code="PROJECT_A1",
+        client_id=30,
+        subcontractor_name=None,
+    ):
+        with storage.SessionLocal() as session:
+            session.add(storage.User(
+                client_id=client_id,
+                wa_id=wa_id,
+                name=name,
+                subcontractor_name=subcontractor_name,
+                role="sub",
+                project_code=project_code,
+                active=True,
+            ))
+            session.commit()
+
+    def assignment_state(self):
+        with storage.SessionLocal() as session:
+            state = session.query(storage.ConversationState).one()
+            return {
+                "id": state.id,
+                "active": state.active,
+                "status": state.status,
+                "expected_field": state.expected_field,
+                "original_request": state.original_request,
+                "client_id": state.client_id,
+                "project_code": state.project_code,
+                "context": json.loads(state.structured_context_json),
+                "candidates": json.loads(state.candidate_metadata_json),
+                "continuation": json.loads(state.continuation_json),
+            }
 
     def retired_legacy_await(self, reason, marker="drop_location"):
         task = storage.create_task(
@@ -357,6 +394,225 @@ class Stage2AccountabilityTests(unittest.TestCase):
                 storage.Task.status == "open",
                 storage.Task.pm_wa_id == None,
             ).count(), 0)
+
+    def test_unresolved_task_assignment_preserves_action_and_scope(self):
+        foreign_wa = "15550000790"
+        later_wa = "15550000792"
+        self.add_person(
+            foreign_wa,
+            "Nobody Zulu",
+            client_id=31,
+        )
+        original = "Assign Nobody Zulu to check the west gate"
+        self.send(original, "task-assignment-zero")
+
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+        state = self.assignment_state()
+        self.assertTrue(state["active"])
+        self.assertEqual(state["expected_field"], "recipient_reference")
+        self.assertEqual(state["original_request"], original)
+        self.assertEqual(state["client_id"], 30)
+        self.assertEqual(state["project_code"], "PROJECT_A1")
+        self.assertEqual(state["context"]["route"], "task")
+        self.assertEqual(state["context"]["action"], "create")
+        self.assertEqual(state["continuation"]["route"], "task")
+        self.assertEqual(state["context"]["task_text"], "check the west gate")
+        self.assertEqual(
+            state["context"]["recipient_reference"], "Nobody Zulu"
+        )
+        candidate_ids = {
+            row["id"] for row in state["candidates"]["person_candidates"]
+        }
+        self.assertEqual(candidate_ids, {self.sender, self.jordan})
+        self.assertNotIn(foreign_wa, json.dumps(state["candidates"]))
+
+        self.add_person(later_wa, "Later Authorized")
+        self.send(original, "task-assignment-zero")
+        replayed = self.assignment_state()
+        self.assertNotIn(
+            later_wa,
+            {
+                row["id"]
+                for row in replayed["candidates"]["person_candidates"]
+            },
+        )
+        self.send(later_wa, "task-assignment-expanded")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            self.assertTrue(
+                session.get(storage.ConversationState, state["id"]).active
+            )
+
+        self.send("Jordan Unique", "task-assignment-resolve")
+        self.send("Jordan Unique", "task-assignment-resolve")
+        with storage.SessionLocal() as session:
+            rows = session.query(storage.Task).all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].tag, "task")
+            self.assertEqual(rows[0].subtype, "assigned")
+            self.assertEqual(rows[0].text, original)
+            self.assertIn("check the west gate", rows[0].text)
+            self.assertEqual(rows[0].pm_wa_id, self.jordan)
+            resolved = session.get(storage.ConversationState, state["id"])
+            self.assertFalse(resolved.active)
+            self.assertEqual(resolved.status, "resolved")
+
+    def test_ambiguous_task_assignment_persists_only_matching_people(self):
+        north_wa = "15550000710"
+        south_wa = "15550000711"
+        self.add_person(
+            north_wa,
+            "Alex Shared",
+            subcontractor_name="Alex North",
+        )
+        self.add_person(
+            south_wa,
+            "Alex Shared",
+            subcontractor_name="Alex South",
+        )
+        original = "Assign Alex to check the loading area"
+        self.send(original, "task-assignment-many")
+
+        state = self.assignment_state()
+        self.assertEqual(state["context"]["route"], "task")
+        self.assertEqual(state["context"]["task_text"], "check the loading area")
+        self.assertEqual(
+            {
+                row["id"]
+                for row in state["candidates"]["person_candidates"]
+            },
+            {north_wa, south_wa},
+        )
+        self.send("Jordan Unique", "task-assignment-not-permitted")
+        self.send("Alex", "task-assignment-still-many")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            self.assertTrue(
+                session.get(storage.ConversationState, state["id"]).active
+            )
+
+        self.send(
+            "Book inspection for drywall tomorrow",
+            "task-assignment-bypass",
+        )
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Inspection).count(), 1)
+            self.assertTrue(
+                session.get(storage.ConversationState, state["id"]).active
+            )
+
+        self.send("Alex North", "task-assignment-distinguish")
+        with storage.SessionLocal() as session:
+            row = session.query(storage.Task).one()
+            self.assertEqual(row.tag, "task")
+            self.assertEqual(row.text, original)
+            self.assertEqual(row.pm_wa_id, north_wa)
+            self.assertFalse(
+                session.get(storage.ConversationState, state["id"]).active
+            )
+
+    def test_unresolved_delivery_assignment_preserves_delivery_identity(self):
+        outside_wa = "15550000791"
+        self.add_person(
+            outside_wa,
+            "Outside Courier",
+            project_code="PROJECT_B1",
+        )
+        original = (
+            "Assign Outside Courier to deliver cement to the west gate tomorrow"
+        )
+        self.send(original, "delivery-assignment-zero")
+
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+        state = self.assignment_state()
+        self.assertEqual(state["context"]["route"], "delivery")
+        self.assertEqual(state["context"]["action"], "create")
+        self.assertEqual(state["continuation"]["route"], "delivery")
+        self.assertEqual(state["context"]["subtype"], "assigned")
+        self.assertEqual(
+            state["context"]["task_text"],
+            "deliver cement to the west gate tomorrow",
+        )
+        self.assertEqual(
+            state["context"]["recipient_reference"], "Outside Courier"
+        )
+        self.assertNotIn(outside_wa, json.dumps(state["candidates"]))
+
+        self.send("Jordan Unique", "delivery-assignment-resolve")
+        self.send("Jordan Unique", "delivery-assignment-resolve")
+        with storage.SessionLocal() as session:
+            rows = session.query(storage.Task).all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].tag, "delivery")
+            self.assertEqual(rows[0].subtype, "assigned")
+            self.assertEqual(rows[0].status, "open")
+            self.assertEqual(rows[0].text, original)
+            self.assertEqual(rows[0].pm_wa_id, self.jordan)
+            self.assertEqual(session.query(storage.Task).filter(
+                storage.Task.tag == "task"
+            ).count(), 0)
+            resolved = session.get(storage.ConversationState, state["id"])
+            self.assertFalse(resolved.active)
+            self.assertEqual(resolved.status, "resolved")
+
+    def test_ambiguous_delivery_assignment_narrows_before_execution(self):
+        north_wa = "15550000710"
+        south_wa = "15550000711"
+        self.add_person(
+            north_wa,
+            "Alex Shared",
+            subcontractor_name="Alex North",
+        )
+        self.add_person(
+            south_wa,
+            "Alex Shared",
+            subcontractor_name="Alex South",
+        )
+        original = "Assign Alex to deliver grout to the loading area tomorrow"
+        self.send(original, "delivery-assignment-many")
+
+        state = self.assignment_state()
+        self.assertEqual(state["context"]["route"], "delivery")
+        self.assertEqual(
+            {
+                row["id"]
+                for row in state["candidates"]["person_candidates"]
+            },
+            {north_wa, south_wa},
+        )
+        self.send("Alex", "delivery-assignment-still-many")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            north = session.query(storage.User).filter(
+                storage.User.wa_id == north_wa
+            ).one()
+            north.active = False
+            session.commit()
+
+        self.send("Alex North", "delivery-assignment-no-longer-authorized")
+        with storage.SessionLocal() as session:
+            self.assertEqual(session.query(storage.Task).count(), 0)
+            self.assertTrue(
+                session.get(storage.ConversationState, state["id"]).active
+            )
+
+        self.send("Alex South", "delivery-assignment-distinguish")
+        self.send("Alex South", "delivery-assignment-distinguish")
+        with storage.SessionLocal() as session:
+            rows = session.query(storage.Task).all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].tag, "delivery")
+            self.assertEqual(rows[0].subtype, "assigned")
+            self.assertEqual(rows[0].text, original)
+            self.assertEqual(rows[0].pm_wa_id, south_wa)
+            self.assertEqual(session.query(storage.Task).filter(
+                storage.Task.tag == "task"
+            ).count(), 0)
+            self.assertFalse(
+                session.get(storage.ConversationState, state["id"]).active
+            )
 
     def test_pending_approval_is_visible_to_owner_and_project_pm(self):
         task = storage.create_task(
