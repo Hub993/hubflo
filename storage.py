@@ -152,13 +152,41 @@ class Inspection(Base):
 
 def create_inspection(payload: dict) -> dict:
     with SessionLocal() as s:
+        actor = str(
+            payload.get("actor") or payload.get("accountable_wa") or ""
+        ).strip()
+        owner = s.query(User).filter(
+            User.wa_id == actor,
+            User.active == True,
+        ).first()
+        if not owner:
+            return {"error": "accountable actor not found"}
+
+        client_id = int(owner.client_id or DEFAULT_CLIENT_ID)
+        authorized_projects = {
+            str(owner.project_code).strip()
+            if owner.project_code is not None
+            else ""
+        }
+        mapped = s.query(PMProjectMap.project_code).filter(
+            PMProjectMap.pm_user_id == owner.id,
+            PMProjectMap.client_id == client_id,
+        ).all()
+        authorized_projects.update(
+            str(row.project_code or "").strip() for row in mapped
+        )
+        authorized_projects.discard("")
+        project_code = str(payload.get("project_code") or "").strip()
+        if not project_code or project_code not in authorized_projects:
+            return {"error": "inspection project not authorized"}
+
         ins = Inspection(
-            client_id=int(payload.get("client_id") or DEFAULT_CLIENT_ID),
-            project_code=payload.get("project_code"),
+            client_id=client_id,
+            project_code=project_code,
             phase=payload.get("phase"),
             required_date=payload.get("required_date"),
             inspector=payload.get("inspector"),
-            accountable_wa=payload.get("accountable_wa"),
+            accountable_wa=actor,
             notes=payload.get("notes"),
         )
         s.add(ins)
@@ -1788,24 +1816,52 @@ def _repair_stage2_client_columns():
             ))
 
 
-def _repair_inspection_accountability():
-    """Add accountable ownership without conflating it with inspector identity."""
-    insp = inspect(ENGINE)
-    if "inspections" not in insp.get_table_names():
-        return
-    columns = {column["name"] for column in insp.get_columns("inspections")}
-    indexes = {index.get("name") for index in insp.get_indexes("inspections")}
-    with ENGINE.begin() as conn:
-        if "accountable_wa" not in columns:
-            conn.execute(text(
-                "ALTER TABLE inspections "
-                "ADD COLUMN accountable_wa VARCHAR(64)"
-            ))
-        if "ix_inspections_accountable_wa" not in indexes:
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_inspections_accountable_wa "
-                "ON inspections (accountable_wa)"
-            ))
+def migrate_inspection_accountability() -> dict:
+    """Idempotently converge and verify required Inspection ownership schema."""
+    try:
+        insp = inspect(ENGINE)
+        if "inspections" not in insp.get_table_names():
+            return {"status": "not_applicable", "changed": []}
+        columns = {
+            column["name"] for column in insp.get_columns("inspections")
+        }
+        indexes = {
+            index.get("name") for index in insp.get_indexes("inspections")
+        }
+        changed = []
+        with ENGINE.begin() as conn:
+            if "accountable_wa" not in columns:
+                conn.execute(text(
+                    "ALTER TABLE inspections "
+                    "ADD COLUMN accountable_wa VARCHAR(64)"
+                ))
+                changed.append("inspections.accountable_wa")
+            if "ix_inspections_accountable_wa" not in indexes:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_inspections_accountable_wa "
+                    "ON inspections (accountable_wa)"
+                ))
+                changed.append("ix_inspections_accountable_wa")
+
+        verified = inspect(ENGINE)
+        verified_columns = {
+            column["name"]
+            for column in verified.get_columns("inspections")
+        }
+        verified_indexes = {
+            index.get("name")
+            for index in verified.get_indexes("inspections")
+        }
+        if (
+            "accountable_wa" not in verified_columns
+            or "ix_inspections_accountable_wa" not in verified_indexes
+        ):
+            raise RuntimeError("required column or index was not observed")
+        return {"status": "ok", "changed": changed}
+    except Exception as exc:
+        raise RuntimeError(
+            "Inspection accountability schema migration failed"
+        ) from exc
 
 def _repair_pm_project_map():
     """Ensure existing pm_project_map tables contain client_id + expected index."""
@@ -2010,10 +2066,7 @@ def init_db():
     except Exception:
         pass
 
-    try:
-        _repair_inspection_accountability()
-    except Exception:
-        pass
+    migrate_inspection_accountability()
 
     try:
         _repair_pm_project_map()
@@ -2242,10 +2295,23 @@ def get_tasks(limit: int = 200, client_id: Optional[str] = None):
         return out
 
 
-def get_personal_responsibilities(accountable_wa: str) -> dict:
+def get_personal_responsibilities(
+    accountable_wa: str,
+    client_id: int,
+    project_codes: Iterable[str],
+) -> dict:
     """Return active work for one accountable person without changing state."""
     accountable_wa = str(accountable_wa or "").strip()
-    if not accountable_wa:
+    try:
+        canonical_client_id = int(client_id)
+    except (TypeError, ValueError):
+        return {"tasks": [], "inspections": [], "meetings": []}
+    authorized_projects = sorted({
+        str(value).strip()
+        for value in (project_codes or [])
+        if str(value or "").strip()
+    })
+    if not accountable_wa or not authorized_projects:
         return {"tasks": [], "inspections": [], "meetings": []}
 
     active_task_states = ("open", "pending_approval")
@@ -2255,6 +2321,8 @@ def get_personal_responsibilities(accountable_wa: str) -> dict:
             s.query(Task)
             .filter(
                 Task.pm_wa_id == accountable_wa,
+                Task.client_id == canonical_client_id,
+                Task.project_code.in_(authorized_projects),
                 Task.tag.in_(actionable_tags),
                 Task.status.in_(active_task_states),
             )
@@ -2265,6 +2333,8 @@ def get_personal_responsibilities(accountable_wa: str) -> dict:
             s.query(Inspection)
             .filter(
                 Inspection.accountable_wa == accountable_wa,
+                Inspection.client_id == canonical_client_id,
+                Inspection.project_code.in_(authorized_projects),
                 Inspection.actual_date == None,
             )
             .order_by(Inspection.id.asc())
@@ -2274,7 +2344,9 @@ def get_personal_responsibilities(accountable_wa: str) -> dict:
             s.query(Meeting)
             .filter(
                 Meeting.created_by == accountable_wa,
-                Meeting.status.in_(("scheduled", "started")),
+                Meeting.client_id == canonical_client_id,
+                Meeting.project_code.in_(authorized_projects),
+                Meeting.status.in_(("scheduled", "active", "started")),
             )
             .order_by(Meeting.id.asc())
             .all()

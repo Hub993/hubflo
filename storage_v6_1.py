@@ -26,6 +26,7 @@ from storage import (
 
     # Core task API (v5 base + v6 extensions)
     init_db,
+    migrate_inspection_accountability,
     create_task,
     get_tasks,
     get_summary,

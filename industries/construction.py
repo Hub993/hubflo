@@ -28,7 +28,45 @@ class ConstructionIndustryModule:
         if candidate == "work_reference_terminology":
             return self._interpret_work_reference(request.text)
 
+        if candidate == "task_actionability":
+            return self._interpret_task_actionability(request.text)
+
         return IndustryResult()
+
+    @staticmethod
+    def _interpret_task_actionability(text: str) -> IndustryResult:
+        """Recognize bounded request grammar without a construction verb list."""
+        raw = str(text or "").strip()
+        normalized = raw.lower()
+        if not normalized:
+            return IndustryResult()
+
+        self_commitment = re.match(
+            r"^(?:i\s+will|i['’]m\s+going\s+to)\s+\S+(?:\s+.+)?$",
+            normalized,
+        )
+        polite_request = re.match(
+            r"^please\s+\S+(?:\s+.+)?$",
+            normalized,
+        )
+        imperative_with_object = re.match(
+            r"^[a-z][a-z'’-]*\s+"
+            r"(?:the|a|an|this|that|these|those|my|our)\b(?:\s+.+)?$",
+            normalized,
+        )
+        if not (self_commitment or polite_request or imperative_with_object):
+            return IndustryResult()
+
+        return IndustryResult(
+            handled=True,
+            classification="actionable_task",
+            entities={"task_text": raw},
+            metadata={
+                "domain": "construction",
+                "concept": "task_actionability",
+                "subtype": "self" if self_commitment else "assigned",
+            },
+        )
 
     @staticmethod
     def _interpret_work_reference(text: str) -> IndustryResult:

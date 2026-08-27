@@ -2,6 +2,8 @@ import datetime as dt
 import unittest
 from unittest.mock import patch
 
+from sqlalchemy import create_engine, inspect, text
+
 import app as hubflo_app
 import storage
 from tests.test_mu14_webhook import inbound
@@ -43,25 +45,51 @@ class Stage2AccountabilityTests(unittest.TestCase):
             "/webhook", json=inbound(self.sender, text, message_id)
         )
 
+    def responsibilities(self, accountable_wa, projects=("PROJECT_A1",)):
+        return storage.get_personal_responsibilities(
+            accountable_wa, 30, projects
+        )
+
     def test_ordinary_actionable_is_sender_owned_and_factual_is_not_task(self):
         self.assertEqual(self.send(
             "Check the generator", "accountability-ordinary"
         ).status_code, 200)
-        self.assertEqual(self.send(
-            "Crew discussed tomorrow's access", "accountability-factual"
-        ).status_code, 200)
-        self.assertEqual(self.send(
+        for index, factual in enumerate((
+            "Crew discussed tomorrow's access",
             "The generator was checked this morning",
-            "accountability-factual-complete",
-        ).status_code, 200)
+            "Paint is dry",
+            "Review was completed",
+            "Update from site: the roof is complete",
+        )):
+            self.assertEqual(self.send(
+                factual, f"accountability-factual-{index}"
+            ).status_code, 200)
 
         with storage.SessionLocal() as session:
             tasks = session.query(storage.Task).all()
             self.assertEqual(len(tasks), 1)
             self.assertEqual(tasks[0].text, "Check the generator")
             self.assertEqual(tasks[0].pm_wa_id, self.sender)
-        responsibilities = storage.get_personal_responsibilities(self.sender)
+        responsibilities = self.responsibilities(self.sender)
         self.assertEqual([row["id"] for row in responsibilities["tasks"]], [1])
+
+    def test_authoritative_industry_actionability_variants(self):
+        messages = (
+            "Check the generator",
+            "Please check the generator",
+            "I will check the generator",
+            "Jordan Unique check the generator",
+        )
+        for index, message in enumerate(messages):
+            self.send(message, f"accountability-actionability-{index}")
+        with storage.SessionLocal() as session:
+            rows = session.query(storage.Task).order_by(storage.Task.id).all()
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(
+                [row.pm_wa_id for row in rows],
+                [self.sender, self.sender, self.sender, self.jordan],
+            )
+            self.assertEqual(rows[2].subtype, "self")
 
     def test_assigned_self_urgent_and_project_oversight_visibility(self):
         messages = (
@@ -82,7 +110,7 @@ class Stage2AccountabilityTests(unittest.TestCase):
             self.assertEqual(rows[2].subtype, "self")
             self.assertEqual(rows[3].tag, "urgent")
 
-        jordan = storage.get_personal_responsibilities(self.jordan)
+        jordan = self.responsibilities(self.jordan)
         self.assertEqual([row["id"] for row in jordan["tasks"]], [1, 2])
         sub_digest = self.client.get(f"/admin/digest/sub?sender={self.jordan}")
         self.assertEqual(sub_digest.status_code, 200)
@@ -113,6 +141,7 @@ class Stage2AccountabilityTests(unittest.TestCase):
         })
         before = awaiting["text"]
         self.send("Crew discussed tomorrow's access", "factual-await")
+        self.send("Check the generator", "actionable-default-await")
         with storage.SessionLocal() as session:
             self.assertEqual(session.get(storage.Task, awaiting["id"]).text, before)
             self.assertTrue(session.get(storage.ConversationState, state["id"]).active)
@@ -134,6 +163,7 @@ class Stage2AccountabilityTests(unittest.TestCase):
             "continuation_key": "accountability-clarification",
         })
         self.send("Crew discussed tomorrow's access", "factual-clarification")
+        self.send("Please check the generator", "actionable-default-clarification")
         with storage.SessionLocal() as session:
             current = session.get(storage.ConversationState, clarification["id"])
             self.assertTrue(current.active)
@@ -192,8 +222,28 @@ class Stage2AccountabilityTests(unittest.TestCase):
             self.assertEqual(inspection.accountable_wa, self.sender)
             self.assertIsNone(inspection.inspector)
             self.assertEqual(meeting.created_by, self.sender)
-        responsibilities = storage.get_personal_responsibilities(self.sender)
-        self.assertEqual(len(responsibilities["inspections"]), 1)
+        spoofed = storage.create_inspection({
+            "actor": self.sender,
+            "client_id": 999,
+            "accountable_wa": self.jordan,
+            "project_code": "PROJECT_A1",
+            "phase": "roofing",
+            "required_date": dt.datetime.utcnow(),
+        })
+        denied = storage.create_inspection({
+            "actor": self.sender,
+            "project_code": "PROJECT_B1",
+            "phase": "roofing",
+            "required_date": dt.datetime.utcnow(),
+        })
+        self.assertIn("id", spoofed)
+        self.assertEqual(denied, {"error": "inspection project not authorized"})
+        with storage.SessionLocal() as session:
+            canonical = session.get(storage.Inspection, spoofed["id"])
+            self.assertEqual(canonical.client_id, 30)
+            self.assertEqual(canonical.accountable_wa, self.sender)
+        responsibilities = self.responsibilities(self.sender)
+        self.assertEqual(len(responsibilities["inspections"]), 2)
         self.assertEqual(len(responsibilities["meetings"]), 1)
         endpoint = self.client.get(
             f"/admin/responsibility.json?wa={self.sender}"
@@ -244,7 +294,7 @@ class Stage2AccountabilityTests(unittest.TestCase):
             project_code="PROJECT_A1", assignee_wa=self.sender,
             status="pending_approval",
         )
-        responsibilities = storage.get_personal_responsibilities(self.sender)
+        responsibilities = self.responsibilities(self.sender)
         self.assertIn(task["id"], [row["id"] for row in responsibilities["tasks"]])
         pm_digest = self.client.get(f"/admin/digest/pm?pm={self.sender}")
         self.assertIn(str(task["id"]), pm_digest.get_json()["preview_text"])
@@ -284,11 +334,28 @@ class Stage2AccountabilityTests(unittest.TestCase):
             self.sender, "Legacy delivery", tag="delivery",
             subtype="assigned", project_code="PROJECT_A1",
         )
-        inspection = storage.create_inspection({
-            "client_id": 30, "project_code": "PROJECT_A1",
-            "phase": "legacy", "required_date": dt.datetime.utcnow(),
-            "inspector": None, "notes": "legacy",
-        })
+        unauthorized_project = storage.create_task(
+            self.sender, "Check the unauthorized gate", tag="task",
+            subtype="assigned", project_code="PROJECT_B1",
+        )
+        with storage.SessionLocal() as session:
+            wrong_tenant = storage.Task(
+                client_id=31, sender=self.sender,
+                text="Check the foreign gate", tag="task",
+                subtype="assigned", project_code="PROJECT_A1",
+            )
+            session.add(wrong_tenant)
+            session.commit()
+            wrong_tenant_id = wrong_tenant.id
+        with storage.SessionLocal() as session:
+            legacy_inspection = storage.Inspection(
+                client_id=30, project_code="PROJECT_A1",
+                phase="legacy", required_date=dt.datetime.utcnow(),
+                inspector=None, notes="legacy",
+            )
+            session.add(legacy_inspection)
+            session.commit()
+            inspection_id = legacy_inspection.id
 
         plan = hubflo_app.reconcile_stage2_accountability(dry_run=True)
         expected_safe = {row["id"] for row in safe_rows}
@@ -311,7 +378,18 @@ class Stage2AccountabilityTests(unittest.TestCase):
             review,
         )
         self.assertIn(
-            ("inspection", inspection["id"], "accountable_creator_not_persisted"),
+            ("inspection", inspection_id, "accountable_creator_not_persisted"),
+            review,
+        )
+        self.assertIn(
+            (
+                "task", unauthorized_project["id"],
+                "sender_project_not_authorized",
+            ),
+            review,
+        )
+        self.assertIn(
+            ("task", wrong_tenant_id, "sender_tenant_not_authorized"),
             review,
         )
 
@@ -347,8 +425,120 @@ class Stage2AccountabilityTests(unittest.TestCase):
             subtype="recorded", project_code="PROJECT_A1", status="done",
             completed_at=dt.datetime.utcnow(),
         )
-        responsibilities = storage.get_personal_responsibilities(self.sender)
+        responsibilities = self.responsibilities(self.sender)
         self.assertEqual(responsibilities["tasks"], [])
+
+    def test_responsibility_views_are_client_and_project_scoped(self):
+        foreign_sender = "15550000702"
+        with storage.SessionLocal() as session:
+            session.add(storage.User(
+                client_id=31, wa_id=foreign_sender, name="Jordan Unique",
+                role="sub", project_code="PROJECT_A1", active=True,
+            ))
+            session.commit()
+        authorized = storage.create_task(
+            self.sender, "Check the authorized gate", tag="task",
+            project_code="PROJECT_A1", assignee_wa=self.jordan,
+        )
+        storage.create_task(
+            self.sender, "Check the unauthorized project", tag="task",
+            project_code="PROJECT_B1", assignee_wa=self.jordan,
+        )
+        storage.create_task(
+            foreign_sender, "Check the foreign tenant", tag="task",
+            project_code="PROJECT_A1", assignee_wa=self.jordan,
+        )
+        with storage.SessionLocal() as session:
+            session.add_all([
+                storage.Inspection(
+                    client_id=30, project_code="PROJECT_A1",
+                    phase="authorized", accountable_wa=self.jordan,
+                ),
+                storage.Inspection(
+                    client_id=30, project_code="PROJECT_B1",
+                    phase="unauthorized", accountable_wa=self.jordan,
+                ),
+                storage.Inspection(
+                    client_id=31, project_code="PROJECT_A1",
+                    phase="foreign", accountable_wa=self.jordan,
+                ),
+                storage.Meeting(
+                    client_id=30, project_code="PROJECT_A1",
+                    title="Authorized", created_by=self.jordan,
+                    status="scheduled",
+                ),
+                storage.Meeting(
+                    client_id=30, project_code="PROJECT_B1",
+                    title="Unauthorized", created_by=self.jordan,
+                    status="scheduled",
+                ),
+                storage.Meeting(
+                    client_id=31, project_code="PROJECT_A1",
+                    title="Foreign", created_by=self.jordan,
+                    status="scheduled",
+                ),
+            ])
+            session.commit()
+
+        direct = self.responsibilities(self.jordan)
+        self.assertEqual(
+            [row["id"] for row in direct["tasks"]], [authorized["id"]]
+        )
+        self.assertEqual(
+            [row["phase"] for row in direct["inspections"]], ["authorized"]
+        )
+        self.assertEqual(
+            [row["title"] for row in direct["meetings"]], ["Authorized"]
+        )
+        endpoint = self.client.get(
+            f"/admin/responsibility.json?wa={self.jordan}"
+        )
+        self.assertEqual(
+            [row["id"] for row in endpoint.get_json()["tasks"]],
+            [authorized["id"]],
+        )
+        sub_digest = self.client.get(
+            f"/admin/digest/sub?sender={self.jordan}"
+        )
+        self.assertEqual(
+            [row["id"] for row in sub_digest.get_json()["tasks"]],
+            [authorized["id"]],
+        )
+        pm_digest = self.client.get(f"/admin/digest/pm?pm={self.sender}")
+        self.assertEqual(pm_digest.get_json()["total_open"], 1)
+
+    def test_inspection_migration_is_idempotent_verified_and_fail_safe(self):
+        legacy_engine = create_engine("sqlite://")
+        with legacy_engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE inspections (id INTEGER PRIMARY KEY, notes TEXT)"
+            ))
+        with patch.object(storage, "ENGINE", legacy_engine):
+            first = storage.migrate_inspection_accountability()
+            second = storage.migrate_inspection_accountability()
+            schema = inspect(legacy_engine)
+            self.assertEqual(first["status"], "ok")
+            self.assertEqual(
+                set(first["changed"]),
+                {"inspections.accountable_wa", "ix_inspections_accountable_wa"},
+            )
+            self.assertEqual(second, {"status": "ok", "changed": []})
+            self.assertIn(
+                "accountable_wa",
+                {column["name"] for column in schema.get_columns("inspections")},
+            )
+            self.assertIn(
+                "ix_inspections_accountable_wa",
+                {index["name"] for index in schema.get_indexes("inspections")},
+            )
+
+        with patch.object(
+            storage,
+            "migrate_inspection_accountability",
+            side_effect=RuntimeError("migration failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "migration failure"):
+                storage.init_db()
 
 
 if __name__ == "__main__":

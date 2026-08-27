@@ -132,8 +132,14 @@ def classify_message(text: str) -> dict:
     # e.g. "This is just an update not an order"
     if "not an order" in t or "just an update" in t:
         if t.startswith("i will") or t.startswith("i'm going to"):
-            return {"tag": "task", "subtype": "self", "order_state": None}
-        return {"tag": "task", "subtype": "assigned", "order_state": None}
+            return {
+                "tag": "task", "subtype": "self", "order_state": None,
+                "actionable": True,
+            }
+        return {
+            "tag": None, "subtype": None, "order_state": None,
+            "actionable": False,
+        }
 
     # -----------------------------
     # CHANGE ORDER (requires an existing open order)
@@ -166,24 +172,32 @@ def classify_message(text: str) -> dict:
             return {
                 "tag": "change",
                 "subtype": "assigned",
-                "order_state": "change_requested"
+                "order_state": "change_requested",
+                "actionable": True,
             }
         else:
             # No existing order → treat as a normal task
             return {
                 "tag": "task",
                 "subtype": "assigned",
-                "order_state": None
+                "order_state": None,
+                "actionable": True,
             }
 
     # -----------------------------
     # APPROVE / REJECT (for an order)
     # -----------------------------
     if "approve" in t:
-        return {"tag": "task", "subtype": "assigned", "order_state": "approve"}
+        return {
+            "tag": "task", "subtype": "assigned", "order_state": "approve",
+            "actionable": True,
+        }
 
     if "reject" in t:
-        return {"tag": "task", "subtype": "assigned", "order_state": "reject"}
+        return {
+            "tag": "task", "subtype": "assigned", "order_state": "reject",
+            "actionable": True,
+        }
 
     # -----------------------------
     # ORDER DETECTION (free-language)
@@ -206,22 +220,47 @@ def classify_message(text: str) -> dict:
             "tag": "order",
             "subtype": "assigned",
             "order_state": "requested",
+            "actionable": True,
         }
 
     # -----------------------------
     # URGENT
     # -----------------------------
     if "urgent" in t or "asap" in t:
-        return {"tag": "urgent", "subtype": "assigned", "order_state": None}
+        return {
+            "tag": "urgent", "subtype": "assigned", "order_state": None,
+            "actionable": True,
+        }
 
     # -----------------------------
     # DEFAULT = TASK
     # Self-tasks when "I will / I'm going to"
     # -----------------------------
     if t.startswith("i will") or t.startswith("i'm going to"):
-        return {"tag": "task", "subtype": "self", "order_state": None}
+        return {
+            "tag": "task", "subtype": "self", "order_state": None,
+            "actionable": True,
+        }
 
-    return {"tag": "task", "subtype": "assigned", "order_state": None}
+    # The authoritative Industry interpretation supplies bounded actionability;
+    # ordinary fallback remains non-deterministic evidence for MU11.
+    actionability = _CONSTRUCTION_INDUSTRY.interpret(IndustryRequest(
+        capability="domain_recognition",
+        text=text or "",
+        context={"candidate": "task_actionability"},
+    ))
+    if actionability.handled:
+        return {
+            "tag": "task",
+            "subtype": actionability.metadata.get("subtype") or "assigned",
+            "order_state": None,
+            "actionable": True,
+        }
+
+    return {
+        "tag": None, "subtype": None, "order_state": None,
+        "actionable": False,
+    }
 
 # >>> PATCH_CLASSIFIER_V6_1_END <<<
 
@@ -1210,27 +1249,15 @@ def interpret_supported_message(
     if re.match(r"^(?:create|add)\s+(?:a\s+)?task\b", lower):
         return {"route": "task", "action": "create", "subtype": "assigned", "entities": entities}
 
-    actionable = _CORE_CONVERSATION.interpret_core(ConversationRequest(
-        capability="core_recognition",
-        text=raw,
-        context={"candidate": "actionable_task"},
-    ))
-    if actionable.handled:
-        entities.update(actionable.entities)
-        return {
-            "route": "task",
-            "action": "create",
-            "subtype": actionable.metadata.get("subtype") or "assigned",
-            "entities": entities,
-        }
-
     return {"route": "ordinary_fallback", "action": "create", "entities": entities}
 
 
 def reconcile_stage2_accountability(dry_run: bool = True) -> dict:
     """Plan or apply only deterministic legacy accountability repairs."""
     from sqlalchemy import or_
-    from storage import Audit, Inspection, Meeting, SessionLocal, Task
+    from storage import (
+        Audit, Inspection, Meeting, PMProjectMap, SessionLocal, Task, User,
+    )
 
     safe = []
     review = []
@@ -1256,17 +1283,50 @@ def reconcile_stage2_accountability(dry_run: bool = True) -> dict:
                 })
                 continue
 
+            sender_user = session.query(User).filter(
+                User.wa_id == sender,
+                User.client_id == int(row.client_id or 1),
+                User.active == True,
+            ).first()
+            if not sender_user:
+                review.append({
+                    "object_type": "task", "id": row.id,
+                    "reason": "sender_tenant_not_authorized",
+                })
+                continue
+            authorized_projects = {
+                str(sender_user.project_code or "").strip()
+            }
+            authorized_projects.update(
+                str(mapped.project_code or "").strip()
+                for mapped in session.query(PMProjectMap.project_code).filter(
+                    PMProjectMap.pm_user_id == sender_user.id,
+                    PMProjectMap.client_id == int(row.client_id or 1),
+                ).all()
+            )
+            authorized_projects.discard("")
+            row_project = str(row.project_code or "").strip()
+            if not row_project or row_project not in authorized_projects:
+                review.append({
+                    "object_type": "task", "id": row.id,
+                    "reason": "sender_project_not_authorized",
+                })
+                continue
+
             reason = None
             if row.tag in ("order", "change", "urgent"):
                 reason = "sender_default_actionable_tag"
             elif row.tag == "task":
-                meaning = interpret_supported_message(
-                    row.text or "", row.project_code
-                )
+                meaning = interpret_supported_message(row.text or "", row.project_code)
+                actionability = classify_message(row.text or "")
                 if (
-                    meaning.get("route") == "task"
-                    and not meaning.get("entities", {}).get(
-                        "recipient_reference"
+                    row.subtype == "self"
+                    or (
+                        actionability.get("tag") == "task"
+                        and actionability.get("actionable")
+                        and not meaning.get("entities", {}).get(
+                            "recipient_reference"
+                        )
                     )
                 ):
                     reason = "sender_default_actionable_task"
@@ -2729,6 +2789,53 @@ def webhook():
             for record in records
             if project in set(record.get("project_codes") or [])
         ]
+
+    def _mu13_leading_task_route(
+        sender_wa: str,
+        raw_text: str,
+        project_code: Optional[str],
+    ) -> Optional[dict]:
+        """Use the canonical authorized-person universe for leading assignees."""
+        authorization = _mu13_sender_authorization(sender_wa)
+        records = _mu13_person_records_for_project(
+            _mu13_authorized_person_records(sender_wa, authorization),
+            project_code,
+        )
+        matches = []
+        for record in records:
+            for label in record.get("labels") or []:
+                label = str(label or "").strip()
+                if not label:
+                    continue
+                match = re.match(
+                    rf"^{re.escape(label)}\s*[:,]?\s+(.+)$",
+                    str(raw_text or "").strip(),
+                    flags=re.IGNORECASE,
+                )
+                if not match:
+                    continue
+                task_text = match.group(1).strip()
+                meaning = classify_message(task_text)
+                if meaning.get("tag") == "task" and meaning.get("actionable"):
+                    matches.append((record, task_text))
+                    break
+
+        unique = {
+            str(record["id"]): (record, task_text)
+            for record, task_text in matches
+        }
+        if len(unique) != 1:
+            return None
+        record, task_text = next(iter(unique.values()))
+        return {
+            "route": "task",
+            "action": "create",
+            "subtype": "assigned",
+            "entities": {
+                "recipient_reference": record["label"],
+                "task_text": task_text,
+            },
+        }
 
     def _mu13_intersect_persisted_records(
         persisted_records: list[dict],
@@ -4545,7 +4652,7 @@ def webhook():
             )
 
             payload = {
-                "client_id": int(user_info.get("client_id") or 1),
+                "actor": sender,
                 "project_code": project_code,
                 "phase": (
                     parsed_inspection["phase"]
@@ -4556,11 +4663,18 @@ def webhook():
                     ]
                 ),
                 "inspector": None,
-                "accountable_wa": sender,
                 "notes": text,
             }
 
             row = create_inspection(payload)
+
+            if row.get("error"):
+                send_whatsapp_text(
+                    phone_id,
+                    sender,
+                    "The inspection could not be created in your authorized scope.",
+                )
+                return ("", 200)
 
             requested_date_text = (
                 parsed_inspection[
@@ -4794,6 +4908,25 @@ def webhook():
         subcontractor_name = user_info.get("subcontractor_name")
         structured_route = interpret_supported_message(text or "", project_code)
 
+        if structured_route["route"] == "ordinary_fallback":
+            leading_task = _mu13_leading_task_route(
+                sender,
+                text or "",
+                project_code,
+            )
+            if leading_task:
+                structured_route = leading_task
+                cls = classify_message(
+                    structured_route["entities"]["task_text"]
+                )
+            elif cls.get("tag") == "task" and cls.get("actionable"):
+                structured_route = {
+                    "route": "task",
+                    "action": "create",
+                    "subtype": cls.get("subtype") or "assigned",
+                    "entities": {},
+                }
+
         if (
             structured_route["route"] == "ordinary_fallback"
             and tag not in ("order", "change")
@@ -4872,21 +5005,11 @@ def webhook():
             and structured_route["entities"].get("recipient_reference")
         ):
             reference = structured_route["entities"]["recipient_reference"]
-            with DBSession() as s:
-                people = s.query(User).filter(
-                    User.client_id == int(user_info.get("client_id") or 1),
-                    User.active == True,
-                ).all()
-            records = [
-                {
-                    "id": person.wa_id,
-                    "label": person.name or person.wa_id,
-                    "labels": [person.name or "", person.wa_id or ""],
-                }
-                for person in people
-                if not project_code or not person.project_code
-                or person.project_code == project_code
-            ]
+            authorization = _mu13_sender_authorization(sender)
+            records = _mu13_person_records_for_project(
+                _mu13_authorized_person_records(sender, authorization),
+                project_code,
+            )
             resolution = _CORE_CONVERSATION.interpret_core(
                 ConversationRequest(
                     capability="record_resolution",
@@ -5332,7 +5455,21 @@ def admin_personal_responsibility_json():
     accountable_wa = str(request.args.get("wa") or "").strip()
     if not accountable_wa:
         return jsonify({"error": "missing wa"}), 400
-    result = get_personal_responsibilities(accountable_wa)
+    from storage import SessionLocal as AccountabilitySession, User
+    with AccountabilitySession() as session:
+        user = session.query(User).filter(
+            User.wa_id == accountable_wa,
+            User.active == True,
+        ).first()
+        if not user:
+            return jsonify({"error": "unknown accountable user"}), 404
+        client_id = int(user.client_id or 1)
+        projects = _authorized_accountability_projects(session, user)
+    result = get_personal_responsibilities(
+        accountable_wa,
+        client_id,
+        projects,
+    )
     for inspection in result["inspections"]:
         value = inspection.get("required_date")
         inspection["required_date"] = value.isoformat() if value else None
@@ -6194,6 +6331,26 @@ def admin_assign_pm():
         return jsonify({"status": "ok", "pm": pm_wa, "project_code": project_code}), 200
 
 # === DIGEST SCAFFOLDS (sandbox only) =================================
+def _authorized_accountability_projects(session, user) -> list[str]:
+    """Return canonical same-client direct and mapped project scope."""
+    from storage import PMProjectMap
+
+    client_id = int(user.client_id or 1)
+    projects = set()
+    direct = str(user.project_code or "").strip()
+    if direct:
+        projects.add(direct)
+    rows = session.query(PMProjectMap.project_code).filter(
+        PMProjectMap.pm_user_id == user.id,
+        PMProjectMap.client_id == client_id,
+    ).all()
+    for row in rows:
+        code = str(row.project_code or "").strip()
+        if code:
+            projects.add(code)
+    return sorted(projects)
+
+
 @app.route("/admin/digest/pm", methods=["GET"])
 def admin_digest_pm():
     if not _check_admin(): return _auth_fail()
@@ -6209,16 +6366,12 @@ def admin_digest_pm():
         if not pm or pm.role != "pm":
             return jsonify({"error": "not a pm"}), 400
 
-        proj_rows = (
-            s.query(PMProjectMap.project_code)
-            .filter(PMProjectMap.pm_user_id == pm.id)
-            .all()
-        )
-        projects = [r.project_code for r in proj_rows]
+        projects = _authorized_accountability_projects(s, pm)
 
         tasks = (
             s.query(Task)
             .filter(
+                Task.client_id == int(pm.client_id or 1),
                 Task.project_code.in_(projects),
                 Task.status.in_(("open", "pending_approval")),
             )
@@ -6256,16 +6409,12 @@ def admin_digest_pm_send():
         if not pm or pm.role != "pm":
             return jsonify({"error": "not a pm"}), 400
 
-        proj_rows = (
-            s.query(PMProjectMap.project_code)
-            .filter(PMProjectMap.pm_user_id == pm.id)
-            .all()
-        )
-        projects = [r.project_code for r in proj_rows]
+        projects = _authorized_accountability_projects(s, pm)
 
         tasks = (
             s.query(Task)
             .filter(
+                Task.client_id == int(pm.client_id or 1),
                 Task.project_code.in_(projects),
                 Task.status.in_(("open", "pending_approval")),
             )
@@ -6312,10 +6461,14 @@ def admin_digest_sub():
         if not sub or sub.role != "sub":
             return jsonify({"error": "not a subcontractor"}), 400
 
+        projects = _authorized_accountability_projects(s, sub)
+
         tasks = (
             s.query(Task)
             .filter(
                 Task.pm_wa_id == sub_wa,
+                Task.client_id == int(sub.client_id or 1),
+                Task.project_code.in_(projects),
                 Task.status.in_(("open", "pending_approval")),
             )
             .order_by(Task.id.desc())
@@ -6356,10 +6509,14 @@ def admin_digest_sub_preview():
         if not sub or sub.role != "sub":
             return jsonify({"error": "not a subcontractor"}), 400
 
+        projects = _authorized_accountability_projects(s, sub)
+
         tasks = (
             s.query(Task)
             .filter(
                 Task.pm_wa_id == sub_wa,
+                Task.client_id == int(sub.client_id or 1),
+                Task.project_code.in_(projects),
                 Task.status.in_(("open", "pending_approval")),
             )
             .order_by(Task.id.asc())
@@ -6395,10 +6552,14 @@ def admin_digest_sub_send():
         if not sub or sub.role != "sub":
             return jsonify({"error": "not a subcontractor"}), 400
 
+        projects = _authorized_accountability_projects(s, sub)
+
         tasks = (
             s.query(Task)
             .filter(
                 Task.pm_wa_id == sub_wa,
+                Task.client_id == int(sub.client_id or 1),
+                Task.project_code.in_(projects),
                 Task.status.in_(("open", "pending_approval")),
             )
             .order_by(Task.id.asc())
@@ -6445,11 +6606,15 @@ def daily_digest_scheduler():
                 # Only fire at exactly 06:00 local, minutes only (safe in 1-min cycle)
                 if local_now.hour == 6 and local_now.minute == 0:
 
+                    projects = _authorized_accountability_projects(s, sub)
+
                     # fetch open tasks
                     tasks = (
                         s.query(Task)
                         .filter(
                             Task.pm_wa_id == sub.wa_id,
+                            Task.client_id == int(sub.client_id or 1),
+                            Task.project_code.in_(projects),
                             Task.status.in_(("open", "pending_approval")),
                         )
                         .order_by(Task.id.asc())
