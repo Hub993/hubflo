@@ -276,16 +276,16 @@ class AnnexAControlledFixture(unittest.TestCase):
     def test_retired_await_bypass_task_note_delivery_search_and_status_routes(self):
         legacy, retired = self.make_retired_legacy_order_await()
         cases = (
-            ("Create a task to check the east gate", "task", "assigned"),
-            ("Urgent fix the roof leak", "urgent", "urgent"),
-            ("Urgent: fix the roof leak", "urgent", "urgent"),
-            ("Note for PROJECT_A1: east gate checked", "note", "note"),
-            ("Pin note for PROJECT_A1: keep east gate clear", "note", "pinned"),
-            ("Pin note: scaffold inspection booked for tomorrow", "note", "pinned"),
-            ("Record delivery of cement at north gate", "delivery", "assigned"),
-            ("Log a delivery of grout at west gate", "delivery", "assigned"),
+            ("Create a task to check the east gate", "task", "assigned", "open"),
+            ("Urgent fix the roof leak", "urgent", "urgent", "open"),
+            ("Urgent: fix the roof leak", "urgent", "urgent", "open"),
+            ("Note for PROJECT_A1: east gate checked", "note", "note", "open"),
+            ("Pin note for PROJECT_A1: keep east gate clear", "note", "pinned", "open"),
+            ("Pin note: scaffold inspection booked for tomorrow", "note", "pinned", "open"),
+            ("Record delivery of cement at north gate", "delivery", "recorded", "done"),
+            ("Log a delivery of grout at west gate", "delivery", "recorded", "done"),
         )
-        for index, (text, tag, subtype) in enumerate(cases):
+        for index, (text, tag, subtype, status) in enumerate(cases):
             before = None
             with storage.SessionLocal() as session:
                 before = session.query(storage.Task).count()
@@ -299,6 +299,7 @@ class AnnexAControlledFixture(unittest.TestCase):
                 ).first()
                 self.assertEqual(created.tag, tag)
                 self.assertEqual(created.subtype, subtype)
+                self.assertEqual(created.status, status)
                 self.assertEqual(created.client_id, 20)
                 self.assertEqual(created.project_code, "PROJECT_A1")
                 self.assertEqual(session.query(storage.Audit).filter(

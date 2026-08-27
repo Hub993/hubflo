@@ -29,6 +29,7 @@ from storage import (
     create_task,
     get_tasks,
     get_summary,
+    get_personal_responsibilities,
     mark_done,
     approve_task,
     reject_task,

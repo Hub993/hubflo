@@ -17,7 +17,7 @@ from core.conversation import ConversationRequest, CoreConversation
 from core.industry import IndustryRequest
 from industries.construction import ConstructionIndustryModule
 from storage_v6_1 import (
-    init_db, create_task, get_tasks, get_summary,
+    init_db, create_task, get_tasks, get_summary, get_personal_responsibilities,
     mark_done, approve_task, reject_task, set_order_state,
     revoke_last, subcontractor_accuracy,
     create_meeting, start_meeting, close_meeting,
@@ -1175,6 +1175,10 @@ def interpret_supported_message(
         }
 
     if re.match(r"^(?:record|log|confirm)\s+(?:a\s+)?delivery\b", lower):
+        return {"route": "delivery", "action": "record", "entities": entities}
+    if re.search(r"\b(?:was|were|has been|have been)\s+delivered\b", lower):
+        return {"route": "delivery", "action": "record", "entities": entities}
+    if re.match(r"^(?:please\s+)?deliver\b", lower):
         return {"route": "delivery", "action": "create", "entities": entities}
     if re.match(r"^(?:show|find|search|list)\b", lower):
         return {"route": "search", "action": "read", "entities": entities}
@@ -1191,6 +1195,13 @@ def interpret_supported_message(
             "recipient_reference": assigned.group(1).strip(),
             "task_text": assigned.group(2).strip(),
         })
+        if re.match(r"^(?:please\s+)?deliver\b", assigned.group(2), re.IGNORECASE):
+            return {
+                "route": "delivery",
+                "action": "create",
+                "subtype": "assigned",
+                "entities": entities,
+            }
         return {"route": "task", "action": "create", "subtype": "assigned", "entities": entities}
     if re.match(r"^(?:create|add)\s+(?:a\s+)?task\s+for\s+me\b", lower):
         return {"route": "task", "action": "create", "subtype": "self", "entities": entities}
@@ -1199,7 +1210,137 @@ def interpret_supported_message(
     if re.match(r"^(?:create|add)\s+(?:a\s+)?task\b", lower):
         return {"route": "task", "action": "create", "subtype": "assigned", "entities": entities}
 
+    actionable = _CORE_CONVERSATION.interpret_core(ConversationRequest(
+        capability="core_recognition",
+        text=raw,
+        context={"candidate": "actionable_task"},
+    ))
+    if actionable.handled:
+        entities.update(actionable.entities)
+        return {
+            "route": "task",
+            "action": "create",
+            "subtype": actionable.metadata.get("subtype") or "assigned",
+            "entities": entities,
+        }
+
     return {"route": "ordinary_fallback", "action": "create", "entities": entities}
+
+
+def reconcile_stage2_accountability(dry_run: bool = True) -> dict:
+    """Plan or apply only deterministic legacy accountability repairs."""
+    from sqlalchemy import or_
+    from storage import Audit, Inspection, Meeting, SessionLocal, Task
+
+    safe = []
+    review = []
+    changed = []
+    active_states = ("open", "pending_approval")
+
+    with SessionLocal() as session:
+        rows = (
+            session.query(Task)
+            .filter(
+                Task.status.in_(active_states),
+                or_(Task.pm_wa_id == None, Task.pm_wa_id == ""),
+            )
+            .order_by(Task.id.asc())
+            .all()
+        )
+        for row in rows:
+            sender = str(row.sender or "").strip()
+            if not sender:
+                review.append({
+                    "object_type": "task", "id": row.id,
+                    "reason": "authoritative_sender_missing",
+                })
+                continue
+
+            reason = None
+            if row.tag in ("order", "change", "urgent"):
+                reason = "sender_default_actionable_tag"
+            elif row.tag == "task":
+                meaning = interpret_supported_message(
+                    row.text or "", row.project_code
+                )
+                if (
+                    meaning.get("route") == "task"
+                    and not meaning.get("entities", {}).get(
+                        "recipient_reference"
+                    )
+                ):
+                    reason = "sender_default_actionable_task"
+                elif meaning.get("entities", {}).get("recipient_reference"):
+                    review.append({
+                        "object_type": "task", "id": row.id,
+                        "reason": "legacy_assigned_intent_ambiguous",
+                    })
+                    continue
+                else:
+                    review.append({
+                        "object_type": "task", "id": row.id,
+                        "reason": "legacy_actionability_ambiguous",
+                    })
+                    continue
+            elif row.tag == "delivery":
+                review.append({
+                    "object_type": "task", "id": row.id,
+                    "reason": "historical_delivery_semantics_ambiguous",
+                })
+                continue
+            else:
+                review.append({
+                    "object_type": "task", "id": row.id,
+                    "reason": "non_actionable_or_unknown_task_record",
+                })
+                continue
+
+            safe.append({
+                "object_type": "task", "id": row.id,
+                "accountable_wa": sender, "reason": reason,
+            })
+            if not dry_run:
+                row.pm_wa_id = sender
+                session.add(Audit(
+                    client_id=int(row.client_id or 1),
+                    actor=sender,
+                    action="accountability_backfill",
+                    ref_type="task",
+                    ref_id=row.id,
+                    details=f"pm_wa_id={sender};reason={reason}",
+                ))
+                changed.append(row.id)
+
+        for inspection in session.query(Inspection).filter(
+            Inspection.actual_date == None,
+            or_(
+                Inspection.accountable_wa == None,
+                Inspection.accountable_wa == "",
+            ),
+        ).order_by(Inspection.id.asc()):
+            review.append({
+                "object_type": "inspection", "id": inspection.id,
+                "reason": "accountable_creator_not_persisted",
+            })
+
+        for meeting in session.query(Meeting).filter(
+            Meeting.status.in_(("scheduled", "started")),
+            or_(Meeting.created_by == None, Meeting.created_by == ""),
+        ).order_by(Meeting.id.asc()):
+            review.append({
+                "object_type": "meeting", "id": meeting.id,
+                "reason": "organizer_missing",
+            })
+
+        if not dry_run:
+            session.commit()
+
+    return {
+        "dry_run": bool(dry_run),
+        "safe_backfill": safe,
+        "requires_review": review,
+        "changed_task_ids": changed,
+    }
 
 
 def parse_pm_reminder_snooze_until(
@@ -4415,6 +4556,7 @@ def webhook():
                     ]
                 ),
                 "inspector": None,
+                "accountable_wa": sender,
                 "notes": text,
             }
 
@@ -4652,6 +4794,17 @@ def webhook():
         subcontractor_name = user_info.get("subcontractor_name")
         structured_route = interpret_supported_message(text or "", project_code)
 
+        if (
+            structured_route["route"] == "ordinary_fallback"
+            and tag not in ("order", "change")
+        ):
+            send_whatsapp_text(
+                phone_id,
+                sender,
+                "No actionable work item was identified.",
+            )
+            return ("", 200)
+
         if structured_route["route"] == "status":
             with DBSession() as s:
                 query = s.query(Task).filter(
@@ -4714,7 +4867,7 @@ def webhook():
 
         assignee_wa = None
         if (
-            structured_route["route"] == "task"
+            structured_route["route"] in ("task", "delivery")
             and structured_route.get("subtype") == "assigned"
             and structured_route["entities"].get("recipient_reference")
         ):
@@ -4760,11 +4913,26 @@ def webhook():
             ),
             "note": ("note", "note"),
             "pinned_note": ("note", "pinned"),
-            "delivery": ("delivery", "assigned"),
+            "delivery": (
+                "delivery",
+                "recorded"
+                if structured_route.get("action") == "record"
+                else "assigned",
+            ),
         }
         if structured_route["route"] in route_overrides:
             tag, subtype = route_overrides[structured_route["route"]]
             order_state = None
+
+        actionable_task = tag in ("task", "urgent", "order", "change") or (
+            tag == "delivery" and structured_route.get("action") != "record"
+        )
+        if actionable_task and not assignee_wa:
+            assignee_wa = sender
+
+        recorded_delivery = (
+            tag == "delivery" and structured_route.get("action") == "record"
+        )
 
         new_row = create_task(
             sender=sender,
@@ -4776,6 +4944,8 @@ def webhook():
             attachment=attachment,
             subtype=subtype,
             assignee_wa=assignee_wa,
+            status="done" if recorded_delivery else None,
+            completed_at=dt.datetime.utcnow() if recorded_delivery else None,
         )
 
         # -------------------------------------------------------------
@@ -5128,6 +5298,7 @@ def admin_view_json():
             "text": r.text,
             "tag": r.tag,
             "subtype": r.subtype,
+            "pm_wa_id": r.pm_wa_id,
             "order_state": r.order_state,
             "cost": r.cost,
             "time_impact_days": r.time_impact_days,
@@ -5152,6 +5323,20 @@ def admin_view_json():
         })
 
     return jsonify(out)
+
+
+@app.route("/admin/responsibility.json", methods=["GET"])
+def admin_personal_responsibility_json():
+    if not _check_admin():
+        return _auth_fail()
+    accountable_wa = str(request.args.get("wa") or "").strip()
+    if not accountable_wa:
+        return jsonify({"error": "missing wa"}), 400
+    result = get_personal_responsibilities(accountable_wa)
+    for inspection in result["inspections"]:
+        value = inspection.get("required_date")
+        inspection["required_date"] = value.isoformat() if value else None
+    return jsonify({"accountable_wa": accountable_wa, **result}), 200
 
 # >>> PATCH_1_INSPECTION_ADMIN_START — READ-ONLY TEST VIEW V6.1 <<<
 
@@ -5188,6 +5373,7 @@ def admin_inspections_view():
         "<th>Required Date</th>"
         "<th>Actual Date</th>"
         "<th>Inspector</th>"
+        "<th>Accountable Owner</th>"
         "<th>Notes</th>"
         "<th>Created At</th>"
         "</tr>"
@@ -5204,6 +5390,7 @@ def admin_inspections_view():
             f"<td>{h(display_datetime(row.required_date))}</td>"
             f"<td>{h(display_datetime(row.actual_date))}</td>"
             f"<td>{h(row.inspector)}</td>"
+            f"<td>{h(row.accountable_wa)}</td>"
             f"<td>{h(row.notes)}</td>"
             f"<td>{h(display_datetime(row.created_at))}</td>"
             "</tr>"
@@ -5283,6 +5470,7 @@ def admin_inspections_json():
                     else None
                 ),
                 "inspector": row.inspector,
+                "accountable_wa": row.accountable_wa,
                 "notes": row.notes,
                 "created_at": (
                     row.created_at.isoformat()
@@ -6030,7 +6218,10 @@ def admin_digest_pm():
 
         tasks = (
             s.query(Task)
-            .filter(Task.project_code.in_(projects), Task.status == "open")
+            .filter(
+                Task.project_code.in_(projects),
+                Task.status.in_(("open", "pending_approval")),
+            )
             .order_by(Task.id.asc())
             .all()
         )
@@ -6074,7 +6265,10 @@ def admin_digest_pm_send():
 
         tasks = (
             s.query(Task)
-            .filter(Task.project_code.in_(projects), Task.status == "open")
+            .filter(
+                Task.project_code.in_(projects),
+                Task.status.in_(("open", "pending_approval")),
+            )
             .order_by(Task.id.asc())
             .all()
         )
@@ -6120,7 +6314,10 @@ def admin_digest_sub():
 
         tasks = (
             s.query(Task)
-            .filter(Task.sender == sub_wa)
+            .filter(
+                Task.pm_wa_id == sub_wa,
+                Task.status.in_(("open", "pending_approval")),
+            )
             .order_by(Task.id.desc())
             .limit(200)
             .all()
@@ -6161,7 +6358,10 @@ def admin_digest_sub_preview():
 
         tasks = (
             s.query(Task)
-            .filter(Task.sender == sub_wa, Task.status == "open")
+            .filter(
+                Task.pm_wa_id == sub_wa,
+                Task.status.in_(("open", "pending_approval")),
+            )
             .order_by(Task.id.asc())
             .all()
         )
@@ -6197,7 +6397,10 @@ def admin_digest_sub_send():
 
         tasks = (
             s.query(Task)
-            .filter(Task.sender == sub_wa, Task.status == "open")
+            .filter(
+                Task.pm_wa_id == sub_wa,
+                Task.status.in_(("open", "pending_approval")),
+            )
             .order_by(Task.id.asc())
             .all()
         )
@@ -6245,7 +6448,10 @@ def daily_digest_scheduler():
                     # fetch open tasks
                     tasks = (
                         s.query(Task)
-                        .filter(Task.sender == sub.wa_id, Task.status == "open")
+                        .filter(
+                            Task.pm_wa_id == sub.wa_id,
+                            Task.status.in_(("open", "pending_approval")),
+                        )
                         .order_by(Task.id.asc())
                         .all()
                     )

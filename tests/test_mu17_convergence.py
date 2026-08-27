@@ -95,15 +95,15 @@ class MU17WebhookConvergenceTests(unittest.TestCase):
 
     def test_task_note_delivery_and_assignment_routes_use_task_handler(self):
         messages = (
-            ("Create a task to check the door", "task", "assigned"),
-            ("Create a task for me to check the door", "task", "self"),
-            ("Urgent fix the kitchen door", "urgent", "urgent"),
-            ("Urgent: fix the kitchen door", "urgent", "urgent"),
-            ("Note for PROJECT_A1: opening is 32 inches", "note", "note"),
-            ("Pin note for PROJECT_A1: opening is 32 inches", "note", "pinned"),
-            ("Record delivery of cement at north gate", "delivery", "assigned"),
+            ("Create a task to check the door", "task", "assigned", "open"),
+            ("Create a task for me to check the door", "task", "self", "open"),
+            ("Urgent fix the kitchen door", "urgent", "urgent", "open"),
+            ("Urgent: fix the kitchen door", "urgent", "urgent", "open"),
+            ("Note for PROJECT_A1: opening is 32 inches", "note", "note", "open"),
+            ("Pin note for PROJECT_A1: opening is 32 inches", "note", "pinned", "open"),
+            ("Record delivery of cement at north gate", "delivery", "recorded", "done"),
         )
-        for index, (text, tag, subtype) in enumerate(messages):
+        for index, (text, tag, subtype, status) in enumerate(messages):
             with storage.SessionLocal() as session:
                 before = session.query(storage.Task).count()
             self.assertEqual(self.send(
@@ -116,6 +116,7 @@ class MU17WebhookConvergenceTests(unittest.TestCase):
                 ).first()
                 self.assertEqual(row.tag, tag)
                 self.assertEqual(row.subtype, subtype)
+                self.assertEqual(row.status, status)
                 self.assertEqual(row.client_id, 10)
                 self.assertEqual(row.project_code, "PROJECT_A1")
                 self.assertEqual(session.query(storage.Audit).filter(

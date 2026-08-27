@@ -8,7 +8,7 @@ from typing import Optional, Iterable
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, DateTime, Text, Boolean, Float,
-    UniqueConstraint,
+    UniqueConstraint, or_,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import func, inspect, text
@@ -145,6 +145,7 @@ class Inspection(Base):
     required_date = Column(DateTime)
     actual_date = Column(DateTime)
     inspector = Column(String)
+    accountable_wa = Column(String(64), nullable=True, index=True)
     notes = Column(Text)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
 
@@ -157,6 +158,7 @@ def create_inspection(payload: dict) -> dict:
             phase=payload.get("phase"),
             required_date=payload.get("required_date"),
             inspector=payload.get("inspector"),
+            accountable_wa=payload.get("accountable_wa"),
             notes=payload.get("notes"),
         )
         s.add(ins)
@@ -1785,6 +1787,26 @@ def _repair_stage2_client_columns():
                 f"UPDATE {table_name} SET client_id = 1 WHERE client_id IS NULL"
             ))
 
+
+def _repair_inspection_accountability():
+    """Add accountable ownership without conflating it with inspector identity."""
+    insp = inspect(ENGINE)
+    if "inspections" not in insp.get_table_names():
+        return
+    columns = {column["name"] for column in insp.get_columns("inspections")}
+    indexes = {index.get("name") for index in insp.get_indexes("inspections")}
+    with ENGINE.begin() as conn:
+        if "accountable_wa" not in columns:
+            conn.execute(text(
+                "ALTER TABLE inspections "
+                "ADD COLUMN accountable_wa VARCHAR(64)"
+            ))
+        if "ix_inspections_accountable_wa" not in indexes:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_inspections_accountable_wa "
+                "ON inspections (accountable_wa)"
+            ))
+
 def _repair_pm_project_map():
     """Ensure existing pm_project_map tables contain client_id + expected index."""
     insp = inspect(ENGINE)
@@ -1989,6 +2011,11 @@ def init_db():
         pass
 
     try:
+        _repair_inspection_accountability()
+    except Exception:
+        pass
+
+    try:
         _repair_pm_project_map()
     except Exception:
         pass
@@ -2037,6 +2064,7 @@ def _as_task_dict(t: Task) -> dict:
         "project_code": t.project_code,
         "order_state": t.order_state,
         "subtype": t.subtype,
+        "pm_wa_id": t.pm_wa_id,
         "cost": t.cost,
         "time_impact_days": t.time_impact_days,
         "approval_required": t.approval_required,
@@ -2152,7 +2180,9 @@ def create_task(sender: str, text: str, tag: Optional[str] = None,
                 due_date: Optional[dt.datetime] = None,
                 order_state: Optional[str] = None,
                 subtype: Optional[str] = None,
-                assignee_wa: Optional[str] = None) -> dict:
+                assignee_wa: Optional[str] = None,
+                status: Optional[str] = None,
+                completed_at: Optional[dt.datetime] = None) -> dict:
     with SessionLocal() as s:
         t = Task(
             client_id=client_id_for_sender(sender),
@@ -2161,6 +2191,10 @@ def create_task(sender: str, text: str, tag: Optional[str] = None,
             due_date=due_date, order_state=order_state, subtype=subtype
         )
         t.pm_wa_id = assignee_wa
+        if status is not None:
+            t.status = status
+        if completed_at is not None:
+            t.completed_at = completed_at
         if attachment:
             t.attachment_name = attachment.get("name")
             t.attachment_mime = attachment.get("mime")
@@ -2185,6 +2219,7 @@ def get_tasks(limit: int = 200, client_id: Optional[str] = None):
                 "text": r.text,
                 "tag": r.tag,
                 "subtype": r.subtype,
+                "pm_wa_id": r.pm_wa_id,
                 "order_state": r.order_state,
                 "cost": r.cost,
                 "time_impact_days": r.time_impact_days,
@@ -2206,6 +2241,62 @@ def get_tasks(limit: int = 200, client_id: Optional[str] = None):
             })
         return out
 
+
+def get_personal_responsibilities(accountable_wa: str) -> dict:
+    """Return active work for one accountable person without changing state."""
+    accountable_wa = str(accountable_wa or "").strip()
+    if not accountable_wa:
+        return {"tasks": [], "inspections": [], "meetings": []}
+
+    active_task_states = ("open", "pending_approval")
+    actionable_tags = ("task", "urgent", "order", "change", "delivery")
+    with SessionLocal() as s:
+        tasks = (
+            s.query(Task)
+            .filter(
+                Task.pm_wa_id == accountable_wa,
+                Task.tag.in_(actionable_tags),
+                Task.status.in_(active_task_states),
+            )
+            .order_by(Task.id.asc())
+            .all()
+        )
+        inspections = (
+            s.query(Inspection)
+            .filter(
+                Inspection.accountable_wa == accountable_wa,
+                Inspection.actual_date == None,
+            )
+            .order_by(Inspection.id.asc())
+            .all()
+        )
+        meetings = (
+            s.query(Meeting)
+            .filter(
+                Meeting.created_by == accountable_wa,
+                Meeting.status.in_(("scheduled", "started")),
+            )
+            .order_by(Meeting.id.asc())
+            .all()
+        )
+
+        return {
+            "tasks": [_as_task_dict(task) for task in tasks],
+            "inspections": [
+                {
+                    "id": row.id,
+                    "client_id": row.client_id,
+                    "project_code": row.project_code,
+                    "phase": row.phase,
+                    "required_date": row.required_date,
+                    "inspector": row.inspector,
+                    "accountable_wa": row.accountable_wa,
+                }
+                for row in inspections
+            ],
+            "meetings": [_as_meeting_dict(row) for row in meetings],
+        }
+
 def get_summary():
     with SessionLocal() as s:
         qry = _apply_client_filter(s.query(Task)).order_by(Task.id.desc())
@@ -2221,6 +2312,7 @@ def get_summary():
                 "text": r.text,
                 "tag": r.tag,
                 "subtype": r.subtype,
+                "pm_wa_id": r.pm_wa_id,
                 "order_state": r.order_state,
                 "cost": r.cost,
                 "time_impact_days": r.time_impact_days,
