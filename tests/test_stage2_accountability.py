@@ -451,8 +451,8 @@ class Stage2AccountabilityTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].tag, "task")
             self.assertEqual(rows[0].subtype, "assigned")
-            self.assertEqual(rows[0].text, original)
-            self.assertIn("check the west gate", rows[0].text)
+            self.assertEqual(rows[0].text, "check the west gate")
+            self.assertNotIn("Nobody Zulu", rows[0].text)
             self.assertEqual(rows[0].pm_wa_id, self.jordan)
             resolved = session.get(storage.ConversationState, state["id"])
             self.assertFalse(resolved.active)
@@ -475,6 +475,7 @@ class Stage2AccountabilityTests(unittest.TestCase):
         self.send(original, "task-assignment-many")
 
         state = self.assignment_state()
+        self.assertEqual(state["original_request"], original)
         self.assertEqual(state["context"]["route"], "task")
         self.assertEqual(state["context"]["task_text"], "check the loading area")
         self.assertEqual(
@@ -506,7 +507,8 @@ class Stage2AccountabilityTests(unittest.TestCase):
         with storage.SessionLocal() as session:
             row = session.query(storage.Task).one()
             self.assertEqual(row.tag, "task")
-            self.assertEqual(row.text, original)
+            self.assertEqual(row.text, "check the loading area")
+            self.assertNotIn("Alex", row.text)
             self.assertEqual(row.pm_wa_id, north_wa)
             self.assertFalse(
                 session.get(storage.ConversationState, state["id"]).active
@@ -527,6 +529,7 @@ class Stage2AccountabilityTests(unittest.TestCase):
         with storage.SessionLocal() as session:
             self.assertEqual(session.query(storage.Task).count(), 0)
         state = self.assignment_state()
+        self.assertEqual(state["original_request"], original)
         self.assertEqual(state["context"]["route"], "delivery")
         self.assertEqual(state["context"]["action"], "create")
         self.assertEqual(state["continuation"]["route"], "delivery")
@@ -548,7 +551,11 @@ class Stage2AccountabilityTests(unittest.TestCase):
             self.assertEqual(rows[0].tag, "delivery")
             self.assertEqual(rows[0].subtype, "assigned")
             self.assertEqual(rows[0].status, "open")
-            self.assertEqual(rows[0].text, original)
+            self.assertEqual(
+                rows[0].text,
+                "deliver cement to the west gate tomorrow",
+            )
+            self.assertNotIn("Outside Courier", rows[0].text)
             self.assertEqual(rows[0].pm_wa_id, self.jordan)
             self.assertEqual(session.query(storage.Task).filter(
                 storage.Task.tag == "task"
@@ -574,7 +581,12 @@ class Stage2AccountabilityTests(unittest.TestCase):
         self.send(original, "delivery-assignment-many")
 
         state = self.assignment_state()
+        self.assertEqual(state["original_request"], original)
         self.assertEqual(state["context"]["route"], "delivery")
+        self.assertEqual(
+            state["context"]["task_text"],
+            "deliver grout to the loading area tomorrow",
+        )
         self.assertEqual(
             {
                 row["id"]
@@ -605,7 +617,11 @@ class Stage2AccountabilityTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].tag, "delivery")
             self.assertEqual(rows[0].subtype, "assigned")
-            self.assertEqual(rows[0].text, original)
+            self.assertEqual(
+                rows[0].text,
+                "deliver grout to the loading area tomorrow",
+            )
+            self.assertNotIn("Alex", rows[0].text)
             self.assertEqual(rows[0].pm_wa_id, south_wa)
             self.assertEqual(session.query(storage.Task).filter(
                 storage.Task.tag == "task"

@@ -3615,7 +3615,7 @@ def webhook():
         try:
             created = create_task(
                 sender=claimed["sender"],
-                text=claimed.get("original_request") or context["task_text"],
+                text=context["task_text"],
                 tag=attributes["tag"],
                 project_code=claimed.get("project_code"),
                 subcontractor_name=context.get("subcontractor_name"),
