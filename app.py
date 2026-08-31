@@ -3033,6 +3033,54 @@ def webhook():
 
         return " ".join(working.strip(" .,:;-_").split())
 
+    def _mu13_explicit_project_reference(
+        raw_text: str,
+        action: str,
+    ) -> Optional[str]:
+        """Return only the accepted lifecycle grammar's project qualifier."""
+        working = str(raw_text or "").strip()
+        if action == "redirect":
+            target_match = re.search(
+                r"\bto\s+(.+)$",
+                working,
+                flags=re.IGNORECASE,
+            )
+            if target_match:
+                working = working[:target_match.start()].strip()
+        if action == "snooze":
+            working = re.sub(
+                r"\bfor\s+\d+\s+(?:minutes?|hours?|days?|weeks?)\b.*$",
+                " ",
+                working,
+                flags=re.IGNORECASE,
+            )
+            working = re.sub(
+                r"\buntil\s+.+$",
+                " ",
+                working,
+                flags=re.IGNORECASE,
+            )
+
+        qualified = re.match(
+            r"^\s*(?:please\s+)?[^\s]+\s+(.+?)\s+"
+            r"reminders?\s+(?:for|in)\s+(.+?)\s*$",
+            working,
+            flags=re.IGNORECASE,
+        )
+        if not qualified:
+            return None
+
+        subject = re.sub(
+            r"^(?:the|a|an)\s+",
+            "",
+            qualified.group(1).strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        reference = qualified.group(2).strip(" .,:;-_")
+        if not subject or not reference:
+            return None
+        return reference
+
     def _mu13_strip_project_reference(
         reference_text: str,
         project_code: Optional[str],
@@ -4029,8 +4077,12 @@ def webhook():
             )
 
         selected_project = None
-        project_resolution = _mu13_resolve_records(
+        explicit_project_reference = _mu13_explicit_project_reference(
             raw_text,
+            action,
+        )
+        project_resolution = _mu13_resolve_records(
+            explicit_project_reference or raw_text,
             project_candidates,
         )
         if project_resolution["status"] == "resolved":
@@ -4046,6 +4098,44 @@ def webhook():
                     person_candidates,
                     selected_project,
                 )
+        elif project_resolution["status"] == "ambiguous":
+            matching_project_codes = {
+                str(record.get("id") or "").strip()
+                for record in (project_resolution.get("matches") or [])
+                if str(record.get("id") or "").strip()
+            }
+            project_candidates = [
+                record
+                for record in project_candidates
+                if str(record.get("id") or "").strip()
+                in matching_project_codes
+            ]
+            reminder_candidates = [
+                record
+                for record in reminder_candidates
+                if str(record.get("project_code") or "").strip()
+                in matching_project_codes
+            ]
+            if action == "redirect":
+                person_candidates = [
+                    record
+                    for record in person_candidates
+                    if matching_project_codes
+                    & {
+                        str(project_code or "").strip()
+                        for project_code in (record.get("project_codes") or [])
+                        if str(project_code or "").strip()
+                    }
+                ]
+            authorization = dict(authorization)
+            authorization["project_codes"] = sorted(matching_project_codes)
+            if str(
+                authorization.get("sender_project_code") or ""
+            ).strip() not in matching_project_codes:
+                authorization["sender_project_code"] = None
+        elif explicit_project_reference is not None:
+            _mu13_send_action_not_found(sender_wa, action)
+            return True
 
         if not reminder_candidates:
             if (
@@ -4215,9 +4305,20 @@ def webhook():
                 persisted_projects,
                 current_projects,
             )
-            followup_project = _mu13_resolve_records(
-                raw_text,
+            exact_project = _mu13_candidate_by_id(
                 available_projects,
+                str(raw_text or "").strip(),
+            )
+            followup_project = (
+                {
+                    "status": "resolved",
+                    "record_id": exact_project["id"],
+                }
+                if exact_project
+                else _mu13_resolve_records(
+                    raw_text,
+                    available_projects,
+                )
             )
             selected_project = None
             if followup_project["status"] == "resolved":
