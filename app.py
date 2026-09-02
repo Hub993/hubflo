@@ -40,6 +40,15 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("hubflo")
 
+@app.teardown_request
+def _clear_effective_membership(_error=None):
+    # Prevent request-local authority leaking across worker requests.
+    try:
+        from storage import clear_effective_membership
+        clear_effective_membership()
+    except Exception:
+        pass
+
 _CONSTRUCTION_INDUSTRY = ConstructionIndustryModule()
 _CORE_CONVERSATION = CoreConversation(_CONSTRUCTION_INDUSTRY)
 
@@ -1542,10 +1551,18 @@ def webhook():
     from storage import (
         SessionLocal as DBSession,
         User,
+        SenderMembership,
         Task,
         PMProjectMap,
         get_user_role,
         get_pms_for_project,
+        resolve_sender_context,
+        set_effective_membership,
+        clear_effective_membership,
+        commit_context_selection,
+        claim_multi_context_inbound,
+        release_multi_context_inbound,
+        complete_multi_context_inbound,
     )
 
     from storage_v6_1 import (
@@ -1565,25 +1582,12 @@ def webhook():
     # MU12 — GENERIC PERSISTENT CONVERSATION-STATE ORCHESTRATION
     # -----------------------------------------------------------------
     def _conversation_scope(sender_wa: str) -> tuple[int, Optional[str]]:
-        with DBSession() as s:
-            sender_user = (
-                s.query(User)
-                .filter(User.wa_id == sender_wa)
-                .first()
-            )
-
-            if not sender_user:
-                return 1, None
-
-            try:
-                client_id = int(sender_user.client_id or 1)
-            except (TypeError, ValueError):
-                client_id = 1
-
-            project_code = sender_user.project_code
-            if project_code is not None:
-                project_code = str(project_code).strip() or None
-            return client_id, project_code
+        resolved = get_user_role(sender_wa)
+        if resolved:
+            if resolved.get("context_kind") == "platform" or resolved.get("client_id") is None:
+                return None, None
+            return int(resolved["client_id"]), resolved.get("project_code")
+        return None, None
 
     def _conversation_client_id(sender_wa: str) -> int:
         return _conversation_scope(sender_wa)[0]
@@ -1803,6 +1807,11 @@ def webhook():
     def run_search(sender_wa: str, text: str):
         """Role-aware, scoped search with PM escalation for subs outside scope."""
         t = (text or "").lower()
+        effective_info = get_user_role(sender_wa)
+        if not effective_info or effective_info.get("client_id") is None:
+            send_whatsapp_text(phone_id, sender_wa, "Search is not available in the current context.")
+            return
+        effective_client_id = int(effective_info["client_id"])
 
         with DBSession() as s:
             # USER VALIDATION
@@ -1819,10 +1828,11 @@ def webhook():
                 )
                 return
 
-            role = (u.role or "").lower().strip()
+            role = (effective_info.get("role") or "").lower().strip()
+            effective_project_code = effective_info.get("project_code")
             authorized_projects = []
             q = s.query(Task).filter(
-                Task.client_id == int(u.client_id or 1)
+                Task.client_id == effective_client_id
             )
 
             # ------------------------------------------------------------
@@ -1832,8 +1842,8 @@ def webhook():
             if role == "sub":
                 # Subs only see their own tasks
                 q = q.filter(Task.sender == sender_wa)
-                if u.project_code:
-                    authorized_projects = [u.project_code]
+                if effective_project_code:
+                    authorized_projects = [effective_project_code]
 
             elif role == "pm":
                 # PMs = tasks across mapped projects
@@ -1841,7 +1851,7 @@ def webhook():
                     s.query(PMProjectMap.project_code)
                     .filter(
                         PMProjectMap.pm_user_id == u.id,
-                        PMProjectMap.client_id == int(u.client_id or 1),
+                        PMProjectMap.client_id == effective_client_id,
                     )
                     .all()
                 )
@@ -1859,7 +1869,7 @@ def webhook():
                     s.query(PMProjectMap.project_code)
                     .filter(
                         PMProjectMap.pm_user_id == u.id,
-                        PMProjectMap.client_id == int(u.client_id or 1),
+                        PMProjectMap.client_id == effective_client_id,
                     )
                     .all()
                 )
@@ -1883,7 +1893,7 @@ def webhook():
                 subs = (
                     s.query(Task.subcontractor_name)
                     .filter(
-                        Task.client_id == int(u.client_id or 1),
+                        Task.client_id == effective_client_id,
                         Task.subcontractor_name != None,
                     )
                     .distinct()
@@ -1896,18 +1906,21 @@ def webhook():
                         break
 
             if role == "sub" and target_sub:
-                own = (u.subcontractor_name or "").strip().lower()
+                own = (effective_info.get("subcontractor_name") or "").strip().lower()
                 if own and target_sub.lower() != own:
                     # Escalate to PMs of the sub's project
-                    if u.project_code:
+                    if effective_project_code:
                         pm_rows = (
                             s.query(User)
+                            .join(SenderMembership, SenderMembership.user_id == User.id)
                             .join(PMProjectMap, PMProjectMap.pm_user_id == User.id)
                             .filter(
-                                User.client_id == int(u.client_id or 1),
-                                PMProjectMap.client_id == int(u.client_id or 1),
-                                PMProjectMap.project_code == u.project_code,
-                                User.role == "pm",
+                                SenderMembership.context_kind == "client",
+                                SenderMembership.client_id == effective_client_id,
+                                SenderMembership.active == True,
+                                SenderMembership.role == "pm",
+                                PMProjectMap.client_id == effective_client_id,
+                                PMProjectMap.project_code == effective_project_code,
                                 User.active == True,
                             )
                             .all()
@@ -1969,7 +1982,7 @@ def webhook():
                 "stage2_read_evidence route=search client_id=%s "
                 "project_codes=%s normalized_query=%r result_count=%s "
                 "result_ids=%s",
-                int(u.client_id or 1),
+                effective_client_id,
                 authorized_projects,
                 normalized_query,
                 len(rows),
@@ -2729,19 +2742,22 @@ def webhook():
                     mapped_projects.setdefault(int(user_id), set()).add(code)
 
             users = (
-                s.query(User)
+                s.query(User, SenderMembership)
+                .join(SenderMembership, SenderMembership.user_id == User.id)
                 .filter(
-                    User.client_id == client_id,
+                    SenderMembership.context_kind == "client",
+                    SenderMembership.client_id == client_id,
+                    SenderMembership.active == True,
                     User.active == True,
                 )
-                .order_by(User.id.asc())
+                .order_by(User.id.asc(), SenderMembership.id.asc())
                 .all()
             )
 
             records = []
-            for user in users:
+            for user, membership in users:
                 projects = set(mapped_projects.get(int(user.id), set()))
-                user_project = str(user.project_code or "").strip()
+                user_project = str(membership.project_code or "").strip()
                 if user_project:
                     projects.add(user_project)
                 if user.wa_id == sender_wa:
@@ -2756,7 +2772,7 @@ def webhook():
                 labels = []
                 for value in (
                     user.name,
-                    user.subcontractor_name,
+                    membership.subcontractor_name,
                     user.wa_id,
                 ):
                     label = str(value or "").strip()
@@ -4463,6 +4479,7 @@ def webhook():
     # -----------------------------------------------------------------
 
     for m in msgs:
+        clear_effective_membership()
         sender = m.get("from") or sender
         mtype = m.get("type")
         text = None
@@ -4483,6 +4500,73 @@ def webhook():
                 "name": meta.get("filename"),
             }
             text = meta.get("caption")
+
+        # Multi-context ingress is resolved without mutation first. Its
+        # provider event claim gates selection responses and downstream work.
+        context_result = resolve_sender_context(sender, str(phone_id), text or "")
+        multi_context = len(context_result.get("memberships") or []) > 1
+        context_routing = context_result.get("status") in ("proposed_selection", "selection_denied", "selection_required", "configuration_conflict")
+        if context_result.get("status") in ("unauthorized", "configuration_error"):
+            send_whatsapp_text(phone_id, sender, "Your WhatsApp number is not linked to an authorized context.")
+            continue
+        membership = context_result.get("membership")
+        claim = {"status": "not-applicable"}
+        # Explicit routing input is claimed even for one membership.  Ordinary
+        # single-membership business text retains the legacy path.
+        if multi_context or context_routing:
+            event_id = m.get("id")
+            resolution = context_result.get("status")
+            claim = claim_multi_context_inbound(event_id, sender, str(phone_id), resolution, membership)
+            if claim.get("status") in ("missing_event_id", "duplicate", "stale-or-unauthorized"):
+                continue
+            if claim.get("status") != "claimed":
+                continue
+            if context_result.get("status") == "configuration_conflict":
+                complete_multi_context_inbound(event_id, "configuration-conflict")
+                send_whatsapp_text(
+                    phone_id, sender,
+                    "Your contexts have ambiguous labels. Please contact support.",
+                )
+                continue
+            if context_result.get("status") == "proposed_selection":
+                commit_context_selection(sender, str(phone_id), membership)
+                set_effective_membership(membership)
+                complete_multi_context_inbound(event_id, "context-selected")
+                send_whatsapp_text(phone_id, sender, f"Context switched to {membership['context_label']}.")
+                continue
+            if context_result.get("status") == "selection_denied":
+                set_effective_membership(membership)
+                complete_multi_context_inbound(event_id, "selection-denied")
+                send_whatsapp_text(phone_id, sender, "That context is not authorized for you.")
+                continue
+            if context_result.get("status") == "selection_required":
+                labels = [str(row["context_label"]) for row in context_result["memberships"]]
+                choice_text = ", ".join(labels[:-1]) + (" or " if len(labels) > 1 else "") + labels[-1]
+                complete_multi_context_inbound(event_id, "selection-required")
+                send_whatsapp_text(phone_id, sender, f"Which context? {choice_text}?")
+                continue
+        if membership:
+            set_effective_membership(membership)
+        else:
+            continue
+
+        if membership.get("context_kind") == "platform":
+            if claim.get("status") == "claimed":
+                complete_multi_context_inbound(
+                    event_id, "platform-boundary", state="completed"
+                )
+            send_whatsapp_text(
+                phone_id, sender,
+                "Platform context is selected, but platform sender ingress is not yet wired.",
+            )
+            continue
+
+        if claim.get("status") == "claimed":
+            # The legacy downstream path has no universal completion contract;
+            # bind the event and record an honest handoff before routing.
+            release_multi_context_inbound(
+                event_id, "released-to-stage2", state="released"
+            )
 
         message_route = (
             interpret_supported_message(text).get("route")

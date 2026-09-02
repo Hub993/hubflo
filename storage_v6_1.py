@@ -22,6 +22,9 @@ from storage import (
     Meeting,
     # User / routing / mapping models
     User,
+    SenderMembership,
+    CurrentContextSelection,
+    MultiContextInboundClaim,
     PMProjectMap,
 
     # Core task API (v5 base + v6 extensions)
@@ -99,4 +102,11 @@ from storage import (
     get_pms_for_project,
     log_call,
     log_audit,
+    resolve_sender_context,
+    set_effective_membership,
+    clear_effective_membership,
+    commit_context_selection,
+    claim_multi_context_inbound,
+    release_multi_context_inbound,
+    complete_multi_context_inbound,
 )

@@ -5,13 +5,14 @@ import os
 import json
 import datetime as dt
 from typing import Optional, Iterable
+from contextvars import ContextVar
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, DateTime, Text, Boolean, Float,
     UniqueConstraint, or_,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import func, inspect, text
+from sqlalchemy import func, inspect, text, event
 
 # ---------------------------------------------------------------------
 # DB bootstrap
@@ -42,6 +43,8 @@ Base = declarative_base()
 # Default client_id = 1 until multi-client onboarding UI is added.
 
 DEFAULT_CLIENT_ID = 1
+IDENTITY_MIGRATION_ERROR = None
+_EFFECTIVE_MEMBERSHIP = ContextVar("hubflo_effective_membership", default=None)
 
 def current_client_id() -> int:
     # Placeholder: returns DEFAULT_CLIENT_ID for now.
@@ -52,13 +55,20 @@ def current_client_id() -> int:
 def client_id_for_sender(sender: Optional[str]) -> int:
     """Resolve canonical tenant identity from the authenticated sender record."""
     if not sender:
-        return DEFAULT_CLIENT_ID
+        return None
+    effective = _EFFECTIVE_MEMBERSHIP.get()
+    if effective and str(effective.get("sender")) == str(sender):
+        if effective.get("context_kind") == "platform":
+            return None
+        return int(effective["client_id"])
     with SessionLocal() as s:
-        row = s.query(User.client_id).filter(User.wa_id == str(sender)).first()
-        try:
-            return int(row[0]) if row and row[0] is not None else DEFAULT_CLIENT_ID
-        except (TypeError, ValueError):
-            return DEFAULT_CLIENT_ID
+        user = s.query(User).filter(User.wa_id == str(sender), User.active == True).one_or_none()
+        if not user:
+            return None
+        memberships = s.query(SenderMembership).filter_by(user_id=user.id, active=True).all()
+        if len(memberships) != 1 or memberships[0].context_kind != "client":
+            return None
+        return memberships[0].client_id
 
 # >>> PATCH_4_STORAGE_END <<<
 
@@ -85,6 +95,218 @@ class User(Base):
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow,
                         onupdate=dt.datetime.utcnow)
+
+@event.listens_for(User, "before_insert")
+def _mark_explicit_legacy_user_creation(mapper, connection, target):
+    # Explicit client scope is the legacy creation operation.  Defaults,
+    # role, and project text are not authority evidence.
+    target._explicit_legacy_membership = (
+        "client_id" in target.__dict__ and target.__dict__.get("client_id") is not None
+    )
+
+@event.listens_for(User, "after_insert")
+def _legacy_membership_after_user_insert(mapper, connection, target):
+    """Create compatibility authority only for an explicit legacy operation."""
+    if not getattr(target, "_explicit_legacy_membership", False):
+        return
+    connection.execute(SenderMembership.__table__.insert().values(
+        user_id=target.id, context_kind="client",
+        client_id=int(target.client_id or DEFAULT_CLIENT_ID),
+        context_label=f"Client {int(target.client_id or DEFAULT_CLIENT_ID)}",
+        role=target.role, project_code=target.project_code,
+        subcontractor_name=target.subcontractor_name,
+        authority_basis="legacy User fields", active=bool(target.active),
+        created_by="legacy-user-create", updated_by="legacy-user-create",
+    ))
+
+@event.listens_for(User, "after_update")
+def _legacy_membership_after_user_update(mapper, connection, target):
+    """Keep retained legacy compatibility scope synchronized at user update."""
+    values = dict(
+        client_id=int(target.client_id or DEFAULT_CLIENT_ID),
+        role=target.role, project_code=target.project_code,
+        subcontractor_name=target.subcontractor_name,
+        updated_by="legacy-user-update", updated_at=dt.datetime.utcnow(),
+    )
+    if not target.active:
+        values["active"] = False
+    connection.execute(SenderMembership.__table__.update().where(
+        (SenderMembership.user_id == target.id) &
+        (SenderMembership.authority_basis == "legacy User fields")
+    ).values(**values))
+
+class SenderMembership(Base):
+    __tablename__ = "sender_memberships"
+    __table_args__ = (UniqueConstraint("user_id", "context_kind", "client_id", name="uq_sender_membership_scope"),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    context_kind = Column(String(16), nullable=False, default="client", index=True)
+    client_id = Column(Integer, nullable=True, index=True)
+    context_label = Column(String(128), nullable=False)
+    role = Column(String(32), nullable=True)
+    project_code = Column(String(128), nullable=True)
+    subcontractor_name = Column(String(128), nullable=True)
+    authority_basis = Column(String(256), nullable=True)
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    created_by = Column(String(64), nullable=True)
+    updated_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
+
+class CurrentContextSelection(Base):
+    __tablename__ = "current_context_selections"
+    __table_args__ = (UniqueConstraint("sender", "channel_id", name="uq_context_selection_sender_channel"),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    sender = Column(String(64), nullable=False, index=True)
+    channel_id = Column(String(128), nullable=False, default="whatsapp")
+    membership_id = Column(Integer, nullable=False, index=True)
+    selected_at = Column(DateTime, default=dt.datetime.utcnow)
+    selected_by = Column(String(64), nullable=True)
+    invalidated_at = Column(DateTime, nullable=True)
+    invalidation_reason = Column(String(64), nullable=True)
+
+class MultiContextInboundClaim(Base):
+    __tablename__ = "multi_context_inbound_claims"
+    id = Column(Integer, primary_key=True)
+    event_id = Column(String(256), nullable=False, unique=True, index=True)
+    sender = Column(String(64), nullable=False, index=True)
+    channel_id = Column(String(128), nullable=False)
+    membership_id = Column(Integer, nullable=True)
+    context_kind = Column(String(16), nullable=True)
+    client_id = Column(Integer, nullable=True)
+    project_code = Column(String(128), nullable=True)
+    authority_version = Column(DateTime, nullable=True)
+    resolution = Column(String(32), nullable=False)
+    processing_state = Column(String(24), nullable=False, default="claimed")
+    claimed_at = Column(DateTime, default=dt.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    outcome = Column(Text, nullable=True)
+
+class IdentityMigrationState(Base):
+    __tablename__ = "identity_migration_state"
+    id = Column(Integer, primary_key=True)
+    version = Column(String(32), nullable=False)
+    completed_at = Column(DateTime, default=dt.datetime.utcnow)
+
+def _membership_dict(m, u):
+    return {"id":m.id,"user_id":u.id,"sender":u.wa_id,"context_kind":m.context_kind,
+            "client_id":m.client_id,"context_label":m.context_label,"role":m.role,
+            "project_code":m.project_code,"subcontractor_name":m.subcontractor_name,
+            "active":bool(m.active),
+            "membership_updated_at":m.updated_at}
+
+def set_effective_membership(value):
+    return _EFFECTIVE_MEMBERSHIP.set(value)
+
+def clear_effective_membership():
+    _EFFECTIVE_MEMBERSHIP.set(None)
+
+def resolve_sender_context(sender, channel_id="whatsapp", text="", persist=False):
+    sender = str(sender or "").strip()
+    if IDENTITY_MIGRATION_ERROR:
+        return {"status":"configuration_error","memberships":[],"error":IDENTITY_MIGRATION_ERROR}
+    with SessionLocal() as s:
+        u = s.query(User).filter(User.wa_id == sender, User.active == True).one_or_none()
+        if not u:
+            return {"status":"unauthorized","memberships":[]}
+        rows = s.query(SenderMembership).filter(SenderMembership.user_id == u.id, SenderMembership.active == True).order_by(SenderMembership.id).all()
+        if not rows:
+            return {"status":"configuration_error","memberships":[]}
+        ms = [_membership_dict(m,u) for m in rows]
+        labels = [m["context_label"].strip().casefold() for m in ms]
+        if len(labels) != len(set(labels)):
+            return {"status":"configuration_conflict","memberships":ms}
+        normalized = str(text or "").strip().casefold()
+        explicit = False
+        for prefix in ("switch to ", "go to "):
+            if normalized.startswith(prefix): normalized, explicit = normalized[len(prefix):].strip(), True
+        chosen = [m for m in ms if normalized == m["context_label"].strip().casefold()]
+        sel = s.query(CurrentContextSelection).filter_by(sender=sender, channel_id=str(channel_id)).one_or_none()
+        current = next((m for m in ms if sel and not sel.invalidated_at and
+                        m["id"] == sel.membership_id and
+                        (not m.get("membership_updated_at") or not sel.selected_at or
+                         m["membership_updated_at"] <= sel.selected_at)), None)
+        if len(ms) == 1 and not explicit and not chosen:
+            return {"status":"resolved","membership":ms[0],"memberships":ms}
+        if len(chosen) == 1:
+            return {"status":"proposed_selection","membership":chosen[0],"memberships":ms}
+        if explicit:
+            return {"status":"selection_denied","membership":current or (ms[0] if len(ms) == 1 else None),"memberships":ms}
+        if current:
+            return {"status":"resolved","membership":current,"memberships":ms}
+        return {"status":"selection_required","memberships":ms}
+
+def claim_multi_context_inbound(event_id, sender, channel_id, resolution, membership=None):
+    event_id = str(event_id or "").strip()
+    if not event_id: return {"status":"missing_event_id"}
+    with SessionLocal() as s:
+        old = s.query(MultiContextInboundClaim).filter_by(event_id=event_id).one_or_none()
+        if old: return {"status":"duplicate","processing_state":old.processing_state,"client_id":old.client_id}
+        user = s.query(User).filter(User.wa_id == str(sender), User.active == True).one_or_none()
+        if not user:
+            return {"status":"stale-or-unauthorized"}
+        # Resolution is a non-mutating snapshot.  Lock the membership during
+        # the authority check and claim so PostgreSQL revocation/update paths
+        # cannot commit between validation and binding.
+        current = None
+        if membership:
+            current = (s.query(SenderMembership)
+                .filter(SenderMembership.id == membership.get("id"),
+                       SenderMembership.user_id == user.id)
+                .with_for_update()
+                .one_or_none())
+        if not current and resolution not in ("selection_required", "configuration_conflict"):
+            return {"status":"stale-or-unauthorized"}
+        if current and (not current.active or current.user_id != user.id):
+            return {"status":"stale-or-unauthorized"}
+        if membership and membership.get("membership_updated_at") and current and current.updated_at != membership.get("membership_updated_at"):
+            return {"status":"stale-or-unauthorized"}
+        bound = _membership_dict(current, user) if current else {}
+        row = MultiContextInboundClaim(event_id=event_id, sender=str(sender), channel_id=str(channel_id),
+            membership_id=bound.get("id"), context_kind=bound.get("context_kind"),
+            client_id=bound.get("client_id"), project_code=bound.get("project_code"),
+            authority_version=bound.get("membership_updated_at"),
+            resolution=resolution, processing_state="claimed")
+        s.add(row)
+        try: s.commit()
+        except Exception: s.rollback(); return {"status":"duplicate"}
+        return {"status":"claimed","id":row.id}
+
+def release_multi_context_inbound(event_id, outcome="downstream-routing",
+                                  state="released"):
+    """Record handoff to legacy Stage 2 without claiming downstream success."""
+    if state not in ("released", "downstream-uncertain"):
+        raise ValueError("invalid multi-context release state")
+    with SessionLocal() as s:
+        row = s.query(MultiContextInboundClaim).filter_by(
+            event_id=str(event_id)).one_or_none()
+        if not row or row.processing_state not in ("claimed", "bound"):
+            return {"status":"not_found"}
+        row.processing_state = state
+        row.outcome = str(outcome or "")
+        s.commit()
+        return {"status":"released", "processing_state":state}
+
+def complete_multi_context_inbound(event_id, outcome, state="completed"):
+    with SessionLocal() as s:
+        row = s.query(MultiContextInboundClaim).filter_by(event_id=str(event_id)).one_or_none()
+        if not row or row.processing_state not in ("claimed", "bound"):
+            return {"status":"not_found"}
+        row.processing_state = state
+        row.completed_at = dt.datetime.utcnow()
+        row.outcome = str(outcome or "")
+        s.commit()
+        return {"status":"completed","event_id":row.event_id}
+
+def commit_context_selection(sender, channel_id, membership):
+    with SessionLocal() as s:
+        sel = s.query(CurrentContextSelection).filter_by(sender=str(sender), channel_id=str(channel_id)).one_or_none()
+        if not sel:
+            sel = CurrentContextSelection(user_id=membership["user_id"], sender=str(sender), channel_id=str(channel_id), membership_id=membership["id"], selected_by=str(sender)); s.add(sel)
+        else:
+            sel.membership_id=membership["id"]; sel.selected_at=dt.datetime.utcnow(); sel.invalidated_at=None; sel.invalidation_reason=None
+        s.commit()
 
 # >>> PATCH_5_STORAGE_START — CLIENT DISPLAY NAME <<<
 
@@ -2020,6 +2242,38 @@ def _repair_conversation_states():
             "COALESCE(last_activity_at, updated_at, created_at, CURRENT_TIMESTAMP)"
         ))
 
+def _repair_multi_context_identity():
+    Base.metadata.create_all(ENGINE)
+    if "multi_context_inbound_claims" in inspect(ENGINE).get_table_names():
+        columns = {c["name"] for c in inspect(ENGINE).get_columns(
+            "multi_context_inbound_claims"
+        )}
+        if "authority_version" not in columns:
+            with ENGINE.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE multi_context_inbound_claims "
+                    "ADD COLUMN authority_version TIMESTAMP"
+                ))
+    with SessionLocal() as s:
+        marker = s.get(IdentityMigrationState, 1)
+        if marker:
+            return
+        # IdentityMigrationState is the one-time boundary: only users already
+        # present when this migration first ran are historical candidates.
+        migration_started = dt.datetime.utcnow()
+        for u in s.query(User).filter(User.created_at <= migration_started).all():
+            if s.query(SenderMembership).filter_by(user_id=u.id).count():
+                continue
+            s.add(SenderMembership(user_id=u.id, context_kind="client",
+                client_id=int(u.client_id or DEFAULT_CLIENT_ID),
+                context_label=f"Client {int(u.client_id or DEFAULT_CLIENT_ID)}",
+                role=u.role, project_code=u.project_code,
+                subcontractor_name=u.subcontractor_name,
+                authority_basis="legacy User fields", active=bool(u.active),
+                created_by="legacy-migration", updated_by="legacy-migration"))
+        s.add(IdentityMigrationState(id=1, version="1.0", completed_at=dt.datetime.utcnow()))
+        s.commit()
+
 
 # ---------------------------------------------------------------------
 # Hygiene helpers (used by /heartbeat and tether checks)
@@ -2089,6 +2343,13 @@ def init_db():
         _repair_conversation_states()
     except Exception:
         pass
+    global IDENTITY_MIGRATION_ERROR
+    try:
+        _repair_multi_context_identity()
+        IDENTITY_MIGRATION_ERROR = None
+    except Exception as exc:
+        # Do not manufacture authority on failed repair; resolution fails closed.
+        IDENTITY_MIGRATION_ERROR = f"multi-context identity migration failed: {exc}"
 
     return True
 
@@ -2157,18 +2418,28 @@ def log_audit(actor: Optional[str], action: str, ref_type: str, ref_id: int, det
 # ---------------------------------------------------------------------
 def get_user_role(wa_id: str) -> Optional[dict]:
     with SessionLocal() as s:
-        u = s.query(User).filter(User.wa_id == wa_id).first()
+        u = s.query(User).filter(User.wa_id == wa_id, User.active == True).first()
         if not u:
             return None
+        effective = _EFFECTIVE_MEMBERSHIP.get()
+        if effective and str(effective.get("sender")) == str(wa_id):
+            m = effective
+        else:
+            rows = s.query(SenderMembership).filter_by(user_id=u.id, active=True).all()
+            if len(rows) != 1:
+                return None
+            m = _membership_dict(rows[0], u)
         return {
             "wa_id": u.wa_id,
-            "client_id": u.client_id,
+            "client_id": m.get("client_id"),
             "name": u.name,
-            "role": u.role,
-            "subcontractor_name": u.subcontractor_name,
-            "project_code": u.project_code,
+            "role": m.get("role"),
+            "project_code": m.get("project_code"),
+            "subcontractor_name": m.get("subcontractor_name"),
             "phone": u.phone,
             "active": u.active,
+            "context_kind": m.get("context_kind"),
+            "membership_id": m.get("id"),
         }
 
 def get_pms_for_project(project_code: str) -> list[dict]:
