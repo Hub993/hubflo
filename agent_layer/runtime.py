@@ -1069,6 +1069,12 @@ class AgentRuntime:
             definition = self._definitions[item["capability_id"]]
             if definition.side_effect_class not in ("S0", "S1"):
                 continue
+            if definition.requires_entitlement:
+                entitlement = self.repository.entitlement(
+                    principal.scope.client_id, "capability",
+                    definition.capability_id, principal.principal_id)
+                if not bool(entitlement and entitlement["value"].get("enabled", False)):
+                    continue
             eligible.append({
                 "capability_id": definition.capability_id,
                 "version": definition.version,
