@@ -1057,6 +1057,33 @@ class AgentRuntime:
         return [item for item in self.repository.capabilities()
                 if self.effective_state(principal, item["capability_id"])["decision"] == "ALLOW"]
 
+    def eligible_conversational_capabilities(self, principal: Principal):
+        """Return the current, governed S0/S1 universe for live ingress.
+
+        This is introspection only.  Every later Invocation still traverses
+        ``governed_invoke`` and its independent current-state gate.
+        """
+        eligible = []
+        for item in self.discover_functions(principal):
+            definition = self._definitions[item["capability_id"]]
+            if definition.side_effect_class not in ("S0", "S1"):
+                continue
+            eligible.append({
+                "capability_id": definition.capability_id,
+                "version": definition.version,
+                "purpose": definition.purpose,
+                "side_effect_class": definition.side_effect_class,
+                "risk_class": definition.risk_class,
+                "input_schema": dict(definition.input_schema),
+                "optional_input_fields": list(definition.optional_input_fields),
+                "input_semantics": list(definition.input_semantics),
+                "requires_provider": definition.requires_provider,
+            })
+        return eligible
+
+    def capability_definition(self, capability_id: str):
+        return self._definitions.get(capability_id)
+
     def compose(self, principal: Principal, components: Iterable[Mapping[str, Any]]):
         return derive_composed_scope(principal, components)
 

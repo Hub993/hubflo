@@ -35,6 +35,9 @@ from storage_v6_1 import (
 )
 
 from storage_v6_1 import Task
+from agent_layer.contracts import Principal, Scope
+from agent_layer.conversational import ConversationalOrchestrator
+from agent_layer.runtime import AgentRuntime
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -77,6 +80,14 @@ _PHASE_DIGEST_TOGGLE = {}
 # Boot DB
 # ---------------------------------------------------------------------
 init_db()
+
+# Agent Layer is constructed once; authority and eligibility are resolved per
+# inbound message by the conversational boundary below.
+AGENT_RUNTIME = AgentRuntime(runtime_id="hubflo-webhook")
+AGENT_CONVERSATIONAL_ORCHESTRATOR = ConversationalOrchestrator(
+    AGENT_RUNTIME,
+    provider_id=os.environ.get("HUBFLO_AGENT_PROVIDER_ID", "").strip() or None,
+)
 
 
 # ============================================================
@@ -4513,7 +4524,9 @@ def webhook():
         claim = {"status": "not-applicable"}
         # Explicit routing input is claimed even for one membership.  Ordinary
         # single-membership business text retains the legacy path.
-        if multi_context or context_routing:
+        if multi_context or context_routing or (
+            membership and membership.get("context_kind") == "platform"
+        ):
             event_id = m.get("id")
             resolution = context_result.get("status")
             claim = claim_multi_context_inbound(event_id, sender, str(phone_id), resolution, membership)
@@ -4550,23 +4563,77 @@ def webhook():
         else:
             continue
 
-        if membership.get("context_kind") == "platform":
-            if claim.get("status") == "claimed":
-                complete_multi_context_inbound(
-                    event_id, "platform-boundary", state="completed"
-                )
-            send_whatsapp_text(
-                phone_id, sender,
-                "Platform context is selected, but platform sender ingress is not yet wired.",
-            )
-            continue
+        # Platform messages are never sent to the client Stage 2 mutation
+        # path. They continue below to the bounded Agent boundary.
 
-        if claim.get("status") == "claimed":
+        if (claim.get("status") == "claimed"
+                and membership.get("context_kind") != "platform"):
             # The legacy downstream path has no universal completion contract;
             # bind the event and record an honest handoff before routing.
             release_multi_context_inbound(
                 event_id, "released-to-stage2", state="released"
             )
+
+        def _agent_principal_for_membership(selected: dict) -> Principal:
+            # The sender is the authenticated canonical person identifier. No
+            # legacy User scope fields participate in Agent authority.
+            return Principal(
+                principal_id=str(sender),
+                principal_class="user",
+                scope=Scope(
+                    client_id=(int(selected["client_id"])
+                               if selected.get("client_id") is not None else None),
+                    project_code=selected.get("project_code"),
+                ),
+            )
+
+        def _agent_response(result: dict) -> str:
+            if result.get("status") == "clarification":
+                return "I need a little more detail before I can help with that."
+            if result.get("status") in ("denied", "degraded"):
+                return "I can’t provide that assistance in the current context."
+            outcome = (result.get("result").outcome
+                       if result.get("result") is not None else {})
+            for key in ("content", "interpretation", "diagnosis", "assessment",
+                        "recommendation", "analysis", "status"):
+                if outcome.get(key):
+                    return str(outcome[key])
+            return "Your request was handled within the current authorized scope."
+
+        # Deterministic ownership arbitration. Platform has no client Stage 2
+        # mutation path; client/Flo ingress enters Agent only when the existing
+        # non-mutating recognizers do not own it and it is not an actionable
+        # ordinary Task.
+        global SENDER_GLOBAL
+        SENDER_GLOBAL = sender
+        deterministic_owner = False
+        if membership.get("context_kind") != "platform" and text:
+            deterministic_owner = has_deterministic_normal_route_recognition(text)
+            if not deterministic_owner:
+                deterministic_owner = bool(classify_message(text).get("actionable"))
+
+        if text and not deterministic_owner:
+            event_id = str(m.get("id") or "").strip()
+            if claim.get("status") == "not-applicable":
+                claim = claim_multi_context_inbound(
+                    event_id, sender, str(phone_id), "agent", membership
+                )
+            if claim.get("status") != "claimed":
+                continue
+            principal = _agent_principal_for_membership(membership)
+            try:
+                agent_result = AGENT_CONVERSATIONAL_ORCHESTRATOR.handle(
+                    text, principal, membership, event_id
+                )
+            except Exception as exc:
+                log.warning("agent conversational selection unavailable: %s", exc)
+                agent_result = {"status": "degraded", "code": "PROVIDER_UNAVAILABLE"}
+            complete_multi_context_inbound(
+                event_id, "agent-%s" % agent_result.get("status", "completed"),
+                state="completed",
+            )
+            send_whatsapp_text(phone_id, sender, _agent_response(agent_result))
+            continue
 
         message_route = (
             interpret_supported_message(text).get("route")
@@ -5343,7 +5410,6 @@ def webhook():
         # -------------------------------------------------------------
         # FALLBACK → classifier + task creation
         # -------------------------------------------------------------
-        global SENDER_GLOBAL
         SENDER_GLOBAL = sender
 
         cls = classify_message(text or "")
