@@ -2,6 +2,7 @@ import threading
 import unittest
 import uuid
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -22,6 +23,8 @@ if (
 
 import storage
 import app as hubflo_app
+from agent_layer.conversational import ConversationalOrchestrator
+from agent_layer.contracts import Principal, Scope
 
 
 class MultiContextIdentityTests(unittest.TestCase):
@@ -170,9 +173,52 @@ class MultiContextIdentityTests(unittest.TestCase):
         ts = [threading.Thread(target=revoke), threading.Thread(target=claim)]
         [t.start() for t in ts]; [t.join() for t in ts]
         self.assertEqual(result, ["stale-or-unauthorized"])
-    @unittest.skip("Agent Layer real sender ingress not yet wired")
-    def test_mc18_agent_ingress_limitation_is_explicit(self):
-        pass
+    def test_mc18_controlled_webhook_reaches_actual_governed_invoke(self):
+        definition = SimpleNamespace(
+            capability_id="manager_pa.assist", version="2.0.0",
+            purpose="bounded assistance", side_effect_class="S1", risk_class="R1",
+            input_schema={"request": str, "assistance_mode": str, "evidence_refs": list},
+            optional_input_fields=(), optional_input_schema={}, input_semantics=(),
+            requires_provider=False,
+        )
+
+        class ControlledRuntime:
+            def eligible_conversational_capabilities(self, principal):
+                return [{"capability_id": "manager_pa.assist", "version": "2.0.0",
+                         "purpose": "bounded assistance", "side_effect_class": "S1",
+                         "risk_class": "R1", "input_schema": definition.input_schema,
+                         "optional_input_fields": [], "input_semantics": [],
+                         "requires_provider": False}]
+
+            def capability_definition(self, capability_id):
+                return definition if capability_id == definition.capability_id else None
+
+            def conversational_proposal(self, provider_id, principal, request_text,
+                                        event_id, membership, eligible, output_contract):
+                return {"selection": "selected", "capability_id": "manager_pa.assist",
+                        "arguments": {"request": request_text,
+                                      "assistance_mode": "explain", "evidence_refs": []},
+                        "evidence_refs": []}
+
+            def governed_invoke(self, invocation):
+                self.principal = invocation.principal
+                return hubflo_app.AGENT_RUNTIME.governed_invoke(invocation)
+
+        controlled = ControlledRuntime()
+        orchestrator = ConversationalOrchestrator(controlled, "controlled-test")
+        with patch.object(hubflo_app, "AGENT_CONVERSATIONAL_ORCHESTRATOR", orchestrator), \
+             patch.object(hubflo_app.AGENT_RUNTIME, "governed_invoke",
+                          wraps=hubflo_app.AGENT_RUNTIME.governed_invoke) as governed:
+            response = self.ingress("hello", "mc18-agent")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(controlled.principal.principal_id, "user:%s" % self.user.id)
+        self.assertEqual(controlled.principal.scope.client_id, 7)
+        self.assertEqual(governed.call_count, 1)
+        with storage.SessionLocal() as s:
+            claim = s.query(storage.MultiContextInboundClaim).filter_by(event_id="mc18-agent").one()
+            self.assertEqual(claim.processing_state, "completed")
+            self.assertIn("agent-denied", claim.outcome)
 
 
 if __name__ == "__main__": unittest.main()

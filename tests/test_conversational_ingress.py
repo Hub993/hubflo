@@ -7,11 +7,12 @@ from agent_layer.providers import DeterministicProvider, ProviderRegistry
 
 
 class RecordingRuntime:
-    def __init__(self, proposal):
+    def __init__(self, proposal, governed_status="COMPLETED"):
         self.providers = ProviderRegistry()
         self.providers.register(DeterministicProvider("selection", "test", lambda request: proposal))
         self.repository = SimpleNamespace(provider_policy=lambda provider_id: {"provider_id": provider_id})
         self.invocations = []
+        self.governed_status = governed_status
         self.definition = SimpleNamespace(
             capability_id="manager_pa.assist", version="2.0.0",
             purpose="bounded assistance", side_effect_class="S1", risk_class="R1",
@@ -33,7 +34,20 @@ class RecordingRuntime:
 
     def governed_invoke(self, invocation):
         self.invocations.append(invocation)
-        return SimpleNamespace(status="COMPLETED", code="OK", outcome={"content": "bounded"})
+        return SimpleNamespace(status=self.governed_status,
+                               code=("OK" if self.governed_status == "COMPLETED" else "DENIED"),
+                               outcome={"content": "bounded"})
+
+    def conversational_proposal(self, provider_id, principal, request_text,
+                                event_id, membership, eligible, output_contract):
+        request = SimpleNamespace(
+            operation="conversational.select",
+            context={"request": request_text, "membership": membership,
+                     "eligible_capabilities": eligible},
+            output_contract=output_contract,
+            optional_output_fields=(), optional_output_schema={},
+        )
+        return self.providers.invoke(request, (provider_id,)).output
 
 
 class ConversationalIngressTests(unittest.TestCase):
@@ -62,6 +76,17 @@ class ConversationalIngressTests(unittest.TestCase):
             "fix it", self.principal(), {"id": 3}, "event-2")
         self.assertEqual(result["code"], "CAPABILITY_OUTSIDE_ELIGIBLE_UNIVERSE")
         self.assertFalse(runtime.invocations)
+
+    def test_governed_denial_is_not_reported_as_invoked(self):
+        runtime = RecordingRuntime({
+            "selection": "selected", "capability_id": "manager_pa.assist",
+            "arguments": {"request": "explain", "assistance_mode": "explain", "evidence_refs": []},
+            "evidence_refs": [],
+        }, governed_status="DENIED")
+        result = ConversationalOrchestrator(runtime, "selection").handle(
+            "Can you explain this?", self.principal(), {"id": 3}, "event-denied")
+        self.assertEqual(result["status"], "denied")
+        self.assertEqual(result["governed_status"], "DENIED")
 
 
 if __name__ == "__main__":

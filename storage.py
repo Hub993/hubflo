@@ -193,6 +193,7 @@ def _membership_dict(m, u):
     return {"id":m.id,"user_id":u.id,"sender":u.wa_id,"context_kind":m.context_kind,
             "client_id":m.client_id,"context_label":m.context_label,"role":m.role,
             "project_code":m.project_code,"subcontractor_name":m.subcontractor_name,
+            "authority_basis":m.authority_basis,
             "active":bool(m.active),
             "membership_updated_at":m.updated_at}
 

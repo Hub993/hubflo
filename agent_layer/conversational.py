@@ -3,9 +3,7 @@
 import hashlib
 from typing import Any, Mapping, Optional
 
-from .contracts import (Invocation, Principal, ProtectedItem, ProviderError,
-                        ProviderRequest, Scope, validate_structured)
-from .security import contains_secret, safe_evidence
+from .contracts import Invocation, Principal, ProtectedItem, validate_structured
 
 
 SELECTION_OUTPUT = {
@@ -25,35 +23,10 @@ class ConversationalOrchestrator:
 
     def _proposal(self, principal: Principal, request_text: str, event_id: str,
                   membership: Mapping[str, Any], eligible: list) -> Mapping[str, Any]:
-        if not self.provider_id:
-            raise ProviderError("conversational provider is not configured")
-        if contains_secret(request_text) or contains_secret(membership):
-            raise ProviderError("secret-bearing conversational input denied")
-        if (hasattr(self.runtime, "repository") and
-                self.runtime.repository.provider_policy(self.provider_id) is None):
-            raise ProviderError("provider is not approved")
-        request = ProviderRequest(
-            operation="conversational.select",
-            context={
-                "request": request_text,
-                "principal": {"principal_id": principal.principal_id,
-                              "principal_class": principal.principal_class},
-                "scope": {"client_id": principal.scope.client_id,
-                          "project_code": principal.scope.project_code,
-                          "industry_key": principal.scope.industry_key},
-                "membership": safe_evidence(dict(membership)),
-                "provider_event_id": event_id,
-                "eligible_capabilities": [
-                    {**item, "input_schema": {
-                        key: getattr(value, "__name__", str(value))
-                        for key, value in item["input_schema"].items()
-                    }} for item in eligible
-                ],
-            },
-            output_contract=SELECTION_OUTPUT,
+        return self.runtime.conversational_proposal(
+            self.provider_id, principal, request_text, event_id, membership, eligible,
+            SELECTION_OUTPUT,
         )
-        result = self.runtime.providers.invoke(request, (self.provider_id,))
-        return result.output
 
     def handle(self, request_text: str, principal: Principal,
                membership: Mapping[str, Any], event_id: str):
@@ -100,4 +73,14 @@ class ConversationalOrchestrator:
             evidence_refs=evidence_refs,
         )
         result = self.runtime.governed_invoke(invocation)
-        return {"status": "invoked", "result": result, "invocation": invocation}
+        status = str(getattr(result, "status", "FAILED")).upper()
+        if status == "COMPLETED":
+            outcome_status = "invoked"
+        elif status in ("DENIED", "STOP"):
+            outcome_status = "denied"
+        elif status in ("PENDING", "ESCALATE"):
+            outcome_status = "pending"
+        else:
+            outcome_status = "degraded"
+        return {"status": outcome_status, "code": getattr(result, "code", status),
+                "governed_status": status, "result": result, "invocation": invocation}

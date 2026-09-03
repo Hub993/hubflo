@@ -2603,6 +2603,12 @@ def webhook():
         if meeting_recognition.handled:
             return True
 
+        # Reuse the existing authorized-person/task route for natural leading
+        # assignees; this is routing evidence, not a new recognizer.
+        scope = _conversation_scope(SENDER_GLOBAL)
+        if _mu13_leading_task_route(SENDER_GLOBAL, t, scope[1]):
+            return True
+
         return False
 
     # -----------------------------------------------------------------
@@ -4512,8 +4518,8 @@ def webhook():
             }
             text = meta.get("caption")
 
-        # Multi-context ingress is resolved without mutation first. Its
-        # provider event claim gates selection responses and downstream work.
+        # Ingress is resolved from an authoritative snapshot before any
+        # routing decision. The event claim is retained until that decision.
         context_result = resolve_sender_context(sender, str(phone_id), text or "")
         multi_context = len(context_result.get("memberships") or []) > 1
         context_routing = context_result.get("status") in ("proposed_selection", "selection_denied", "selection_required", "configuration_conflict")
@@ -4522,11 +4528,7 @@ def webhook():
             continue
         membership = context_result.get("membership")
         claim = {"status": "not-applicable"}
-        # Explicit routing input is claimed even for one membership.  Ordinary
-        # single-membership business text retains the legacy path.
-        if multi_context or context_routing or (
-            membership and membership.get("context_kind") == "platform"
-        ):
+        if membership or multi_context or context_routing:
             event_id = m.get("id")
             resolution = context_result.get("status")
             claim = claim_multi_context_inbound(event_id, sender, str(phone_id), resolution, membership)
@@ -4563,22 +4565,11 @@ def webhook():
         else:
             continue
 
-        # Platform messages are never sent to the client Stage 2 mutation
-        # path. They continue below to the bounded Agent boundary.
-
-        if (claim.get("status") == "claimed"
-                and membership.get("context_kind") != "platform"):
-            # The legacy downstream path has no universal completion contract;
-            # bind the event and record an honest handoff before routing.
-            release_multi_context_inbound(
-                event_id, "released-to-stage2", state="released"
-            )
-
         def _agent_principal_for_membership(selected: dict) -> Principal:
-            # The sender is the authenticated canonical person identifier. No
-            # legacy User scope fields participate in Agent authority.
+            # Membership user_id is the canonical person authority. The
+            # channel address is evidence only, never the Agent principal.
             return Principal(
-                principal_id=str(sender),
+                principal_id="user:%s" % str(selected["user_id"]),
                 principal_class="user",
                 scope=Scope(
                     client_id=(int(selected["client_id"])
@@ -4590,7 +4581,7 @@ def webhook():
         def _agent_response(result: dict) -> str:
             if result.get("status") == "clarification":
                 return "I need a little more detail before I can help with that."
-            if result.get("status") in ("denied", "degraded"):
+            if result.get("status") in ("denied", "degraded", "pending", "failed"):
                 return "I can’t provide that assistance in the current context."
             outcome = (result.get("result").outcome
                        if result.get("result") is not None else {})
@@ -4600,24 +4591,48 @@ def webhook():
                     return str(outcome[key])
             return "Your request was handled within the current authorized scope."
 
-        # Deterministic ownership arbitration. Platform has no client Stage 2
-        # mutation path; client/Flo ingress enters Agent only when the existing
-        # non-mutating recognizers do not own it and it is not an actionable
-        # ordinary Task.
+        # Deterministic ownership arbitration uses the existing Stage 2
+        # recognizers only. ordinary_fallback is intentionally available to
+        # the conversational boundary; classify_message has no routing field.
         global SENDER_GLOBAL
         SENDER_GLOBAL = sender
         deterministic_owner = False
         if membership.get("context_kind") != "platform" and text:
+            # Existing await/clarification ownership has priority over the
+            # conversational boundary and is resolved by the accepted seam.
+            deterministic_owner = bool(_get_active_conversation_state(sender))
+            if not deterministic_owner:
+                with DBSession() as session:
+                    legacy_await = session.query(Task).filter(
+                        Task.sender == sender,
+                        Task.status == "open",
+                        Task.text.ilike("[await:%]%"),
+                    ).order_by(Task.id.desc()).first()
+                if legacy_await:
+                    current_scope = _conversation_scope(sender)
+                    await_project = str(legacy_await.project_code or "").strip() or None
+                    deterministic_owner = (
+                        int(legacy_await.client_id or 1) == int(current_scope[0])
+                        and (await_project is None or await_project == current_scope[1])
+                    )
+        if membership.get("context_kind") != "platform" and text and not deterministic_owner:
             deterministic_owner = has_deterministic_normal_route_recognition(text)
             if not deterministic_owner:
-                deterministic_owner = bool(classify_message(text).get("actionable"))
+                # The accepted classifier's public contract is tag/subtype/
+                # order_state. Its tag is existing Stage 2 ownership evidence;
+                # the rejected candidate's invented `actionable` field is not.
+                deterministic_owner = classify_message(text).get("tag") in (
+                    "task", "order", "urgent", "change"
+                )
+
+        if (deterministic_owner and claim.get("status") == "claimed"
+                and membership.get("context_kind") != "platform"):
+            release_multi_context_inbound(
+                event_id, "released-to-stage2", state="released"
+            )
 
         if text and not deterministic_owner:
             event_id = str(m.get("id") or "").strip()
-            if claim.get("status") == "not-applicable":
-                claim = claim_multi_context_inbound(
-                    event_id, sender, str(phone_id), "agent", membership
-                )
             if claim.get("status") != "claimed":
                 continue
             principal = _agent_principal_for_membership(membership)
@@ -4629,9 +4644,10 @@ def webhook():
                 log.warning("agent conversational selection unavailable: %s", exc)
                 agent_result = {"status": "degraded", "code": "PROVIDER_UNAVAILABLE"}
             complete_multi_context_inbound(
-                event_id, "agent-%s" % agent_result.get("status", "completed"),
-                state="completed",
-            )
+                event_id, "agent-%s:%s" % (
+                    agent_result.get("status", "failed"),
+                    agent_result.get("code", "UNKNOWN"),
+                ), state="completed")
             send_whatsapp_text(phone_id, sender, _agent_response(agent_result))
             continue
 

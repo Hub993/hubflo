@@ -13,6 +13,7 @@ from .contracts import (
     InvocationResult,
     LEARNING_SCOPES,
     Principal,
+    ProtectedItem,
     ProviderError,
     ProviderRequest,
     SecurityError,
@@ -22,7 +23,7 @@ from .contracts import (
 )
 from .persistence import AgentRepository, stable_hash
 from .providers import ProviderRegistry
-from .security import ContextAssembler, derive_composed_scope
+from .security import ContextAssembler, derive_composed_scope, safe_evidence
 
 
 OPTIONAL_FIELD_TYPES = {
@@ -1080,6 +1081,62 @@ class AgentRuntime:
                 "requires_provider": definition.requires_provider,
             })
         return eligible
+
+    def conversational_proposal(self, provider_id, principal, request_text,
+                                event_id, membership, eligible, output_contract):
+        """Select through the same classified provider boundary as invocations."""
+        if not provider_id:
+            raise ProviderError("conversational provider is not configured")
+        policy = self.repository.provider_policy(provider_id)
+        if policy is None or policy.get("training_permitted"):
+            raise ProviderError("provider is not approved")
+        context = self.context_assembler.assemble(
+            principal,
+            (
+                ProtectedItem(
+                    reference="conversational-request:" + str(event_id),
+                    value=str(request_text), security_domain="SD3",
+                    client_id=principal.scope.client_id,
+                    project_code=principal.scope.project_code,
+                    classification="conversational-request",
+                    permitted_uses=("reason",), provider_eligible=True,
+                    retention_max_seconds=0,
+                    provenance={"source_ref": "whatsapp-event:" + str(event_id)},
+                ),
+                ProtectedItem(
+                    reference="conversational-membership:" + str(event_id),
+                    value=safe_evidence(dict(membership)), security_domain="SD1",
+                    client_id=principal.scope.client_id,
+                    project_code=principal.scope.project_code,
+                    classification="membership-authority",
+                    permitted_uses=("reason",), provider_eligible=True,
+                    retention_max_seconds=0,
+                    provenance={"source_ref": "sender-membership:" + str(membership.get("id"))},
+                ),
+            ),
+            policy.get("allowed_data_classes", ()), "reason",
+            for_provider=True, provider_policy=policy,
+        )
+        request = ProviderRequest(
+            operation="conversational.select",
+            context={
+                "classified_context": context,
+                "principal": {"principal_id": principal.principal_id,
+                              "principal_class": principal.principal_class},
+                "scope": {"client_id": principal.scope.client_id,
+                          "project_code": principal.scope.project_code,
+                          "industry_key": principal.scope.industry_key},
+                "provider_event_id": str(event_id),
+                "eligible_capabilities": [
+                    {**item, "input_schema": {
+                        key: getattr(value, "__name__", str(value))
+                        for key, value in item["input_schema"].items()
+                    }} for item in eligible
+                ],
+            },
+            output_contract=output_contract,
+        )
+        return self.providers.invoke(request, (provider_id,)).output
 
     def capability_definition(self, capability_id: str):
         return self._definitions.get(capability_id)
