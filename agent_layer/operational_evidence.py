@@ -144,7 +144,7 @@ class OperationalEvidenceAssembler:
                 ]
                 items.append(self._item(
                     storage.Task.__tablename__, row.id, client_id,
-                    project_code, value,
+                    row.project_code or None, value,
                 ))
 
             inspections = self._scope_query(
@@ -159,7 +159,7 @@ class OperationalEvidenceAssembler:
                 )
                 items.append(self._item(
                     storage.Inspection.__tablename__, row.id, client_id,
-                    project_code, value,
+                    row.project_code or None, value,
                 ))
 
             meetings = self._scope_query(
@@ -169,7 +169,7 @@ class OperationalEvidenceAssembler:
             for row in meetings:
                 items.append(self._item(
                     storage.Meeting.__tablename__, row.id, client_id,
-                    project_code, _record(row, self._MEETING_FIELDS),
+                    row.project_code or None, _record(row, self._MEETING_FIELDS),
                 ))
 
             stocks = self._scope_query(
@@ -180,7 +180,7 @@ class OperationalEvidenceAssembler:
             for row in stocks:
                 items.append(self._item(
                     storage.StockItem.__tablename__, row.id, client_id,
-                    project_code, _record(row, self._STOCK_FIELDS),
+                    row.project_code or None, _record(row, self._STOCK_FIELDS),
                 ))
 
             delays = self._scope_query(
@@ -192,18 +192,28 @@ class OperationalEvidenceAssembler:
                     continue
                 items.append(self._item(
                     storage.DelayLog.__tablename__, row.id, client_id,
-                    project_code, _record(row, self._DELAY_FIELDS),
+                    row.project_code or None, _record(row, self._DELAY_FIELDS),
                 ))
 
-            groups = session.query(storage.TaskGroup).order_by(storage.TaskGroup.id).all()
+            task_ids = tuple(scoped_tasks)
+            groups = (
+                session.query(storage.TaskGroup).filter(
+                    storage.TaskGroup.parent_id.in_(task_ids),
+                    storage.TaskGroup.child_id.in_(task_ids),
+                ).order_by(storage.TaskGroup.id).all()
+                if task_ids else []
+            )
             for row in groups:
                 parent = scoped_tasks.get(row.parent_id)
                 child = scoped_tasks.get(row.child_id)
-                if parent is None or child is None:
-                    continue
+                relationship_project = (
+                    parent.project_code
+                    if parent.project_code == child.project_code
+                    else None
+                )
                 items.append(self._item(
                     storage.TaskGroup.__tablename__, row.id, client_id,
-                    project_code,
+                    relationship_project or None,
                     {"id": row.id, "parent_task_id": row.parent_id,
                      "child_task_id": row.child_id,
                      "created_at": _value(row.created_at)},
@@ -215,7 +225,7 @@ class OperationalEvidenceAssembler:
             for row in movements:
                 items.append(self._item(
                     storage.StockMovement.__tablename__, row.id, client_id,
-                    project_code,
+                    scoped_stock[row.stock_item_id].project_code or None,
                     _record(row, ("id", "stock_item_id", "ts", "qty_change",
                                   "related_task_id")),
                 ))

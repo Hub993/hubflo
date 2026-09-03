@@ -55,6 +55,12 @@ class ConversationalOrchestrator:
         protected_context = ()
         evidence_refs = tuple(str(ref) for ref in proposal["evidence_refs"])
         if capability_id == "manager_pa.assist" and self.evidence_assembler is not None:
+            # Selection is provider-assisted and may take long enough for
+            # authority to change. Re-resolve the accepted deterministic
+            # eligible universe before any protected operational retrieval.
+            eligible = self.runtime.eligible_conversational_capabilities(principal)
+            if capability_id not in {row["capability_id"] for row in eligible}:
+                return {"status": "denied", "code": "CAPABILITY_NO_LONGER_ELIGIBLE"}
             operational = tuple(self.evidence_assembler.assemble(principal, membership))
             evidence_refs = tuple(item.reference for item in operational)
             arguments = dict(arguments)

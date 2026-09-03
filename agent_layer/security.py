@@ -70,6 +70,7 @@ class ContextAssembler:
                 raise SecurityError("cross-client context denied")
             if (
                 item.project_code is not None
+                and principal.scope.project_code is not None
                 and item.project_code != principal.scope.project_code
             ):
                 raise SecurityError("cross-project context denied")

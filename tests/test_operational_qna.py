@@ -1,9 +1,12 @@
 import json
 import os
 from pathlib import Path
+import datetime as dt
 import unittest
 import uuid
 from unittest.mock import patch
+
+from sqlalchemy import event
 
 _db_url = os.environ.get("DATABASE_URL", "")
 _db_path = _db_url.removeprefix("sqlite:///") if _db_url.startswith("sqlite:///") else ""
@@ -15,8 +18,9 @@ import app as hubflo_app
 import storage
 from agent_layer.contracts import Principal, Scope
 from agent_layer.conversational import ConversationalOrchestrator
-from agent_layer.models import AgentProviderPolicy
+from agent_layer.models import AgentAuthorityGrant, AgentProviderPolicy
 from agent_layer.operational_evidence import OperationalEvidenceAssembler
+from agent_layer.persistence import scope_key
 from agent_layer.providers import (
     DeterministicProvider, OpenAIResponsesProvider, ProviderRegistry,
     register_configured_provider,
@@ -254,6 +258,38 @@ class OperationalQATests(unittest.TestCase):
         self.assertIn("SA-UNIQUE-SENTINEL", repr(self._assist_request().context))
         self.assertNotIn("FL-UNIQUE-SENTINEL", repr(self._assist_request().context))
 
+    def test_q11_other_client_taskgroups_are_filtered_by_the_query(self):
+        with storage.SessionLocal() as session:
+            sa_tasks = session.query(storage.Task).filter_by(
+                client_id=self.sa, project_code="Branch 1").order_by(
+                    storage.Task.id).limit(2).all()
+            foreign = storage.TaskGroup(
+                parent_id=sa_tasks[0].id, child_id=sa_tasks[1].id)
+            session.add(foreign); session.commit(); foreign_id = foreign.id
+            foreign_task_ids = {sa_tasks[0].id, sa_tasks[1].id}
+        membership = storage.resolve_sender_context(SENDERS["Dolan"])["membership"]
+        principal = Principal(
+            "user:%s" % membership["user_id"], "user", Scope(self.florida, None))
+        observed = []
+
+        def capture(_connection, _cursor, statement, parameters, _context, _many):
+            if "from task_groups" in statement.lower():
+                observed.append((statement, parameters))
+
+        event.listen(storage.ENGINE, "before_cursor_execute", capture)
+        try:
+            items = OperationalEvidenceAssembler().assemble(principal, membership)
+        finally:
+            event.remove(storage.ENGINE, "before_cursor_execute", capture)
+        self.assertEqual(len(observed), 1)
+        statement, parameters = observed[0]
+        normalized = " ".join(statement.lower().split())
+        self.assertIn("task_groups.parent_id in", normalized)
+        self.assertIn("task_groups.child_id in", normalized)
+        self.assertTrue(foreign_task_ids.isdisjoint(set(parameters)))
+        self.assertNotIn("hubflo:task_groups:%s" % foreign_id,
+                         {item.reference for item in items})
+
     def test_q12_project_restricted_principal_gets_only_project(self):
         with storage.SessionLocal() as session:
             user = session.query(storage.User).filter_by(wa_id=SENDERS["Dolan"]).one()
@@ -266,8 +302,31 @@ class OperationalQATests(unittest.TestCase):
             {"id": membership_id, "user_id": user_id},
         )
         self.assertTrue(items)
-        self.assertTrue(all(item.project_code in (None, "Site 1") for item in items))
+        self.assertTrue(all(item.project_code == "Site 1" for item in items))
         self.assertNotIn("Site 2", repr(items))
+
+    def test_q12_broad_scope_preserves_justified_record_project_metadata(self):
+        membership = storage.resolve_sender_context(SENDERS["Dolan"])["membership"]
+        principal = Principal(
+            "user:%s" % membership["user_id"], "user", Scope(self.florida, None))
+        with storage.SessionLocal() as session:
+            parent = session.query(storage.Task).filter_by(
+                client_id=self.florida, project_code="Site 1").first()
+            child = session.query(storage.Task).filter_by(
+                client_id=self.florida, project_code="Site 2").first()
+            relationship = storage.TaskGroup(parent_id=parent.id, child_id=child.id)
+            session.add(relationship); session.commit(); relationship_id = relationship.id
+        items = OperationalEvidenceAssembler().assemble(principal, membership)
+        intrinsic_tables = {"tasks", "inspections", "meetings", "stock_items",
+                            "delay_logs"}
+        intrinsic = [item for item in items
+                     if item.provenance.get("table") in intrinsic_tables]
+        self.assertTrue(intrinsic)
+        self.assertTrue(all(item.project_code == item.value["project_code"]
+                            for item in intrinsic))
+        cross_project = next(item for item in items
+                             if item.reference == "hubflo:task_groups:%s" % relationship_id)
+        self.assertIsNone(cross_project.project_code)
 
     def test_q13_revoked_membership_cannot_retrieve_or_reason(self):
         result = storage.resolve_sender_context(SENDERS["Dolan"])
@@ -282,6 +341,54 @@ class OperationalQATests(unittest.TestCase):
         before = len(self.requests)
         self._inbound(SENDERS["Dolan"], "what is overdue?")
         self.assertEqual(before, len(self.requests))
+
+    def _assert_grant_change_during_selection_blocks_retrieval(self, change):
+        principal_id = "user:%s" % self.state["user_ids"]["Dolan"]
+
+        def responder(request):
+            self.requests.append(request)
+            if request.operation != "conversational.select":
+                self.fail("protected operational reasoning occurred after grant change")
+            with storage.SessionLocal() as session:
+                grant = session.query(AgentAuthorityGrant).filter(
+                    AgentAuthorityGrant.principal_id == principal_id,
+                    AgentAuthorityGrant.capability_id == "manager_pa.assist",
+                    AgentAuthorityGrant.client_id == self.florida,
+                    AgentAuthorityGrant.revoked_at == None,
+                ).one()
+                if change == "revoke":
+                    grant.revoked_at = dt.datetime.utcnow()
+                else:
+                    grant.project_code = "Site 1"
+                    grant.scope_key = scope_key(self.florida, "Site 1")
+                self._changed_grant_id = grant.id
+                session.commit()
+            return self._selection(request)
+
+        hubflo_app.AGENT_RUNTIME.providers.register(DeterministicProvider(
+            self.provider_id, "grant-change", responder))
+        assembler = self.orchestrator.evidence_assembler
+        try:
+            with patch.object(assembler, "assemble", wraps=assembler.assemble) as assemble:
+                answer = self._inbound(SENDERS["Dolan"], "what is overdue?")
+        finally:
+            with storage.SessionLocal() as session:
+                grant = session.get(AgentAuthorityGrant, self._changed_grant_id)
+                grant.scope_key = scope_key(self.florida)
+                grant.project_code = None
+                grant.revoked_at = None
+                session.commit()
+        self.assertIn("can’t provide", answer)
+        assemble.assert_not_called()
+        self.assertEqual([request.operation for request in self.requests],
+                         ["conversational.select"])
+        self.assertNotIn("hubflo:", repr(self.requests))
+
+    def test_q13_grant_revoked_after_selection_gate_blocks_retrieval(self):
+        self._assert_grant_change_during_selection_blocks_retrieval("revoke")
+
+    def test_q13_grant_narrowed_after_selection_gate_blocks_stale_scope(self):
+        self._assert_grant_change_during_selection_blocks_retrieval("narrow")
 
     def test_q14_no_current_context_preserves_selection_required(self):
         answer = self._inbound(SENDERS["Neville"], "what is overdue?",
