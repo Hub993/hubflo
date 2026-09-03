@@ -1105,7 +1105,7 @@ class AgentRuntime:
                 ),
                 ProtectedItem(
                     reference="conversational-membership:" + str(event_id),
-                    value=safe_evidence(dict(membership)), security_domain="SD1",
+                    value=safe_evidence(dict(membership)), security_domain="SD3",
                     client_id=principal.scope.client_id,
                     project_code=principal.scope.project_code,
                     classification="membership-authority",

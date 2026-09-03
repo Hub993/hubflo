@@ -2603,6 +2603,19 @@ def webhook():
         if meeting_recognition.handled:
             return True
 
+        # The construction Industry interpretation is the existing
+        # non-mutating actionability evidence used by Stage 2.  In
+        # particular, this preserves ordinary imperative Tasks such as
+        # ``check the generator`` without treating classify_message()'s
+        # ordinary fallback tag as ownership.
+        actionability = _CONSTRUCTION_INDUSTRY.interpret(IndustryRequest(
+            capability="domain_recognition",
+            text=t,
+            context={"candidate": "task_actionability"},
+        ))
+        if actionability.handled:
+            return True
+
         # Reuse the existing authorized-person/task route for natural leading
         # assignees; this is routing evidence, not a new recognizer.
         scope = _conversation_scope(SENDER_GLOBAL)
@@ -4617,14 +4630,6 @@ def webhook():
                     )
         if membership.get("context_kind") != "platform" and text and not deterministic_owner:
             deterministic_owner = has_deterministic_normal_route_recognition(text)
-            if not deterministic_owner:
-                # The accepted classifier's public contract is tag/subtype/
-                # order_state. Its tag is existing Stage 2 ownership evidence;
-                # the rejected candidate's invented `actionable` field is not.
-                deterministic_owner = classify_message(text).get("tag") in (
-                    "task", "order", "urgent", "change"
-                )
-
         if (deterministic_owner and claim.get("status") == "claimed"
                 and membership.get("context_kind") != "platform"):
             release_multi_context_inbound(
@@ -4794,8 +4799,13 @@ def webhook():
         # CHECK FOR PERSISTENT CONVERSATION STATE / LEGACY AWAIT
         # -------------------------------------------------------------
         if text:
+            # Pending await/clarification arbitration uses structured
+            # non-ordinary routing evidence.  Ordinary actionable Tasks are
+            # still Stage 2-owned, but must not bypass an active continuation.
             deterministic_recognition = (
-                has_deterministic_normal_route_recognition(text)
+                interpret_supported_message(text).get("route")
+                not in ("ordinary_fallback", "search")
+                or is_search_request(text)
             )
             pending_state = _get_active_conversation_state(sender)
 
