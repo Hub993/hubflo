@@ -39,12 +39,20 @@ def _client_ids():
                  for row in rows}
         if len(found) == 2:
             return found
-        used = {int(value[0]) for value in s.query(storage.User.client_id).all()
-                if value is not None}
-        for model in (storage.Task, storage.Inspection, storage.Meeting,
-                      storage.StockItem, storage.PMProjectMap):
-            used.update(int(value[0]) for value in s.query(model.client_id).all()
-                        if value[0] is not None)
+        used = set()
+        # ClientWAIdentity is the fixture's durable reservation.  Scan every
+        # accepted client-scoped table only when allocating a missing slot so
+        # a partial table scan cannot collide with an unrelated record.
+        for table in storage.Base.metadata.sorted_tables:
+            if "client_id" not in table.c:
+                continue
+            for value, in s.execute(table.select().with_only_columns(table.c.client_id)):
+                if value is None:
+                    continue
+                try:
+                    used.add(int(value))
+                except (TypeError, ValueError):
+                    continue
         candidate = max(used or {0}) + 1
         for label in ("Florida", "SA"):
             if label not in found:
@@ -53,6 +61,14 @@ def _client_ids():
                 found[label] = candidate
                 used.add(candidate)
                 candidate += 1
+        for label, client_id in found.items():
+            if not s.query(storage.ClientWAIdentity).filter_by(
+                    client_id=str(client_id),
+                    display_name_for_whatsapp=f"{FIXTURE_TAG}: {label}").first():
+                s.add(storage.ClientWAIdentity(
+                    client_id=str(client_id),
+                    display_name_for_whatsapp=f"{FIXTURE_TAG}: {label}"))
+        s.commit()
         return found
 
 
@@ -100,8 +116,6 @@ def reset_controlled_fixture():
             s.query(storage.MultiContextInboundClaim).filter(storage.MultiContextInboundClaim.sender.in_(tuple(SENDERS.values()))).delete(synchronize_session=False)
             s.query(storage.SenderMembership).filter(storage.SenderMembership.user_id.in_(user_ids)).delete(synchronize_session=False)
             s.query(storage.User).filter(storage.User.id.in_(user_ids)).delete(synchronize_session=False)
-        s.query(storage.ClientWAIdentity).filter(storage.ClientWAIdentity.display_name_for_whatsapp.in_(
-            (f"{FIXTURE_TAG}: Florida", f"{FIXTURE_TAG}: SA"))).delete(synchronize_session=False)
         s.commit()
     _reset_agent_rows(client_ids)
 
@@ -143,7 +157,7 @@ def _install_agent_state(client_ids, user_ids):
                  "capabilities": sorted(runtime_caps), "risk_classes": ["R1"],
                  "max_autonomy": 2, "actions": ["invoke"], "information_permissions": ["read"],
                  "domains": ["SD3", "SD4"], "confidentiality": ["restricted", "internal"],
-                 "industry_keys": ["construction"]}
+                 "industry_keys": []}
     principals = {service: authority}
     scopes = {"platform": None, "client:%s" % client_ids["Florida"]: client_ids["Florida"],
               "client:%s" % client_ids["SA"]: client_ids["SA"]}
@@ -160,7 +174,7 @@ def _install_agent_state(client_ids, user_ids):
                 "permissions": [], "capabilities": ["help.discover"] if key == "platform" else ["manager_pa.assist"],
                 "risk_classes": ["R1"], "max_autonomy": 1, "actions": ["invoke"],
                 "information_permissions": ["read"], "domains": ["SD3", "SD4"],
-                "confidentiality": ["restricted", "internal"], "industry_keys": ["construction"],
+                "confidentiality": ["restricted", "internal"], "industry_keys": [],
             }
         repo.install_authority_value("AB-AUTH-001", key, {"principals": value_principals},
                                      FIXTURE_TAG, FIXTURE_TAG, _now(),
@@ -207,30 +221,60 @@ def _seed_operations(client_ids):
                     user_id=user_id, client_id=cid).first()[0]
             token = storage.set_effective_membership(membership)
             try:
-                storage.create_task(actor, f"{project} healthy work Ops1", "work", project_code=project, due_date=_now(3), assignee_wa=actor)
-                storage.create_task(actor, f"{project} overdue Concrete1 PM1", "exception", project_code=project, due_date=_now(-3), subcontractor_name="Concrete1")
-                storage.create_task(actor, f"{project} acknowledged escalation PM2", "escalation", project_code=project, due_date=_now(-1), status="open")
-                storage.create_task(actor, f"{project} approved change order", "approval", project_code=project, due_date=_now(2), order_state="approved", subtype="order")
-                storage.create_task(actor, f"{project} completed performance evidence", "performance", project_code=project, status="completed", completed_at=_now(-1), subcontractor_name="Electrical1")
-                rework = storage.create_task(actor, f"{project} rework dependency delivery", "dependency", project_code=project)
-                roster = ("Ops1 PM1 PM2 Site Manager1 Site Manager2 Site Manager3 "
-                          "Concrete1 Electrical1 Plumbing1 HVAC1 Drywall1 Rebar1 "
-                          "Concrete Supply1 Materials1 Equipment1") if cid == florida else (
-                          "Branch 1 Branch 2 Manager1 Workshop Manager1 Parts Manager1 "
-                          "Sales Manager1 Parts Supplier1 Tyre Supplier1 Equipment Supplier1 "
-                          "Vehicle1 Vehicle2 Vehicle3")
-                storage.create_task(actor, f"{project} controlled roster {roster}", "reference", project_code=project)
+                if cid == florida:
+                    healthy = storage.create_task(actor, f"{project} future work", "task", project_code=project, due_date=_now(3), assignee_wa=actor)
+                    due = storage.create_task(actor, f"{project} due work", "task", project_code=project, due_date=_now(0), assignee_wa=actor)
+                    overdue = [storage.create_task(actor, f"{project} overdue {days} day work", "urgent", project_code=project, due_date=_now(-days), subcontractor_name="Concrete1", assignee_wa=actor) for days in (1, 2, 3, 5, 6)]
+                    acknowledged = storage.create_task(actor, f"{project} acknowledged work", "task", project_code=project, due_date=_now(1), assignee_wa=actor)
+                    escalation = storage.create_task(actor, f"{project} escalation evidence", "urgent", project_code=project, due_date=_now(-2), assignee_wa=actor)
+                    change = storage.create_task(actor, f"{project} approved change", "change", project_code=project, due_date=_now(2), assignee_wa=actor)
+                    completed = storage.create_task(actor, f"{project} completed performance", "task", project_code=project, status="completed", completed_at=_now(-1), subcontractor_name="Electrical1", assignee_wa=actor)
+                    rework = storage.create_task(actor, f"{project} rework work", "task", project_code=project, assignee_wa=actor)
+                    order = storage.create_task(actor, f"{project} order", "order", project_code=project, subtype="order", order_state="ordered", assignee_wa=actor)
+                    delivery = storage.create_task(actor, f"{project} delivered order", "delivery", project_code=project, subtype="order", order_state="delivered", assignee_wa=actor)
+                    roster = "Ops1 PM1 PM2 Site Manager1 Site Manager2 Site Manager3 Plumbing1 HVAC1 Drywall1 Rebar1 Concrete Supply1 Materials1 Equipment1"
+                else:
+                    overdue_customer = storage.create_task(actor, f"{project} overdue customer commitment", "urgent", project_code=project, due_date=_now(-2), subtype="customer_commitment", assignee_wa=actor)
+                    overdue_workshop = storage.create_task(actor, f"{project} overdue workshop commitment", "urgent", project_code=project, due_date=_now(-4), subtype="workshop_commitment", assignee_wa=actor)
+                    overdue_supplier = storage.create_task(actor, f"{project} overdue supplier commitment", "urgent", project_code=project, due_date=_now(-6), subtype="supplier_commitment", subcontractor_name="Parts Supplier1", assignee_wa=actor)
+                    change = storage.create_task(actor, f"{project} approved commitment", "change", project_code=project, due_date=_now(2), assignee_wa=actor)
+                    branch_issue = storage.create_task(actor, f"{project} branch issue", "urgent", project_code=project, assignee_wa=actor)
+                    completed = storage.create_task(actor, f"{project} completed activity", "task", project_code=project, status="completed", completed_at=_now(-1), assignee_wa=actor)
+                    rework = overdue_workshop
+                    order = storage.create_task(actor, f"{project} supplier history", "task", project_code=project, status="completed", completed_at=_now(-2), subtype="supplier_performance", subcontractor_name="Parts Supplier1", assignee_wa=actor)
+                    delivery = storage.create_task(actor, f"{project} healthy future activity", "task", project_code=project, due_date=_now(5), subtype="future_activity", assignee_wa=actor)
+                    healthy = delivery; due = overdue_customer; overdue = [overdue_customer, overdue_workshop, overdue_supplier]; escalation = overdue_workshop
+                    roster = "Branch 1 Branch 2 Manager1 Workshop Manager1 Parts Manager1 Sales Manager1 Parts Supplier1 Tyre Supplier1 Equipment Supplier1 Vehicle1 Vehicle2 Vehicle3"
+                storage.create_task(actor, f"{project} controlled roster {roster}", "task", project_code=project, assignee_wa=actor)
                 with storage.SessionLocal() as s:
-                    s.query(storage.Task).filter_by(id=rework["id"]).update({"is_rework": True})
-                    s.add(storage.Inspection(client_id=cid, project_code=project, phase="rough-in", required_date=_now(-2), inspector="Site Manager1", notes="inspection evidence"))
-                    s.add(storage.Meeting(client_id=cid, title=f"{project} actions PM1", project_code=project, site_name=project, scheduled_for=_now(1), created_by=actor, status="scheduled"))
-                    s.add(storage.StockItem(client_id=cid, name="Rebar1", project_code=project, supplier_name="Materials1", unit="lengths", current_qty=40))
+                    s.query(storage.Task).filter_by(id=rework["id"]).update({"is_rework": True, "started_at": _now(-1)})
+                    s.query(storage.Task).filter_by(id=acknowledged["id"] if cid == florida else completed["id"]).update({"started_at": _now(-1)})
+                    s.query(storage.Task).filter_by(id=escalation["id"]).update({"overrun_days": 2})
+                    s.add(storage.Inspection(client_id=cid, project_code=project, phase="operational", required_date=_now(-2), inspector=("Site Manager1" if cid == florida else "Manager1"), notes="inspection evidence"))
+                    s.add(storage.Meeting(client_id=cid, title=f"{project} actions", project_code=project, site_name=project, scheduled_for=_now(1), created_by=actor, status="scheduled"))
                     supplier_names = (("Concrete Supply1", "Materials1", "Equipment1") if cid == florida else
                                       ("Parts Supplier1", "Tyre Supplier1", "Equipment Supplier1"))
+                    if cid == florida:
+                        s.add(storage.StockItem(client_id=cid, name="Rebar1", project_code=project, supplier_name="Materials1", unit="lengths", current_qty=40))
                     for supplier_name in supplier_names:
                         s.add(storage.StockItem(client_id=cid, name=f"{supplier_name} stock", project_code=project,
                                                 supplier_name=supplier_name, unit="units", current_qty=10))
                     s.commit()
+                if cid == florida:
+                    storage.record_change_order({"task_id": change["id"], "cost": 1500, "time_impact_days": 4, "approval_required": True, "actor": actor})
+                    with storage.SessionLocal() as s:
+                        s.query(storage.Task).filter_by(id=change["id"]).update({"approved_at": _now(-1)})
+                        s.commit()
+                    storage.add_task_to_group(overdue[0]["id"], rework["id"], actor)
+                    storage.log_delay({"task_id": escalation["id"], "project_code": project, "reporter": actor, "days": 2, "reason": "escalation evidence"})
+                    storage.log_delay({"task_id": escalation["id"], "project_code": project, "reporter": actor, "days": 3, "reason": "repeat delay evidence"})
+                else:
+                    storage.record_change_order({"task_id": change["id"], "cost": 500, "time_impact_days": 1, "approval_required": True, "actor": actor})
+                    with storage.SessionLocal() as s:
+                        s.query(storage.Task).filter_by(id=change["id"]).update({"approved_at": _now(-1)})
+                        s.commit()
+                    storage.log_delay({"task_id": escalation["id"], "project_code": project, "reporter": actor, "days": 2, "reason": "recurring delay evidence"})
+                    storage.log_delay({"task_id": escalation["id"], "project_code": project, "reporter": actor, "days": 3, "reason": "recurring delay evidence"})
             finally:
                 storage._EFFECTIVE_MEMBERSHIP.reset(token)
 
