@@ -17,9 +17,11 @@ SELECTION_OUTPUT = {
 class ConversationalOrchestrator:
     """Reason only over the deterministic, current eligible universe."""
 
-    def __init__(self, runtime, provider_id: Optional[str] = None):
+    def __init__(self, runtime, provider_id: Optional[str] = None,
+                 evidence_assembler=None):
         self.runtime = runtime
         self.provider_id = provider_id
+        self.evidence_assembler = evidence_assembler
 
     def _proposal(self, principal: Principal, request_text: str, event_id: str,
                   membership: Mapping[str, Any], eligible: list) -> Mapping[str, Any]:
@@ -50,7 +52,36 @@ class ConversationalOrchestrator:
                                 optional_schema=definition.optional_input_schema)
         except Exception:
             return {"status": "denied", "code": "INVALID_CAPABILITY_ARGUMENTS"}
+        protected_context = ()
         evidence_refs = tuple(str(ref) for ref in proposal["evidence_refs"])
+        if capability_id == "manager_pa.assist" and self.evidence_assembler is not None:
+            operational = tuple(self.evidence_assembler.assemble(principal, membership))
+            evidence_refs = tuple(item.reference for item in operational)
+            arguments = dict(arguments)
+            arguments["request"] = str(request_text)
+            arguments["evidence_refs"] = list(evidence_refs)
+            protected_context = operational + (
+                ProtectedItem(
+                    reference="conversational-membership:" + str(event_id),
+                    value=dict(membership), security_domain="SD3",
+                    client_id=principal.scope.client_id,
+                    project_code=principal.scope.project_code,
+                    classification="membership-authority",
+                    permitted_uses=("reason",), provider_eligible=True,
+                    retention_max_seconds=0,
+                    provenance={"source_ref": "sender-membership:" + str(membership.get("id"))},
+                ),
+                ProtectedItem(
+                    reference="conversational-eligible:" + str(event_id),
+                    value=eligible, security_domain="SD3",
+                    client_id=principal.scope.client_id,
+                    project_code=principal.scope.project_code,
+                    classification="eligible-capability-universe",
+                    permitted_uses=("reason",), provider_eligible=True,
+                    retention_max_seconds=0,
+                    provenance={"source_ref": "agent-runtime:eligible:" + str(event_id)},
+                ),
+            )
         invocation = Invocation(
             capability_id=capability_id,
             principal=principal,
@@ -70,6 +101,7 @@ class ConversationalOrchestrator:
                 retention_max_seconds=0,
                 provenance={"source_ref": "whatsapp-event:" + str(event_id)},
             ) if definition.requires_provider else None),
+            protected_context=protected_context,
             evidence_refs=evidence_refs,
         )
         result = self.runtime.governed_invoke(invocation)

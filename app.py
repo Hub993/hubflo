@@ -37,6 +37,8 @@ from storage_v6_1 import (
 from storage_v6_1 import Task
 from agent_layer.contracts import Principal, Scope
 from agent_layer.conversational import ConversationalOrchestrator
+from agent_layer.operational_evidence import OperationalEvidenceAssembler
+from agent_layer.providers import register_configured_provider
 from agent_layer.runtime import AgentRuntime
 
 app = Flask(__name__)
@@ -84,9 +86,11 @@ init_db()
 # Agent Layer is constructed once; authority and eligibility are resolved per
 # inbound message by the conversational boundary below.
 AGENT_RUNTIME = AgentRuntime(runtime_id="hubflo-webhook")
+register_configured_provider(AGENT_RUNTIME.providers)
 AGENT_CONVERSATIONAL_ORCHESTRATOR = ConversationalOrchestrator(
     AGENT_RUNTIME,
     provider_id=os.environ.get("HUBFLO_AGENT_PROVIDER_ID", "").strip() or None,
+    evidence_assembler=OperationalEvidenceAssembler(),
 )
 
 

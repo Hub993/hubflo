@@ -688,6 +688,19 @@ class AgentRuntime:
             optional_output_schema=self._definitions[invocation.capability_id].optional_output_schema,
         )
         result = self.providers.invoke(request, provider_ids)
+        authoritative_refs = {
+            item.reference for item in invocation.protected_context
+            if item.authoritative
+        }
+        operational_seam = any(
+            item.classification == "eligible-capability-universe"
+            for item in invocation.protected_context
+        )
+        if operational_seam and "evidence_refs" in result.output:
+            returned_refs = result.output.get("evidence_refs")
+            if (not isinstance(returned_refs, list) or
+                    not set(returned_refs).issubset(authoritative_refs)):
+                raise ContractError("provider cited evidence outside supplied authoritative context")
         return result, context
 
     def _execute_shadow(self, invocation, provider_result, effective):
@@ -1322,6 +1335,9 @@ class AgentRuntime:
 
     def _validate_output_semantics(self, invocation, outcome):
         capability_id = invocation.capability_id
+        if (capability_id == "manager_pa.assist" and
+                outcome.get("proposed_action", {}).get("executed") is True):
+            raise ContractError("manager assistance cannot claim action execution")
         if capability_id == "market.analyze" and outcome["authorizes_action"] is not False:
             raise ContractError("market intelligence cannot authorize action")
         if capability_id == "takeon.propose" and outcome["authority_status"] not in (
